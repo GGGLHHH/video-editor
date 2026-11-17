@@ -55,6 +55,8 @@ fn three_layers(width: u32, height: u32) -> Project {
                 y: -0.3,
                 scale: 0.25,
                 opacity: 0.7,
+                // 转过的图层：导出和预览也得一致
+                rotation: 20.0,
                 ..Transform::default()
             },
         ),

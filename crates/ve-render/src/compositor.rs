@@ -70,13 +70,17 @@ pub struct Layer<'a> {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct LayerInstance {
-    rect: [f32; 4],
+    /// 左上、右上两个角（NDC）。转过的图层四个角不再是正矩形，所以逐个角给。
+    top: [f32; 4],
+    /// 左下、右下两个角（NDC）。
+    bottom: [f32; 4],
     uv: [f32; 4],
     opacity: f32,
 }
 
-const INSTANCE_ATTRS: [wgpu::VertexAttribute; 3] =
-    wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32];
+const INSTANCE_ATTRS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
+    0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32
+];
 
 /// 一个图层槽位：纹理按尺寸复用。
 struct Slot {
@@ -505,17 +509,18 @@ impl Compositor {
                 },
                 extent(pix),
             );
-            let shown = layer.geometry.shown;
             let uv = layer.geometry.uv;
-            let ndc_x = |x: f32| to_f32(f64::from(x) / cw * 2.0 - 1.0);
-            let ndc_y = |y: f32| to_f32(1.0 - f64::from(y) / ch * 2.0);
+            // 四个角已经按旋转算好（左上、右上、右下、左下），这里只换成 NDC
+            let ndc = |(x, y): (f32, f32)| {
+                (
+                    to_f32(f64::from(x) / cw * 2.0 - 1.0),
+                    to_f32(1.0 - f64::from(y) / ch * 2.0),
+                )
+            };
+            let [tl, tr, br, bl] = layer.geometry.corners().map(ndc);
             instances.push(LayerInstance {
-                rect: [
-                    ndc_x(shown.x),
-                    ndc_y(shown.y),
-                    ndc_x(shown.x + shown.w),
-                    ndc_y(shown.y + shown.h),
-                ],
+                top: [tl.0, tl.1, tr.0, tr.1],
+                bottom: [bl.0, bl.1, br.0, br.1],
                 uv: [uv.x, uv.y, uv.x + uv.w, uv.y + uv.h],
                 opacity: layer.opacity.clamp(0.0, 1.0),
             });
@@ -1016,6 +1021,8 @@ mod tests {
                 w: 1.0,
                 h: 1.0,
             },
+            center: (w.mul_add(0.5, x), h.mul_add(0.5, y)),
+            angle: 0.0,
         }
     }
 
@@ -1059,6 +1066,8 @@ mod tests {
             w: 1.0,
             h: 1.0,
         },
+        center: (32.0, 18.0),
+        angle: 0.0,
     };
 
     #[test]
@@ -1088,6 +1097,29 @@ mod tests {
         assert!(near(px(&out, 48, 25), [0, 0, 0], 0));
         assert!(near(px(&out, 20, 7), [0, 0, 0], 0));
         assert!(near(px(&out, 20, 26), [0, 0, 0], 0));
+    }
+
+    #[test]
+    fn rotated_layer_turns_about_its_center() {
+        let mut c = compositor();
+        let red = solid(4, 4, [0, 0, 255, 255]);
+        // 32×8 的横条，中心 (32, 18)；顺时针转 90° 变成竖条：x 28–36、y 2–34
+        let g = LayerGeometry {
+            angle: std::f32::consts::FRAC_PI_2,
+            ..geom(16.0, 14.0, 32.0, 8.0)
+        };
+        let mut out = Vec::new();
+        c.compose_bgra(SIZE, &[layer(&red, 4, 4, g, 1.0)], &mut out)
+            .unwrap();
+        assert!(
+            near(px(&out, 32, 4), [0, 0, 255], 0),
+            "{:?}",
+            px(&out, 32, 4)
+        );
+        assert!(near(px(&out, 32, 31), [0, 0, 255], 0));
+        // 没转时横条覆盖的地方，现在是黑的
+        assert!(near(px(&out, 18, 18), [0, 0, 0], 0));
+        assert!(near(px(&out, 45, 18), [0, 0, 0], 0));
     }
 
     #[test]
@@ -1263,26 +1295,7 @@ mod tests {
             tex.extend(solid(2, 1, [0, 0, 255, 255]));
             tex.extend(solid(2, 1, [255, 0, 0, 255]));
         }
-        let g = LayerGeometry {
-            full: Rect {
-                x: 0.0,
-                y: 0.0,
-                w: 4.0,
-                h: 2.0,
-            },
-            shown: Rect {
-                x: 0.0,
-                y: 0.0,
-                w: 4.0,
-                h: 2.0,
-            },
-            uv: Rect {
-                x: 0.0,
-                y: 0.0,
-                w: 1.0,
-                h: 1.0,
-            },
-        };
+        let g = geom(0.0, 0.0, 4.0, 2.0);
         let mut out = Nv12::default();
         c.compose_nv12((4, 2), &[layer(&tex, 4, 2, g, 1.0)], &mut out)
             .unwrap();
