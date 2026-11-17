@@ -1,0 +1,109 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["spikes"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+repository = "https://github.com/local/video-editor"
+publish = false
+readme = "README.md"
+keywords = ["video", "editor", "gpui"]
+categories = ["multimedia::video"]
+
+[workspace.dependencies]
+ve-core = { path = "crates/ve-core" }
+ve-media = { path = "crates/ve-media" }
+ve-engine = { path = "crates/ve-engine" }
+ve-export = { path = "crates/ve-export" }
+
+gpui-kit = "0.10.0"
+ffmpeg-next = "9.1.0"
+cpal = "0.18"
+rtrb = "0.4"
+smol = "2"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+pathdiff = "0.2"
+lru = "0.19"
+image = { version = "0.25", default-features = false }
+
+proptest = "1"
+tempfile = "3"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unused_qualifications = "warn"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+trivial_numeric_casts = "warn"
+unused_lifetimes = "warn"
+let_underscore_drop = "warn"
+unused_import_braces = "warn"
+redundant_lifetimes = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+# gpui / ffmpeg 依赖树里不可避免有同一 crate 的多个版本
+multiple_crate_versions = "allow"
+# 与 rustc 的 unreachable_pub 互相矛盾（私有模块里的条目），保留 unreachable_pub
+redundant_pub_crate = "allow"
+# 性能：x86-64 基线没有 FMA 指令，mul_add 会退化成慢得多的软件实现
+suboptimal_flops = "allow"
+# 挑选的 restriction 规则
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+clone_on_ref_ptr = "warn"
+undocumented_unsafe_blocks = "warn"
+mod_module_files = "warn"
+str_to_string = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+if_then_some_else_none = "warn"
+lossy_float_literal = "warn"
+float_cmp_const = "warn"
+exit = "warn"
+mem_forget = "warn"
+try_err = "warn"
+verbose_file_reads = "warn"
+shadow_unrelated = "warn"
+large_include_file = "warn"
+unnecessary_self_imports = "warn"
+string_lit_chars_any = "warn"
+
+[profile.dev]
+debug = "line-tables-only"
+
+# 依赖在 dev 下也优化：gpui / 解码路径在未优化时慢到没法测
+[profile.dev.package."*"]
+opt-level = 2
+
+# ffmpeg-sys-next 的 bindgen 构建脚本未优化时栈溢出（2026-11-17 实测）
+[profile.dev.build-override]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+debug = "line-tables-only"
+
+[profile.release.build-override]
+opt-level = 3

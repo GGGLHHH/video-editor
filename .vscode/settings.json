@@ -1,0 +1,20 @@
+{
+  // 编辑器内的诊断尽量对齐 scripts/check.ps1：
+  //   cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+  // 区别：这里只显示为警告，不当错误；最终是否合格仍以 check.ps1 为准。
+
+  // 用 clippy 代替 cargo check，[workspace.lints.clippy] 和 clippy.toml 才会生效
+  "rust-analyzer.check.command": "clippy",
+  // 打开所有 feature（ve-core/testing、ve-media/test-fixtures 等），避免特性门控的代码被标成找不到
+  "rust-analyzer.cargo.features": "all",
+  // 测试、bench、example 一起检查（与 --all-targets 一致）
+  "rust-analyzer.check.allTargets": true,
+
+  "[rust]": {
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "rust-lang.rust-analyzer"
+  },
+  "[toml]": {
+    "editor.defaultFormatter": "tamasfe.even-better-toml"
+  }
+}

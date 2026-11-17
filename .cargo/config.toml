@@ -1,0 +1,4 @@
+# 本机 FFmpeg 开发包（scoop 安装的 ffmpeg-shared，含 include/ 和 lib/）。
+# 换机器时用环境变量 FFMPEG_DIR 覆盖即可（force = false）。
+[env]
+FFMPEG_DIR = { value = "C:/Users/Administrator/scoop/apps/ffmpeg-shared/current", force = false }

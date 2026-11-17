@@ -1,0 +1,44 @@
+# cargo-deny：安全公告、许可证、来源
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+# 「不再维护」只看我们直接依赖的 crate；gpui 传递依赖里的这类提示我们无法处理。
+# 安全漏洞公告仍覆盖整棵依赖树。
+unmaintained = "workspace"
+
+[licenses]
+confidence-threshold = 0.9
+unused-allowed-license = "allow"
+allow = [
+    "MIT",
+    "MIT-0",
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "BSL-1.0",
+    "MPL-2.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "WTFPL",
+    "CDLA-Permissive-2.0",
+    "bzip2-1.0.6",
+    "NCSA",
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

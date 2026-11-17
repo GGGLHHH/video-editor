@@ -1,0 +1,26 @@
+/target/
+**/target/
+*.pdb
+
+# 测试素材和导出结果不进库
+/media/
+/exports/
+*.mp4
+*.mov
+*.mkv
+*.wav
+*.mp3
+
+# 只共享项目级 VS Code 设置，其他 .vscode/ 文件（launch.json 等）仍为个人配置
+.vscode/*
+!.vscode/settings.json
+.idea/
+
+# 实验日志
+logs/
+
+# 执行工作区
+.superpowers/
+
+# 性能测试输出
+ve-bench.log
