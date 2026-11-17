@@ -1,0 +1,24 @@
+[package]
+name = "ve-media"
+description = "FFmpeg 进程内封装：探测、视频 / 音频解码、缩略图、波形"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ve-core.workspace = true
+ffmpeg-next.workspace = true
+thiserror.workspace = true
+
+[features]
+# 给下游 crate 的测试用：按需生成测试素材
+test-fixtures = []
