@@ -26,4 +26,4 @@ pub use project::{Project, ProjectSettings};
 pub use project_file::{LoadedProject, ProjectFileError, load_project, save_project};
 pub use time::{FLICKS_PER_SECOND, FrameRate, Time, format_timecode};
 pub use timeline::{Clip, ClipContent, InvariantError, Timeline, Track, TrackKind};
-pub use transform::{Crop, LayerGeometry, Rect, Transform, layer_geometry};
+pub use transform::{Crop, LayerGeometry, Rect, Transform, layer_geometry, wrap_degrees};

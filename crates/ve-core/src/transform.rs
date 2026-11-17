@@ -1,4 +1,4 @@
-//! 片段的画面属性（位置、缩放、裁剪、不透明度）和由它算出的图层几何。
+//! 片段的画面属性（位置、缩放、旋转、裁剪、不透明度）和由它算出的图层几何。
 //!
 //! 几何是纯函数，预览合成、导出合成、预览上的拖拽框三处共用，保证三处一致。
 
@@ -32,6 +32,8 @@ pub struct Transform {
     pub crop: Crop,
     /// 不透明度（0–1）。
     pub opacity: f32,
+    /// 旋转角度（度，顺时针为正），绕整幅画面（未裁剪）的中心转。
+    pub rotation: f32,
 }
 
 impl Default for Transform {
@@ -53,12 +55,13 @@ impl Transform {
             bottom: 0.0,
         },
         opacity: 1.0,
+        rotation: 0.0,
     };
 
     /// `scale` 的取值范围。
     pub const SCALE_RANGE: (f32, f32) = (0.01, 10.0);
 
-    /// 是否满足不变式：有限、缩放在范围内、不透明度 0–1、裁剪不越界。
+    /// 是否满足不变式：都是有限数、缩放在范围内、不透明度 0–1、裁剪不越界。
     #[must_use]
     pub fn is_valid(&self) -> bool {
         let c = self.crop;
@@ -67,6 +70,7 @@ impl Transform {
             self.y,
             self.scale,
             self.opacity,
+            self.rotation,
             c.left,
             c.top,
             c.right,
@@ -108,15 +112,96 @@ impl Rect {
     }
 }
 
-/// 一个图层在画布上的几何。
+/// 一个图层在画布上的几何。`full`、`shown` 是转之前的框；实际画面是它们绕 `center`
+/// 顺时针转 `angle` 弧度后的样子（见 [`LayerGeometry::corners`]）。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LayerGeometry {
-    /// 未裁剪的整幅画面框。
+    /// 未裁剪的整幅画面框（转之前）。
     pub full: Rect,
-    /// 裁剪后实际显示的部分。
+    /// 裁剪后实际显示的部分（转之前）。
     pub shown: Rect,
     /// `shown` 对应的纹理坐标（0–1）。
     pub uv: Rect,
+    /// 旋转中心：整幅画面框的中心。
+    pub center: (f32, f32),
+    /// 旋转角（弧度，顺时针为正）。
+    pub angle: f32,
+}
+
+impl LayerGeometry {
+    /// 把转之前的点绕中心转到画布上。
+    #[must_use]
+    pub fn rotate(&self, p: (f32, f32)) -> (f32, f32) {
+        turn(p, self.center, self.angle)
+    }
+
+    /// 把画布上的点转回转之前的坐标（命中测试用）。
+    #[must_use]
+    pub fn to_local(&self, p: (f32, f32)) -> (f32, f32) {
+        turn(p, self.center, -self.angle)
+    }
+
+    /// 显示部分在画布上的四个角：左上、右上、右下、左下（按画面自己的方向）。
+    #[must_use]
+    pub fn corners(&self) -> [(f32, f32); 4] {
+        let s = self.shown;
+        [
+            (s.x, s.y),
+            (s.x + s.w, s.y),
+            (s.x + s.w, s.y + s.h),
+            (s.x, s.y + s.h),
+        ]
+        .map(|p| self.rotate(p))
+    }
+
+    /// 显示部分转过之后的外接矩形（对齐吸附用）。
+    #[must_use]
+    pub fn bounds(&self) -> Rect {
+        if self.angle == 0.0 {
+            return self.shown;
+        }
+        let c = self.corners();
+        let (mut x0, mut y0, mut x1, mut y1) = (c[0].0, c[0].1, c[0].0, c[0].1);
+        for (x, y) in c {
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
+        }
+        Rect {
+            x: x0,
+            y: y0,
+            w: x1 - x0,
+            h: y1 - y0,
+        }
+    }
+
+    /// 画布上的点是否落在显示部分里（算上旋转）。
+    #[must_use]
+    pub fn contains(&self, px: f32, py: f32) -> bool {
+        let (x, y) = self.to_local((px, py));
+        self.shown.contains(x, y)
+    }
+}
+
+/// 角度换算到 (-180°, 180°]：450° → 90°，-190° → 170°，-180° → 180°。
+#[must_use]
+pub fn wrap_degrees(d: f32) -> f32 {
+    let r = d.rem_euclid(360.0);
+    if r > 180.0 { r - 360.0 } else { r }
+}
+
+/// 点 `p` 绕 `c` 顺时针转 `angle` 弧度（屏幕坐标 y 向下）。
+fn turn(p: (f32, f32), c: (f32, f32), angle: f32) -> (f32, f32) {
+    if angle == 0.0 {
+        return p;
+    }
+    let (sin, cos) = angle.sin_cos();
+    let (dx, dy) = (p.0 - c.0, p.1 - c.1);
+    (
+        c.0 + dx.mul_add(cos, -(dy * sin)),
+        c.1 + dx.mul_add(sin, dy * cos),
+    )
 }
 
 #[expect(
@@ -161,6 +246,8 @@ pub fn layer_geometry(canvas: (u32, u32), source: (u32, u32), t: &Transform) -> 
             full_h * keep_h,
         ),
         uv: make(cut_l, cut_t, keep_w, keep_h),
+        center: (to_f32(left + full_w / 2.0), to_f32(top + full_h / 2.0)),
+        angle: t.rotation.to_radians(),
     }
 }
 
@@ -224,6 +311,76 @@ mod tests {
         assert!(close(g.uv, rect(0.25, 0.1, 0.75, 0.9)), "{:?}", g.uv);
     }
 
+    fn near(a: (f32, f32), b: (f32, f32)) -> bool {
+        (a.0 - b.0).abs() < 1e-2 && (a.1 - b.1).abs() < 1e-2
+    }
+
+    #[test]
+    fn rotation_turns_corners_clockwise_about_center() {
+        let t = Transform {
+            scale: 0.5,
+            rotation: 90.0,
+            ..Transform::default()
+        };
+        // 1000×500 画布里 500×250 的框，中心 (500, 250)；顺时针转 90°
+        let g = layer_geometry((1000, 500), (1000, 500), &t);
+        assert_eq!(g.center, (500.0, 250.0));
+        let [tl, tr, br, bl] = g.corners();
+        assert!(near(tl, (625.0, 0.0)), "{tl:?}");
+        assert!(near(tr, (625.0, 500.0)), "{tr:?}");
+        assert!(near(br, (375.0, 500.0)), "{br:?}");
+        assert!(near(bl, (375.0, 0.0)), "{bl:?}");
+        let b = g.bounds();
+        assert!(
+            near((b.x, b.y), (375.0, 0.0)) && near((b.w, b.h), (250.0, 500.0)),
+            "{b:?}"
+        );
+        // 转过以后：原来框外、现在框内的点算在里面，反之不算
+        assert!(g.contains(500.0, 50.0));
+        assert!(!g.contains(300.0, 250.0));
+        // 不转时 corners 就是 shown 的四个角
+        let flat = layer_geometry((1000, 500), (1000, 500), &Transform::default());
+        assert_eq!(flat.corners()[0], (0.0, 0.0));
+        assert_eq!(flat.bounds(), flat.shown);
+    }
+
+    #[test]
+    fn cropped_rotation_pivots_on_full_frame_center() {
+        let t = Transform {
+            rotation: 180.0,
+            crop: Crop {
+                left: 0.5,
+                ..Crop::default()
+            },
+            ..Transform::default()
+        };
+        // 裁掉左半边后转 180°：剩下的右半边绕整幅画面中心转到左边
+        let g = layer_geometry((1000, 500), (1000, 500), &t);
+        let b = g.bounds();
+        assert!(
+            near((b.x, b.y), (0.0, 0.0)) && near((b.w, b.h), (500.0, 500.0)),
+            "{b:?}"
+        );
+    }
+
+    #[test]
+    fn degrees_wrap_to_half_turn() {
+        for (d, want) in [
+            (0.0, 0.0),
+            (450.0, 90.0),
+            (-190.0, 170.0),
+            (-180.0, 180.0),
+            (180.0, 180.0),
+            (359.5, -0.5),
+        ] {
+            assert!(
+                (wrap_degrees(d) - want).abs() < 1e-4,
+                "{d} → {}",
+                wrap_degrees(d)
+            );
+        }
+    }
+
     #[test]
     fn invalid_transforms_rejected() {
         assert!(Transform::default().is_valid());
@@ -242,6 +399,10 @@ mod tests {
             },
             Transform {
                 opacity: 1.5,
+                ..Transform::default()
+            },
+            Transform {
+                rotation: f32::INFINITY,
                 ..Transform::default()
             },
             Transform {
@@ -280,7 +441,7 @@ mod tests {
             x in -2.0f32..2.0, y in -2.0f32..2.0, scale in 0.01f32..10.0,
             l in 0.0f32..0.49, r in 0.0f32..0.49, t in 0.0f32..0.49, b in 0.0f32..0.49,
         ) {
-            let tf = Transform { x, y, scale, crop: Crop { left: l, top: t, right: r, bottom: b }, opacity: 1.0 };
+            let tf = Transform { x, y, scale, crop: Crop { left: l, top: t, right: r, bottom: b }, opacity: 1.0, rotation: 0.0 };
             prop_assert!(tf.is_valid());
             let geom = layer_geometry((cw, ch), (sw, sh), &tf);
             let (full, shown) = (geom.full, geom.shown);
