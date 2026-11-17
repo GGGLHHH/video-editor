@@ -38,6 +38,8 @@ pub struct EngineConfig {
     pub audio: AudioBackend,
     /// 帧缓存字节数上限。
     pub cache_bytes: usize,
+    /// 合成器配置（测试里用软件显卡）。
+    pub render: ve_render::RenderConfig,
 }
 
 impl Default for EngineConfig {
@@ -49,6 +51,7 @@ impl Default for EngineConfig {
             },
             audio: AudioBackend::Device,
             cache_bytes: 512 * 1024 * 1024,
+            render: ve_render::RenderConfig::default(),
         }
     }
 }
@@ -133,6 +136,7 @@ pub(crate) struct Shared {
     pub(crate) decoded: AtomicU64,
     pub(crate) preview_max: ScaleTarget,
     pub(crate) cache_bytes: usize,
+    pub(crate) render: ve_render::RenderConfig,
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -232,6 +236,7 @@ impl Engine {
             decoded: AtomicU64::new(0),
             preview_max: config.preview_max,
             cache_bytes: config.cache_bytes,
+            render: config.render,
         });
 
         let mut threads = Vec::new();
@@ -419,14 +424,17 @@ impl Drop for Engine {
 mod tests {
     use super::*;
     use std::thread::sleep;
-    use ve_core::edit::{append_asset, delete_clips};
+    use ve_core::edit::{
+        add_track, append_asset, delete_clips, insert_asset_at, set_transform, trim_end,
+    };
     use ve_core::{Asset, AssetId, ClipId, FrameRate};
     use ve_media::testing::{Fixture, expected_gray, fixture};
 
     const RATE: FrameRate = FrameRate::new(30, 1);
 
     fn project_with(items: &[Fixture]) -> (Project, Vec<ClipId>) {
-        let mut p = Project::new();
+        // 和测试素材同尺寸：软件显卡合成小画布才快
+        let mut p = small_project();
         let mut clips = Vec::new();
         for &f in items {
             let path = fixture(f);
@@ -447,6 +455,7 @@ mod tests {
     fn engine() -> Engine {
         Engine::new(EngineConfig {
             audio: AudioBackend::Capture,
+            render: ve_render::RenderConfig { software: true },
             ..EngineConfig::default()
         })
         .unwrap()
@@ -472,6 +481,16 @@ mod tests {
         got.unwrap()
     }
 
+    /// 等到时刻 `t` 的那一帧（换工程本身也会先交一帧当前位置的画面，不能拿第一帧就当定位结果）。
+    fn wait_frame_at(e: &Engine, t: Time) -> FrameUpdate {
+        let mut got = None;
+        assert!(wait_until(3000, || {
+            got = e.take_frame().filter(|u| u.time == t);
+            got.is_some()
+        }));
+        got.unwrap()
+    }
+
     fn gray(f: &VideoFrame) -> f64 {
         let i = ((f.height / 2 * f.width + f.width / 2) * 4) as usize;
         f64::from(f.data[i])
@@ -482,7 +501,7 @@ mod tests {
         let e = engine();
         e.set_project(Arc::new(project_with(&[Fixture::FrameIndexed30]).0));
         e.seek(RATE.time_of_frame(30) + Time::from_millis(10));
-        let u = wait_frame(&e);
+        let u = wait_frame_at(&e, RATE.time_of_frame(30) + Time::from_millis(10));
         let f = u.frame.unwrap();
         assert!((gray(&f) - expected_gray(30)).abs() <= 2.0, "{}", gray(&f));
         assert!(e.take_frame().is_none(), "同一帧只交一次");
@@ -593,7 +612,7 @@ mod tests {
         let (first, _) = project_with(&[Fixture::FrameIndexed30]);
         e.set_project(Arc::new(first.clone()));
         e.seek(RATE.time_of_frame(30));
-        let u = wait_frame(&e);
+        let u = wait_frame_at(&e, RATE.time_of_frame(30));
         assert!((gray(&u.frame.unwrap()) - expected_gray(30)).abs() <= 2.0);
         let mut second = first;
         for a in second.assets.values_mut() {
@@ -648,5 +667,139 @@ mod tests {
             Ok(EngineEvent::Ended)
         )));
         assert!(!e.is_playing());
+    }
+    // ---------- 多层合成 ----------
+
+    fn add(p: &mut Project, f: Fixture) -> AssetId {
+        let path = fixture(f);
+        let r = ve_media::probe(&path).unwrap();
+        p.add_asset(Asset {
+            id: AssetId(0),
+            name: path.file_name().unwrap().to_string_lossy().into_owned(),
+            path,
+            duration: r.duration,
+            video: r.video,
+            audio: r.audio,
+        })
+    }
+
+    /// 64×36 的工程（测试素材也是 64×36，软件显卡合成快）。
+    fn small_project() -> Project {
+        let mut p = Project::new();
+        p.settings.width = 64;
+        p.settings.height = 36;
+        p
+    }
+
+    fn half() -> ve_core::Transform {
+        ve_core::Transform {
+            scale: 0.5,
+            ..ve_core::Transform::default()
+        }
+    }
+
+    /// 在新的上层视频轨 `at` 处放素材，缩小一半居中。
+    fn overlay(p: &mut Project, asset: AssetId, at: Time) -> ClipId {
+        let track = add_track(p, ve_core::TrackKind::Video).unwrap();
+        let clip = insert_asset_at(p, asset, track, at).unwrap();
+        set_transform(p, clip, half()).unwrap();
+        clip
+    }
+
+    fn bgr(f: &VideoFrame, x: u32, y: u32) -> [u8; 3] {
+        let i = ((y * f.width + x) * 4) as usize;
+        [f.data[i], f.data[i + 1], f.data[i + 2]]
+    }
+
+    fn frame_at(p: Project, t: Time) -> Arc<VideoFrame> {
+        let e = engine();
+        e.set_project(Arc::new(p));
+        e.seek(t);
+        wait_frame_at(&e, t).frame.unwrap()
+    }
+
+    fn is_gray(px: [u8; 3], n: i64) -> bool {
+        px.iter()
+            .all(|c| (f64::from(*c) - expected_gray(n)).abs() <= 3.0)
+    }
+
+    const RED: [u8; 3] = [0, 0, 255];
+
+    fn is_red(px: [u8; 3]) -> bool {
+        px.iter().zip(RED).all(|(c, w)| c.abs_diff(w) <= 3)
+    }
+
+    #[test]
+    fn two_layers_compose_pip() {
+        let mut p = small_project();
+        let gray = add(&mut p, Fixture::FrameIndexed30);
+        let red = add(&mut p, Fixture::Image);
+        append_asset(&mut p, gray).unwrap();
+        overlay(&mut p, red, Time::ZERO);
+        let f = frame_at(p, RATE.time_of_frame(15) + Time::from_millis(5));
+        assert_eq!((f.width, f.height), (64, 36));
+        assert!(is_red(bgr(&f, 32, 18)), "中心是上层：{:?}", bgr(&f, 32, 18));
+        assert!(
+            is_gray(bgr(&f, 2, 2), 15),
+            "角上是下层：{:?}",
+            bgr(&f, 2, 2)
+        );
+    }
+
+    #[test]
+    fn same_asset_two_tracks_independent() {
+        let mut p = small_project();
+        let gray = add(&mut p, Fixture::FrameIndexed30);
+        append_asset(&mut p, gray).unwrap();
+        overlay(&mut p, gray, Time::from_secs(1));
+        // 1.5 秒：下层是素材第 45 帧，上层（从 1 秒开始）是素材第 15 帧
+        let f = frame_at(p, RATE.time_of_frame(45) + Time::from_millis(5));
+        assert!(is_gray(bgr(&f, 32, 18), 15), "上层：{:?}", bgr(&f, 32, 18));
+        assert!(is_gray(bgr(&f, 2, 2), 45), "下层：{:?}", bgr(&f, 2, 2));
+    }
+
+    #[test]
+    fn still_over_video_outlives_it() {
+        let mut p = small_project();
+        let gray = add(&mut p, Fixture::FrameIndexed30);
+        let red = add(&mut p, Fixture::Image);
+        append_asset(&mut p, gray).unwrap();
+        overlay(&mut p, red, Time::ZERO);
+        // 视频 2 秒就结束，图片（5 秒）还在：图片之外是黑底
+        let f = frame_at(p, Time::from_secs(3));
+        assert!(is_red(bgr(&f, 32, 18)), "{:?}", bgr(&f, 32, 18));
+        assert_eq!(bgr(&f, 2, 2), [0, 0, 0]);
+    }
+
+    #[test]
+    fn top_layer_ends_bottom_continues() {
+        let mut p = small_project();
+        let gray = add(&mut p, Fixture::FrameIndexed30);
+        let red = add(&mut p, Fixture::Image);
+        append_asset(&mut p, gray).unwrap();
+        let top = overlay(&mut p, red, Time::ZERO);
+        trim_end(&mut p, top, Time::from_secs(1)).unwrap();
+        let f = frame_at(p, RATE.time_of_frame(45) + Time::from_millis(5));
+        assert!(
+            is_gray(bgr(&f, 32, 18), 45),
+            "上层结束后只剩下层：{:?}",
+            bgr(&f, 32, 18)
+        );
+    }
+
+    #[test]
+    fn identical_layers_decode_once() {
+        // 同一素材、同一时刻叠两层（比如竖屏视频用自己的模糊版做背景）：只解一次
+        let mut p = small_project();
+        let gray = add(&mut p, Fixture::FrameIndexed30);
+        append_asset(&mut p, gray).unwrap();
+        overlay(&mut p, gray, Time::ZERO);
+        let e = engine();
+        e.set_project(Arc::new(p));
+        let t = RATE.time_of_frame(10) + Time::from_millis(5);
+        e.seek(t);
+        let f = wait_frame_at(&e, t).frame.unwrap();
+        assert!(is_gray(bgr(&f, 32, 18), 10));
+        assert_eq!(e.stats().decoded_frames, 1, "{:?}", e.stats());
     }
 }

@@ -1,6 +1,6 @@
 //! 拖动预览延迟：随机定位 N 次，测 `seek()` 到新帧可取的时间。
 //!
-//! 用法：`cargo run --release -p ve-engine --example scrub_latency -- <视频文件> [次数]`
+//! 用法：`cargo run --release -p ve-engine --example scrub_latency -- <视频文件> [次数] [层数]`
 
 #![expect(
     clippy::print_stdout,
@@ -14,7 +14,6 @@
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use ve_core::edit::append_asset;
 use ve_core::{Asset, AssetId, Project, Time};
 use ve_engine::{AudioBackend, Engine, EngineConfig};
 
@@ -22,6 +21,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let path = std::path::PathBuf::from(args.next().expect("视频文件"));
     let count: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(50);
+    let layers: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(1);
     let r = ve_media::probe(&path).unwrap();
     let mut p = Project::new();
     let id = p.add_asset(Asset {
@@ -32,7 +32,7 @@ fn main() {
         video: r.video,
         audio: r.audio,
     });
-    append_asset(&mut p, id).unwrap();
+    ve_core::bench::stack_layers(&mut p, id, layers, r.duration).unwrap();
     let duration = p.timeline.duration();
     let engine = Engine::new(EngineConfig {
         audio: AudioBackend::Null,
@@ -66,7 +66,7 @@ fn main() {
     ms.sort_by(f64::total_cmp);
     let pct = |q: f64| ms[((ms.len() - 1) as f64 * q).round() as usize];
     println!(
-        "seeks={count} p50={:.1}ms p90={:.1}ms p99={:.1}ms max={:.1}ms",
+        "layers={layers} seeks={count} p50={:.1}ms p90={:.1}ms p99={:.1}ms max={:.1}ms",
         pct(0.5),
         pct(0.9),
         pct(0.99),

@@ -17,6 +17,7 @@ workspace = true
 [dependencies]
 ve-core.workspace = true
 ve-media.workspace = true
+ve-render.workspace = true
 cpal.workspace = true
 rtrb.workspace = true
 smol.workspace = true

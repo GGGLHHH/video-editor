@@ -1,6 +1,8 @@
 //! 时间轴解析：某一时刻该显示哪个素材的哪一帧、某段时间该播哪些音频。
 
-use ve_core::{AssetId, ClipId, Project, Time, TrackKind};
+pub use ve_core::compose::{LayerSource, resolve_layers};
+use ve_core::{AssetId, ClipId, Project, ProjectSettings, Time, TrackKind};
+use ve_media::ScaleTarget;
 
 /// 某一时刻的画面来源。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,19 +49,17 @@ pub fn db_to_gain(db: f32) -> f32 {
 /// 时刻 `t` 的画面：最上面一条在 `t` 处有片段的视频轨。
 #[must_use]
 pub fn resolve_video(project: &Project, t: Time) -> Option<VideoSource> {
-    project
-        .timeline
-        .tracks
-        .iter()
-        .filter(|tr| tr.kind == TrackKind::Video)
-        .find_map(|tr| {
-            let clip = tr.clip_at(t)?;
-            Some(VideoSource {
-                asset: clip.asset()?,
-                source_time: clip.source_in() + (t - clip.start),
-                clip: clip.id,
-            })
-        })
+    resolve_layers(project, t).pop().map(|l| VideoSource {
+        asset: l.asset,
+        source_time: l.source_time,
+        clip: l.clip,
+    })
+}
+
+/// 预览画布尺寸：工程尺寸等比缩进预览上限（偶数）。
+#[must_use]
+pub fn preview_canvas(settings: &ProjectSettings, max: ScaleTarget) -> (u32, u32) {
+    ve_media::fit_size(settings.width, settings.height, max)
 }
 
 /// 时间轴区间 `[from, from + len)` 内要播的所有音频段（视频轨的原声和音频轨）。
@@ -113,7 +113,7 @@ mod tests {
     use super::*;
     use ve_core::edit::{set_fades, set_gain};
     use ve_core::testing::sample_project;
-    use ve_core::{Asset, AssetId, Time, TrackKind, VideoInfo};
+    use ve_core::{Asset, AssetId, Time, TrackKind, Transform, VideoInfo};
 
     fn secs(s: i64) -> Time {
         Time::from_secs(s)
@@ -209,5 +209,28 @@ mod tests {
         let (p, _) = sample_project();
         assert_eq!(resolve_subtitles(&p, Time::from_millis(1500)), vec!["你好"]);
         assert_eq!(resolve_subtitles(&p, secs(3)), Vec::<&str>::new());
+    }
+    #[test]
+    fn resolve_layers_bottom_up() {
+        let (mut p, ids) = sample_project();
+        let top = ve_core::edit::add_track(&mut p, TrackKind::Video).unwrap();
+        let pip = ve_core::edit::insert_asset_at(&mut p, ids.video_asset, top, secs(1)).unwrap();
+        let t = Transform {
+            scale: 0.3,
+            ..Transform::default()
+        };
+        ve_core::edit::set_transform(&mut p, pip, t).unwrap();
+        let layers = resolve_layers(&p, secs(2));
+        assert_eq!(layers.len(), 2);
+        assert_eq!((layers[0].track, layers[0].clip), (ids.video_track, ids.v1));
+        assert_eq!(layers[0].source_time, secs(2));
+        assert_eq!((layers[1].track, layers[1].clip), (top, pip));
+        assert_eq!(layers[1].source_time, secs(1));
+        assert_eq!(layers[1].transform, t);
+        // 最上层就是 resolve_video 的结果
+        assert_eq!(resolve_video(&p, secs(2)).unwrap().clip, pip);
+        // 上层还没开始：只有下层
+        assert_eq!(resolve_layers(&p, Time::from_millis(500)).len(), 1);
+        assert_eq!(resolve_layers(&p, secs(30)), []);
     }
 }
