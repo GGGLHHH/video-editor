@@ -1,12 +1,12 @@
-//! 执行导出：写临时文件、启动 ffmpeg、解析进度、取消、NVENC 失败退回 x264。
+//! 执行导出：写临时文件、启动 ffmpeg、逐帧渲染画面写进它的标准输入、取消、NVENC 失败退回 x264。
 
 use crate::{
     Encoder, ExportError, ExportSettings, SubtitleStyle, build_job, has_subtitles, write_ass,
 };
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use ve_core::{Project, Time};
+use ve_core::Project;
 
 /// ffmpeg 可执行文件：环境变量 `VE_FFMPEG` 优先，否则 PATH 上的 `ffmpeg`。
 fn ffmpeg_program() -> std::ffi::OsString {
@@ -65,20 +65,6 @@ fn part_path(path: &std::path::Path) -> std::path::PathBuf {
     path.with_file_name(format!("{stem}.ve-part.{ext}"))
 }
 
-/// 解析 `-progress` 输出里的 `out_time_us=` 行，返回 0–1 的进度。
-#[must_use]
-pub fn parse_progress(line: &str, total: Time) -> Option<f32> {
-    let us: i64 = line.strip_prefix("out_time_us=")?.trim().parse().ok()?;
-    let total_us = (total.as_millis() * 1000).max(1);
-    #[expect(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        reason = "进度只需大致精度"
-    )]
-    let p = (us as f64 / total_us as f64).clamp(0.0, 1.0) as f32;
-    Some(p)
-}
-
 /// 导出。`on_progress` 收到单调不减的 0–1 进度，成功时最后一次为 1.0；
 /// `cancel` 置真后尽快停止并删除半成品。NVENC 失败时自动用 x264 重试一次。
 ///
@@ -107,16 +93,37 @@ fn export_with(
     mut on_progress: impl FnMut(f32),
     cancel: &AtomicBool,
 ) -> Result<(), ExportError> {
-    match run_once(program, project, settings, &mut on_progress, cancel) {
+    let mut progress = Monotonic::new(&mut on_progress);
+    let mut report = |p| progress.report(p);
+    match run_once(program, project, settings, &mut report, cancel) {
         Err(ExportError::Ffmpeg { message, .. }) if settings.encoder == Encoder::Nvenc => {
             log::warn!("NVENC 导出失败，改用 x264 重试：{message}");
             let fallback = ExportSettings {
                 encoder: Encoder::X264,
                 ..settings.clone()
             };
-            run_once(program, project, &fallback, &mut on_progress, cancel)
+            run_once(program, project, &fallback, &mut report, cancel)
         }
         other => other,
+    }
+}
+
+/// 只往前报的进度：NVENC 失败改用 x264 从头重来时，进度条不倒退。
+struct Monotonic<F: FnMut(f32)> {
+    last: f32,
+    f: F,
+}
+
+impl<F: FnMut(f32)> Monotonic<F> {
+    const fn new(f: F) -> Self {
+        Self { last: 0.0, f }
+    }
+
+    fn report(&mut self, p: f32) {
+        if p > self.last {
+            self.last = p;
+            (self.f)(p);
+        }
     }
 }
 
@@ -149,8 +156,8 @@ fn run_once(
     let mut child = Command::new(program)
         .args(&job.args)
         .current_dir(dir.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| match e.kind() {
@@ -165,28 +172,31 @@ fn run_once(
             text
         })
     });
-    let mut last = 0.0f32;
-    let mut cancelled = false;
-    if let Some(out) = child.stdout.take() {
-        for line in BufReader::new(out).lines().map_while(Result::ok) {
-            if cancel.load(Ordering::Acquire) {
-                cancelled = true;
-                drop(child.kill());
-                break;
-            }
-            if let Some(p) = parse_progress(&line, job.duration)
-                && p > last
-            {
-                last = p;
-                on_progress(p);
-            }
-        }
+    let mut on_frame = |done: u64, total: u64| {
+        // 写完最后一帧还要等 ffmpeg 收尾、改名，1.0 留到真正完成时再报
+        #[expect(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            reason = "进度只需大致精度"
+        )]
+        let p = (done as f64 / total.max(1) as f64 * 0.99) as f32;
+        on_progress(p);
+    };
+    let rendered = child.stdin.take().map_or(Ok(false), |stdin| {
+        crate::render::render_video(project, settings, stdin, &mut on_frame, cancel)
+    });
+    if rendered.is_err() {
+        drop(child.kill());
     }
     let status = child.wait()?;
     let message = stderr.and_then(|h| h.join().ok()).unwrap_or_default();
-    if cancelled || cancel.load(Ordering::Acquire) {
+    if cancel.load(Ordering::Acquire) || matches!(rendered, Err(ExportError::Cancelled)) {
         drop(std::fs::remove_file(&part));
         return Err(ExportError::Cancelled);
+    }
+    if let Err(e) = rendered {
+        drop(std::fs::remove_file(&part));
+        return Err(e);
     }
     if !status.success() {
         drop(std::fs::remove_file(&part));
@@ -222,6 +232,7 @@ pub const fn default_settings(project: &Project, path: std::path::PathBuf) -> Ex
         frame_rate: project.settings.frame_rate,
         video_bitrate_kbps: 12_000,
         encoder: Encoder::Nvenc,
+        render: ve_render::RenderConfig { software: false },
     }
 }
 
@@ -230,7 +241,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use ve_core::edit::{add_subtitle, append_asset};
-    use ve_core::{Asset, AssetId, FrameRate, Project};
+    use ve_core::{Asset, AssetId, FrameRate, Project, Time};
     use ve_media::testing::{Fixture, fixture};
 
     fn project() -> Project {
@@ -262,6 +273,7 @@ mod tests {
             frame_rate: FrameRate::new(30, 1),
             video_bitrate_kbps: 500,
             encoder,
+            render: ve_render::RenderConfig { software: true },
         }
     }
 
@@ -500,12 +512,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_progress_lines() {
-        let total = Time::from_secs(10);
-        assert_eq!(parse_progress("out_time_us=5000000", total), Some(0.5));
-        assert_eq!(parse_progress("out_time_us=N/A", total), None);
-        assert_eq!(parse_progress("out_time_us=-5", total), Some(0.0));
-        assert_eq!(parse_progress("out_time_us=99000000", total), Some(1.0));
-        assert_eq!(parse_progress("frame=3", total), None);
+    fn progress_never_goes_backwards_across_retries() {
+        // NVENC 中途失败改用 x264 重来时，进度条不能从 60% 跳回 0
+        let mut seen = Vec::new();
+        {
+            let mut m = Monotonic::new(|p| seen.push(p));
+            for p in [0.2, 0.6, 0.0, 0.3, 0.6, 0.8, 1.0] {
+                m.report(p);
+            }
+        }
+        assert_eq!(seen, [0.2, 0.6, 0.8, 1.0]);
     }
 }

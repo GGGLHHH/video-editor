@@ -2,8 +2,11 @@
 
 pub mod ass;
 pub mod graph;
+pub mod render;
 pub mod run;
 
 pub use ass::{SubtitleStyle, has_subtitles, write_ass};
 pub use graph::{Encoder, ExportError, ExportSettings, FfmpegJob, build_job};
-pub use run::{default_settings, export, parse_progress};
+pub use render::{frame_count, output_size};
+pub use run::{default_settings, export};
+pub use ve_render::RenderConfig;

@@ -1,0 +1,185 @@
+//! 预览和导出一致：同一个三层工程、同一时刻，预览合成出的画面和导出文件里那一帧要对得上。
+
+#![expect(clippy::unwrap_used, clippy::panic, reason = "集成测试")]
+
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant};
+use ve_core::edit::{add_track, append_asset, insert_asset_at, set_transform};
+use ve_core::{Asset, AssetId, FrameRate, Project, Time, TrackKind, Transform};
+use ve_engine::{AudioBackend, Engine, EngineConfig};
+use ve_export::{Encoder, ExportSettings, export};
+use ve_media::testing::{Fixture, fixture};
+use ve_media::{ScaleTarget, VideoDecoder, VideoFrame};
+use ve_render::RenderConfig;
+
+const RATE: FrameRate = FrameRate::new(30, 1);
+
+fn add(p: &mut Project, f: Fixture) -> AssetId {
+    let path = fixture(f);
+    let r = ve_media::probe(&path).unwrap();
+    p.add_asset(Asset {
+        id: AssetId(0),
+        name: path.file_name().unwrap().to_string_lossy().into_owned(),
+        path,
+        duration: r.duration,
+        video: r.video,
+        audio: r.audio,
+    })
+}
+
+/// 三层：灰度视频铺满；红色图片画中画在右下；彩条视频小窗在左上、70% 不透明。
+fn three_layers(width: u32, height: u32) -> Project {
+    let mut p = Project::new();
+    p.settings.width = width;
+    p.settings.height = height;
+    p.settings.frame_rate = RATE;
+    let gray = add(&mut p, Fixture::FrameIndexed30);
+    let red = add(&mut p, Fixture::Image);
+    let bars = add(&mut p, Fixture::VideoWithAudio);
+    append_asset(&mut p, gray).unwrap();
+    for (asset, t) in [
+        (
+            red,
+            Transform {
+                x: 0.3,
+                y: 0.3,
+                scale: 0.33,
+                ..Transform::default()
+            },
+        ),
+        (
+            bars,
+            Transform {
+                x: -0.3,
+                y: -0.3,
+                scale: 0.25,
+                opacity: 0.7,
+                ..Transform::default()
+            },
+        ),
+    ] {
+        let track = add_track(&mut p, TrackKind::Video).unwrap();
+        let clip = insert_asset_at(&mut p, asset, track, Time::ZERO).unwrap();
+        set_transform(&mut p, clip, t).unwrap();
+    }
+    p
+}
+
+/// 预览引擎在时刻 `t` 合成出的画面。
+fn preview_frame(p: &Project, t: Time) -> Arc<VideoFrame> {
+    let e = Engine::new(EngineConfig {
+        audio: AudioBackend::Capture,
+        render: RenderConfig { software: true },
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    e.set_project(Arc::new(p.clone()));
+    e.seek(t);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Some(u) = e.take_frame() {
+            return u.frame.unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("预览没出帧");
+}
+
+/// 导出成文件，再解出时刻 `t` 的那一帧。
+fn exported_frame(p: &Project, width: u32, height: u32, t: Time) -> VideoFrame {
+    let dir = tempfile::tempdir().unwrap();
+    let settings = ExportSettings {
+        path: dir.path().join("out.mp4"),
+        width,
+        height,
+        frame_rate: RATE,
+        video_bitrate_kbps: 20_000,
+        encoder: Encoder::X264,
+        render: RenderConfig { software: true },
+    };
+    export(p, &settings, |_| {}, &AtomicBool::new(false)).unwrap();
+    let mut d = VideoDecoder::open(
+        &settings.path,
+        ScaleTarget {
+            max_width: width,
+            max_height: height,
+        },
+    )
+    .unwrap();
+    d.seek_to(t).unwrap()
+}
+
+fn psnr(a: &VideoFrame, b: &VideoFrame) -> f64 {
+    assert_eq!((a.width, a.height), (b.width, b.height));
+    let mut sum = 0.0;
+    let mut count = 0.0;
+    for (pa, pb) in a
+        .data
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(b.data.as_chunks::<4>().0)
+    {
+        for c in 0..3 {
+            let d = f64::from(pa[c]) - f64::from(pb[c]);
+            sum += d * d;
+            count += 1.0;
+        }
+    }
+    let mse = sum / count;
+    if mse == 0.0 {
+        return 99.0;
+    }
+    10.0 * (255.0 * 255.0 / mse).log10()
+}
+
+/// 红色画中画（在右下四分之一）的外框（左、上、右、下，含）。
+/// 按「红色比其他通道高出 100 以上」判定，取的是过渡带的中点：
+/// 4:2:0 色度抽样会把颜色边缘抹开约 2 像素，用纯红的阈值会把边量窄。
+fn red_box(f: &VideoFrame) -> (u32, u32, u32, u32) {
+    let mut b = (u32::MAX, u32::MAX, 0, 0);
+    for y in f.height / 2..f.height {
+        for x in f.width / 2..f.width {
+            let i = ((y * f.width + x) * 4) as usize;
+            let (blue, green, red) = (f.data[i], f.data[i + 1], f.data[i + 2]);
+            if i32::from(red) - i32::from(green.max(blue)) > 100 {
+                b = (b.0.min(x), b.1.min(y), b.2.max(x), b.3.max(y));
+            }
+        }
+    }
+    assert!(b.0 <= b.2, "没找到红色画中画");
+    b
+}
+
+fn assert_box_close(a: (u32, u32, u32, u32), b: (u32, u32, u32, u32), what: &str) {
+    let d = [
+        a.0.abs_diff(b.0),
+        a.1.abs_diff(b.1),
+        a.2.abs_diff(b.2),
+        a.3.abs_diff(b.3),
+    ];
+    assert!(d.iter().all(|v| *v <= 1), "{what}：预览 {a:?}，导出 {b:?}");
+}
+
+#[test]
+fn export_matches_preview_three_layers() {
+    let p = three_layers(640, 360);
+    let t = RATE.time_of_frame(30);
+    let preview = preview_frame(&p, t);
+    let exported = exported_frame(&p, 640, 360, t);
+    let score = psnr(&preview, &exported);
+    assert!(score >= 35.0, "PSNR {score:.1} dB");
+    assert_box_close(red_box(&preview), red_box(&exported), "画中画边界");
+}
+
+#[test]
+fn export_size_differs_from_project() {
+    // 1280×720 的工程导出 640×360：画中画位置、大小按比例缩小
+    let p = three_layers(1280, 720);
+    let t = RATE.time_of_frame(30);
+    let preview = red_box(&preview_frame(&p, t));
+    let half = (preview.0 / 2, preview.1 / 2, preview.2 / 2, preview.3 / 2);
+    let exported = red_box(&exported_frame(&p, 640, 360, t));
+    assert_box_close(half, exported, "按比例换算后的画中画边界");
+}

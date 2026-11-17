@@ -18,9 +18,12 @@ workspace = true
 ve-core.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
+ve-media.workspace = true
+ve-render.workspace = true
 log.workspace = true
 
 [dev-dependencies]
+ve-engine.workspace = true
 pathdiff.workspace = true
 ve-core = { workspace = true, features = ["testing"] }
 ve-media = { workspace = true, features = ["test-fixtures"] }
