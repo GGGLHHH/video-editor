@@ -1,0 +1,29 @@
+[package]
+name = "ve-engine"
+description = "播放引擎：时间轴解析、混音、帧缓存、音视频工作线程、音频输出"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ve-core.workspace = true
+ve-media.workspace = true
+cpal.workspace = true
+rtrb.workspace = true
+smol.workspace = true
+lru.workspace = true
+log.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+ve-core = { workspace = true, features = ["testing"] }
+ve-media = { workspace = true, features = ["test-fixtures"] }
