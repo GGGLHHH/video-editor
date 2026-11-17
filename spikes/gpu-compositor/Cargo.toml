@@ -1,0 +1,19 @@
+[package]
+name = "gpu-compositor"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "一次性实验：wgpu 显卡合成多层画面 → 读回 → GPUI 显示 / ffmpeg 导出，测性能"
+
+[dependencies]
+wgpu = "30"
+pollster = "1"
+bytemuck = { version = "1", features = ["derive"] }
+gpui-kit = "0.10.0"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.release]
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 2
