@@ -194,6 +194,7 @@ impl Workspace {
 
     /// 文档变化后：同步引擎、属性面板，重绘。
     pub(crate) fn after_change(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.clamp_timeline_scroll();
         self.sync_engine();
         self.sync_inspector(window, cx);
         cx.notify();
@@ -290,6 +291,43 @@ impl Workspace {
                 Ok(())
             });
         }
+    }
+
+    /// Esc：正在拖动（时间轴或预览）时取消这次拖动、回到按下前，不记撤销；
+    /// 正在框选时回到框之前的选择；否则取消选择。
+    fn cancel(&mut self, _: &act::Cancel, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let preview = self.preview.drag.take().is_some();
+        let (timeline_busy, timeline_drag) = self.cancel_timeline_gesture();
+        if preview || timeline_drag {
+            self.doc.cancel_gesture();
+            // 预览拖动时属性面板的数字跟着变过，还原后也要填回原值
+            let restored = self
+                .inspector
+                .bound
+                .and_then(|c| self.doc.project.timeline.find_clip(c))
+                .map(|(_, c)| c.transform);
+            if let Some(t) = restored {
+                self.fill_transform(&t, window, cx);
+            }
+        } else if !timeline_busy {
+            self.doc.clear_selection();
+        }
+        self.after_change(window, cx);
+    }
+
+    fn select_all(&mut self, _: &act::SelectAll, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.doc.select_all();
+        self.after_change(window, cx);
+    }
+
+    fn deselect_all(
+        &mut self,
+        _: &act::DeselectAll,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.doc.clear_selection();
+        self.after_change(window, cx);
     }
 
     fn delete(&mut self, _: &act::Delete, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -475,6 +513,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::export))
             .on_action(cx.listener(Self::import_srt))
             .on_action(cx.listener(Self::export_srt))
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::deselect_all))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::play_pause))

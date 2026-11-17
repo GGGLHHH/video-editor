@@ -13,6 +13,8 @@ pub struct Document {
     pub project: Project,
     history: History,
     selection: Vec<ClipId>,
+    /// Shift 点击选区间的起点：最后一次单击 / Ctrl 点击的片段。
+    anchor: Option<ClipId>,
     path: Option<PathBuf>,
     dirty: bool,
     revision: u64,
@@ -38,6 +40,7 @@ impl Document {
             project,
             history: History::new(HISTORY_LIMIT),
             selection: Vec::new(),
+            anchor: None,
             path,
             dirty: false,
             revision: 0,
@@ -82,6 +85,15 @@ impl Document {
     /// 结束连续手势。
     pub fn end_gesture(&mut self) {
         self.history.commit_transaction(&self.project);
+    }
+
+    /// 放弃进行中的手势（拖到一半按 Esc）：回到手势开始前，不记撤销。没有手势返回 `false`。
+    pub fn cancel_gesture(&mut self) -> bool {
+        let restored = self.history.abort_transaction(&mut self.project);
+        if restored {
+            self.changed();
+        }
+        restored
     }
 
     /// 是否在连续手势中。
@@ -151,6 +163,7 @@ impl Document {
 
     /// 选中片段；`additive` 时切换该片段的选中状态。
     pub fn select(&mut self, clip: ClipId, additive: bool) {
+        self.anchor = Some(clip);
         if !additive {
             self.selection = vec![clip];
         } else if let Some(i) = self.selection.iter().position(|c| *c == clip) {
@@ -158,6 +171,63 @@ impl Document {
         } else {
             self.selection.push(clip);
         }
+    }
+
+    /// Shift 点击：选中起点片段和 `to` 之间的一块——两者所在轨道之间的每条轨上，
+    /// 和两者合起来的时间范围有交集的片段。没有起点（或起点已删）时只选中 `to`。起点不变。
+    pub fn select_range(&mut self, to: ClipId) {
+        let tl = &self.project.timeline;
+        let place = |clip: ClipId| {
+            tl.tracks.iter().enumerate().find_map(|(i, t)| {
+                t.clips
+                    .iter()
+                    .find(|c| c.id == clip)
+                    .map(|c| (i, c.start, c.end()))
+            })
+        };
+        let Some(target) = place(to) else { return };
+        let Some(from) = self.anchor.and_then(place) else {
+            self.selection = vec![to];
+            self.anchor = Some(to);
+            return;
+        };
+        let (top, bottom) = (from.0.min(target.0), from.0.max(target.0));
+        let (lo, hi) = (from.1.min(target.1), from.2.max(target.2));
+        self.selection = tl.tracks[top..=bottom]
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .filter(|c| c.start < hi && c.end() > lo)
+            .map(|c| c.id)
+            .collect();
+    }
+
+    /// 换成一组选择（框选）：去重，去掉不存在的片段。
+    pub fn set_selection(&mut self, clips: Vec<ClipId>) {
+        let tl = &self.project.timeline;
+        let mut out: Vec<ClipId> = Vec::with_capacity(clips.len());
+        for c in clips {
+            if !out.contains(&c) && tl.find_clip(c).is_some() {
+                out.push(c);
+            }
+        }
+        self.selection = out;
+    }
+
+    /// 片段是否选中。
+    #[must_use]
+    pub fn is_selected(&self, clip: ClipId) -> bool {
+        self.selection.contains(&clip)
+    }
+
+    /// 选中所有片段。
+    pub fn select_all(&mut self) {
+        self.selection = self
+            .project
+            .timeline
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter().map(|c| c.id))
+            .collect();
     }
 
     /// 取消选择。
@@ -215,6 +285,49 @@ mod tests {
     fn doc() -> (Document, ve_core::testing::SampleIds) {
         let (p, ids) = sample_project();
         (Document::from_project(p, None), ids)
+    }
+
+    fn sorted(d: &Document) -> Vec<ClipId> {
+        let mut v = d.selection().to_vec();
+        v.sort_unstable();
+        v
+    }
+
+    fn set(mut v: Vec<ClipId>) -> Vec<ClipId> {
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn shift_range_covers_tracks_and_time_between_anchor_and_target() {
+        let (mut d, ids) = doc();
+        // 没有起点：只选中点到的
+        d.select_range(ids.v2);
+        assert_eq!(d.selection(), [ids.v2]);
+        // 起点 s1（字幕轨 1–3 秒）到 a1（音频轨 0–8 秒）：音频、字幕两条轨上 0–8 秒内的
+        d.select(ids.s1, false);
+        d.select_range(ids.a1);
+        assert_eq!(sorted(&d), set(vec![ids.a1, ids.s1]));
+        // 起点不变：再 Shift 点 v1，范围改成 视频—字幕 三条轨、0–5 秒
+        d.select_range(ids.v1);
+        assert_eq!(sorted(&d), set(vec![ids.v1, ids.a1, ids.s1]));
+        // 同一轨：v1 到 v2
+        d.select(ids.v1, false);
+        d.select_range(ids.v2);
+        assert_eq!(sorted(&d), set(vec![ids.v1, ids.v2]));
+    }
+
+    #[test]
+    fn ctrl_toggle_moves_anchor_and_set_selection_replaces() {
+        let (mut d, ids) = doc();
+        d.select(ids.v1, false);
+        d.select(ids.a1, true);
+        assert!(d.is_selected(ids.v1) && d.is_selected(ids.a1));
+        // 起点跟着最后一次点击走
+        d.select_range(ids.s1);
+        assert_eq!(sorted(&d), set(vec![ids.a1, ids.s1]));
+        d.set_selection(vec![ids.v2, ids.v2, ClipId(999)]);
+        assert_eq!(d.selection(), [ids.v2], "去重、去掉不存在的");
     }
 
     #[test]

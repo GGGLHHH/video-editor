@@ -338,6 +338,7 @@ fn export_runs_and_reports_done(cx: &mut TestAppContext) {
         frame_rate: ve_core::FrameRate::new(30, 1),
         video_bitrate_kbps: 500,
         encoder: ve_export::Encoder::X264,
+        render: ve_export::RenderConfig { software: true },
     };
     cx.update_window(ui.win, |_, window, cx| {
         ui.view
@@ -680,4 +681,760 @@ fn recent_entry_for_deleted_file_is_removed(cx: &mut TestAppContext) {
     .unwrap();
     cx.run_until_parked();
     assert_eq!(ui.view.read_with(cx, |w, _| w.recent().paths().len()), 0);
+}
+
+fn track_count(cx: &TestAppContext, ui: &Ui, kind: TrackKind) -> usize {
+    ui.view.read_with(cx, |w, _| {
+        w.document()
+            .project
+            .timeline
+            .tracks
+            .iter()
+            .filter(|t| t.kind == kind)
+            .count()
+    })
+}
+
+fn click(cx: &mut TestAppContext, ui: &Ui, id: &'static str) {
+    cx.update_window(ui.win, |_, window, cx| window.click(id, cx))
+        .unwrap();
+    cx.run_until_parked();
+    frame(cx, ui);
+}
+
+#[gpui_kit::test]
+fn add_and_remove_tracks(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    click(cx, &ui, "add-video-track");
+    assert_eq!(track_count(cx, &ui, TrackKind::Video), 2);
+    click(cx, &ui, "add-audio-track");
+    assert_eq!(track_count(cx, &ui, TrackKind::Audio), 2);
+    // 每次加轨都是一步撤销
+    press(cx, &ui, "ctrl-z");
+    assert_eq!(track_count(cx, &ui, TrackKind::Audio), 1);
+    press(cx, &ui, "ctrl-z");
+    assert_eq!(track_count(cx, &ui, TrackKind::Video), 1);
+    press(cx, &ui, "ctrl-y");
+    assert_eq!(track_count(cx, &ui, TrackKind::Video), 2);
+    frame(cx, &ui);
+    // 新视频轨在最上面（第 0 行），空轨直接删，不用确认
+    click(cx, &ui, "track-del-0");
+    assert_eq!(track_count(cx, &ui, TrackKind::Video), 1);
+    // 只剩一条视频轨：没有删除按钮
+    cx.update_window(ui.win, |_, window, _| {
+        assert!(window.try_find("track-del-0").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn deleting_track_with_clips_asks_first(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click(cx, &ui, "add-video-track");
+    // 第 0 行是新的空视频轨，第 1 行是放了片段的原视频轨
+    click(cx, &ui, "track-del-1");
+    cx.simulate_prompt_answer("取消");
+    cx.run_until_parked();
+    assert_eq!(track_count(cx, &ui, TrackKind::Video), 2);
+    click(cx, &ui, "track-del-1");
+    cx.simulate_prompt_answer("删除");
+    cx.run_until_parked();
+    assert_eq!(track_count(cx, &ui, TrackKind::Video), 1);
+    assert_eq!(clips(cx, &ui, TrackKind::Video), 0, "片段随轨道一起删了");
+    // 能撤销回来
+    press(cx, &ui, "ctrl-z");
+    assert_eq!(track_count(cx, &ui, TrackKind::Video), 2);
+}
+
+#[gpui_kit::test]
+fn clip_drags_between_video_tracks(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click(cx, &ui, "add-video-track");
+    let origin = cx
+        .update_window(ui.win, |_, window, _| {
+            window.find("timeline").bounds().origin
+        })
+        .unwrap();
+    // 片段在第 1 行（V1），拖到第 0 行（V2）
+    let from = origin + timeline_point(1.0, 1.0);
+    let to = origin + timeline_point(1.0, 0.0);
+    cx.update_window(ui.win, |_, window, cx| window.drag(from, to, cx))
+        .unwrap();
+    cx.run_until_parked();
+    let top = ui.view.read_with(cx, |w, _| {
+        w.document().project.timeline.tracks[0].clips.len()
+    });
+    assert_eq!(top, 1);
+}
+
+fn first_video_transform(cx: &TestAppContext, ui: &Ui) -> ve_core::Transform {
+    ui.view.read_with(cx, |w, _| {
+        w.document()
+            .project
+            .timeline
+            .track_of_kind(TrackKind::Video)
+            .unwrap()
+            .clips[0]
+            .transform
+    })
+}
+
+fn type_into(cx: &mut TestAppContext, ui: &Ui, id: &'static str, text: &str) {
+    cx.update_window(ui.win, |_, window, cx| {
+        window.click(id, cx);
+        window.press("ctrl-a", cx);
+        window.input(text, cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    frame(cx, ui);
+}
+
+#[gpui_kit::test]
+fn transform_fields_edit_clip(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(
+        cx,
+        &ui,
+        vec![
+            fixture(Fixture::FrameIndexed30),
+            fixture(Fixture::ToneStereo48k),
+        ],
+        true,
+    );
+    // 音频片段没有「画面」区
+    cx.update_window(ui.win, |_, window, cx| {
+        window.click_at("timeline", timeline_point(0.5, 1.0), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    frame(cx, &ui);
+    cx.update_window(ui.win, |_, window, _| {
+        assert!(window.try_find("tf-x").is_none());
+    })
+    .unwrap();
+    // 选中视频片段
+    cx.update_window(ui.win, |_, window, cx| {
+        window.click_at("timeline", timeline_point(0.5, 0.0), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    frame(cx, &ui);
+    type_into(cx, &ui, "tf-x", "25");
+    assert!((first_video_transform(cx, &ui).x - 0.25).abs() < 1e-6);
+    type_into(cx, &ui, "tf-scale", "50");
+    assert!((first_video_transform(cx, &ui).scale - 0.5).abs() < 1e-6);
+    // 超出范围的缩放夹到 1000%
+    type_into(cx, &ui, "tf-scale", "5000");
+    assert!((first_video_transform(cx, &ui).scale - 10.0).abs() < 1e-6);
+    // 左右裁剪加起来到 100% 以上：这次修改不生效
+    type_into(cx, &ui, "tf-crop-l", "30");
+    type_into(cx, &ui, "tf-crop-r", "80");
+    let t = first_video_transform(cx, &ui);
+    assert!(
+        (t.crop.left - 0.3).abs() < 1e-6 && t.crop.right == 0.0,
+        "{t:?}"
+    );
+    // 重置
+    cx.update_window(ui.win, |_, window, cx| window.click("tf-reset", cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert!(first_video_transform(cx, &ui).is_default());
+    // 光标还在输入框里时 Ctrl+Z 是输入框自己的撤销，这里用工具栏的撤销按钮
+    click(cx, &ui, "tb-undo");
+    assert!((first_video_transform(cx, &ui).crop.left - 0.3).abs() < 1e-6);
+}
+
+#[gpui_kit::test]
+fn opacity_slider_drag_is_one_undo_step(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    cx.update_window(ui.win, |_, window, cx| {
+        window.click_at("timeline", timeline_point(0.5, 0.0), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    frame(cx, &ui);
+    let bounds = cx
+        .update_window(ui.win, |_, window, _| window.find("tf-opacity").bounds())
+        .unwrap();
+    let y = bounds.origin.y + bounds.size.height / 2.0;
+    let from = point(bounds.origin.x + bounds.size.width - px(2.0), y);
+    let to = point(bounds.origin.x + bounds.size.width / 2.0, y);
+    cx.update_window(ui.win, |_, window, cx| window.drag(from, to, cx))
+        .unwrap();
+    cx.run_until_parked();
+    let opacity = first_video_transform(cx, &ui).opacity;
+    assert!(opacity < 0.8 && opacity > 0.2, "{opacity}");
+    press(cx, &ui, "ctrl-z");
+    assert_eq!(first_video_transform(cx, &ui).opacity, 1.0);
+}
+
+/// 预览里画面的中心（窗口坐标）。
+fn preview_center(cx: &mut TestAppContext, ui: &Ui) -> Point<Pixels> {
+    let b = cx
+        .update_window(ui.win, |_, window, _| window.find("preview").bounds())
+        .unwrap();
+    point(
+        b.origin.x + b.size.width / 2.0,
+        b.origin.y + b.size.height / 2.0,
+    )
+}
+
+#[gpui_kit::test]
+fn drag_in_preview_moves_selected_clip(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    cx.update_window(ui.win, |_, window, cx| {
+        window.click_at("timeline", timeline_point(0.5, 0.0), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    frame(cx, &ui);
+    let from = preview_center(cx, &ui);
+    let to = from + point(px(40.0), px(0.0));
+    cx.update_window(ui.win, |_, window, cx| window.drag(from, to, cx))
+        .unwrap();
+    cx.run_until_parked();
+    let t = first_video_transform(cx, &ui);
+    assert!(t.x > 0.01, "{t:?}");
+    assert_eq!(t.y, 0.0);
+    click(cx, &ui, "tb-undo");
+    assert!(
+        first_video_transform(cx, &ui).is_default(),
+        "一次拖动一步撤销"
+    );
+}
+
+#[gpui_kit::test]
+fn click_in_preview_selects_top_layer(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click(cx, &ui, "add-video-track");
+    // 双击素材：接在主画面（V1，第 1 行）后面，2–4 秒；再把它拖到上层 V2（第 0 行）的 0 秒
+    let id = ui.view.read_with(cx, |w, _| {
+        *w.document().project.assets.keys().next().unwrap()
+    });
+    cx.update_window(ui.win, |_, window, cx| {
+        window.double_click(format!("asset-{}", id.0), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    frame(cx, &ui);
+    let origin = cx
+        .update_window(ui.win, |_, window, _| {
+            window.find("timeline").bounds().origin
+        })
+        .unwrap();
+    let (from, to) = (
+        origin + timeline_point(3.0, 1.0),
+        origin + timeline_point(1.0, 0.0),
+    );
+    cx.update_window(ui.win, |_, window, cx| window.drag(from, to, cx))
+        .unwrap();
+    cx.run_until_parked();
+    frame(cx, &ui);
+    let (pip, bottom) = ui.view.read_with(cx, |w, _| {
+        let t = &w.document().project.timeline.tracks;
+        (t[0].clips[0].id, t[1].clips[0].id)
+    });
+    // 选中上层片段，在属性面板里缩小一半（居中）
+    cx.update_window(ui.win, |_, window, cx| {
+        window.click_at("timeline", timeline_point(0.5, 0.0), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    frame(cx, &ui);
+    type_into(cx, &ui, "tf-scale", "50");
+    // 点时间轴空白处取消选择
+    cx.update_window(ui.win, |_, window, cx| {
+        window.click_at("timeline", timeline_point(20.0, 2.0), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    frame(cx, &ui);
+    let size = cx
+        .update_window(ui.win, |_, window, _| window.find("preview").bounds().size)
+        .unwrap();
+    // 预览中心落在上层画中画里
+    cx.update_window(ui.win, |_, window, cx| {
+        window.click_at("preview", point(size.width / 2.0, size.height / 2.0), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    frame(cx, &ui);
+    let selected = ui
+        .view
+        .read_with(cx, |w, _| w.document().selection().to_vec());
+    assert_eq!(selected, [pip], "中心点在上层画中画里");
+    // 画中画外面、下层画面里：选中下层
+    cx.update_window(ui.win, |_, window, cx| {
+        window.click_at(
+            "preview",
+            point(size.width / 2.0, size.height / 2.0 - size.height * 0.3),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let second = ui
+        .view
+        .read_with(cx, |w, _| w.document().selection().to_vec());
+    assert_eq!(second, [bottom], "点到下层画面");
+    // 选中铺满画面的下层以后，再点上层画中画：照样选中上层（上层盖住的地方点的是上层）
+    cx.update_window(ui.win, |_, window, cx| {
+        window.click_at("preview", point(size.width / 2.0, size.height / 2.0), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let third = ui
+        .view
+        .read_with(cx, |w, _| w.document().selection().to_vec());
+    assert_eq!(third, [pip], "下层选中时仍能点到上层");
+}
+
+#[gpui_kit::test]
+fn many_tracks_scroll_vertically_over_headers(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    for _ in 0..3 {
+        click(cx, &ui, "add-video-track");
+    }
+    // 6 条轨（V4 V3 V2 V1 A1 S1），时间轴放不下：在轨道头上滚轮往下滚
+    cx.update_window(ui.win, |_, window, _| {
+        assert!(window.try_find("track-del-0").is_some());
+    })
+    .unwrap();
+    cx.update_window(ui.win, |_, window, cx| {
+        window.scroll(
+            "track-headers",
+            ScrollDelta::Pixels(point(px(0.), px(-120.))),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    frame(cx, &ui);
+    // 第 0 行滚到标尺下面去了：它的删除按钮不再显示
+    cx.update_window(ui.win, |_, window, _| {
+        assert!(window.try_find("track-del-0").is_none());
+        assert!(window.try_find("track-del-3").is_some());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn switching_selection_after_drag_adds_no_hidden_edit(cx: &mut TestAppContext) {
+    // 预览上拖出来的值精度比输入框显示的高；换选中时不能把四舍五入后的值再写回去
+    let ui = open(cx);
+    import(
+        cx,
+        &ui,
+        vec![
+            fixture(Fixture::FrameIndexed30),
+            fixture(Fixture::ToneStereo48k),
+        ],
+        true,
+    );
+    cx.update_window(ui.win, |_, window, cx| {
+        window.click_at("timeline", timeline_point(0.5, 0.0), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    frame(cx, &ui);
+    let from = preview_center(cx, &ui);
+    let to = from + point(px(37.3), px(11.7));
+    cx.update_window(ui.win, |_, window, cx| window.drag(from, to, cx))
+        .unwrap();
+    cx.run_until_parked();
+    let dragged = first_video_transform(cx, &ui);
+    assert!(dragged.x != 0.0);
+    // 点音频片段（换选中）
+    cx.update_window(ui.win, |_, window, cx| {
+        window.click_at("timeline", timeline_point(0.5, 1.0), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        first_video_transform(cx, &ui),
+        dragged,
+        "换选中不应改动画面"
+    );
+    click(cx, &ui, "tb-undo");
+    assert!(
+        first_video_transform(cx, &ui).is_default(),
+        "撤销一步就回到拖动之前"
+    );
+}
+
+#[gpui_kit::test]
+fn scroll_is_clamped_after_tracks_go_away(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    for _ in 0..3 {
+        click(cx, &ui, "add-video-track");
+    }
+    cx.update_window(ui.win, |_, window, cx| {
+        window.scroll(
+            "track-headers",
+            ScrollDelta::Pixels(point(px(0.), px(-200.))),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    // 撤销三次加轨：剩 3 条轨，放得下，滚动位置要回到 0
+    for _ in 0..3 {
+        click(cx, &ui, "tb-undo");
+    }
+    cx.update_window(ui.win, |_, window, cx| {
+        window.click_at("timeline", timeline_point(0.5, 0.0), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let selected = ui.view.read_with(cx, |w, _| w.document().selection().len());
+    assert_eq!(selected, 1, "第 0 行就是视频轨上的片段");
+}
+
+/// 只按下、移动，不松开（模拟拖到一半）。
+fn press_and_move(cx: &mut TestAppContext, ui: &Ui, from: Point<Pixels>, to: Point<Pixels>) {
+    press_and_move_with(cx, ui, from, to, gpui_kit::Modifiers::default());
+}
+
+/// 同上，按住修饰键。
+fn press_and_move_with(
+    cx: &mut TestAppContext,
+    ui: &Ui,
+    from: Point<Pixels>,
+    to: Point<Pixels>,
+    modifiers: gpui_kit::Modifiers,
+) {
+    use gpui_kit::{InputEvent as _, MouseButton, MouseDownEvent, MouseMoveEvent};
+    cx.update_window(ui.win, |_, window, cx| {
+        window.dispatch_event(
+            MouseDownEvent {
+                button: MouseButton::Left,
+                position: from,
+                modifiers,
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+        window.dispatch_event(
+            MouseMoveEvent {
+                position: to,
+                pressed_button: Some(MouseButton::Left),
+                modifiers,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+/// 松开鼠标。
+fn release(cx: &mut TestAppContext, ui: &Ui, at: Point<Pixels>) {
+    use gpui_kit::{InputEvent as _, Modifiers, MouseButton, MouseUpEvent};
+    cx.update_window(ui.win, |_, window, cx| {
+        window.dispatch_event(
+            MouseUpEvent {
+                button: MouseButton::Left,
+                position: at,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+fn first_video_start(cx: &TestAppContext, ui: &Ui) -> Time {
+    ui.view.read_with(cx, |w, _| {
+        w.document()
+            .project
+            .timeline
+            .track_of_kind(TrackKind::Video)
+            .unwrap()
+            .clips[0]
+            .start
+    })
+}
+
+#[gpui_kit::test]
+fn escape_clears_selection(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    cx.update_window(ui.win, |_, window, cx| {
+        window.click_at("timeline", timeline_point(0.5, 0.0), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        ui.view.read_with(cx, |w, _| w.document().selection().len()),
+        1
+    );
+    press(cx, &ui, "escape");
+    assert!(
+        ui.view
+            .read_with(cx, |w, _| w.document().selection().is_empty())
+    );
+}
+
+#[gpui_kit::test]
+fn escape_mid_preview_drag_restores_and_adds_no_undo_step(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    cx.update_window(ui.win, |_, window, cx| {
+        window.click_at("timeline", timeline_point(0.5, 0.0), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    frame(cx, &ui);
+    let from = preview_center(cx, &ui);
+    let to = from + point(px(40.0), px(0.0));
+    press_and_move(cx, &ui, from, to);
+    assert!(first_video_transform(cx, &ui).x > 0.01);
+    press(cx, &ui, "escape");
+    assert!(
+        first_video_transform(cx, &ui).is_default(),
+        "拖到一半按 Esc 回到原位"
+    );
+    // 拖动取消后：选择保留（第一下 Esc 只取消拖动），松开鼠标不再改动
+    assert_eq!(
+        ui.view.read_with(cx, |w, _| w.document().selection().len()),
+        1
+    );
+    release(cx, &ui, to);
+    assert!(first_video_transform(cx, &ui).is_default());
+    // 没有留下撤销步骤：撤销的是导入，不是拖动
+    let before = clips(cx, &ui, TrackKind::Video);
+    click(cx, &ui, "tb-undo");
+    assert_ne!(clips(cx, &ui, TrackKind::Video), before);
+}
+
+#[gpui_kit::test]
+fn escape_mid_timeline_drag_restores_clip(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    let origin = cx
+        .update_window(ui.win, |_, window, _| {
+            window.find("timeline").bounds().origin
+        })
+        .unwrap();
+    let from = origin + timeline_point(0.5, 0.0);
+    let to = from + point(px(100.0), px(0.0));
+    press_and_move(cx, &ui, from, to);
+    assert!(first_video_start(cx, &ui) > Time::ZERO, "拖动生效了");
+    press(cx, &ui, "escape");
+    assert_eq!(
+        first_video_start(cx, &ui),
+        Time::ZERO,
+        "拖到一半按 Esc 回到原位"
+    );
+    release(cx, &ui, to);
+    assert_eq!(first_video_start(cx, &ui), Time::ZERO);
+}
+
+#[gpui_kit::test]
+fn ctrl_a_selects_all_and_ctrl_shift_a_clears(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    ui.view
+        .read_with(cx, |w, _| w.engine().seek(Time::from_secs(1)));
+    frame(cx, &ui);
+    press(cx, &ui, "s");
+    let total: usize = ui.view.read_with(cx, |w, _| {
+        w.document()
+            .project
+            .timeline
+            .tracks
+            .iter()
+            .map(|t| t.clips.len())
+            .sum()
+    });
+    assert!(total >= 2);
+    press(cx, &ui, "ctrl-a");
+    assert_eq!(
+        ui.view.read_with(cx, |w, _| w.document().selection().len()),
+        total
+    );
+    press(cx, &ui, "ctrl-shift-a");
+    assert!(
+        ui.view
+            .read_with(cx, |w, _| w.document().selection().is_empty())
+    );
+}
+
+/// 视频轨上的片段（按时间先后）。
+fn video_clips(cx: &TestAppContext, ui: &Ui) -> Vec<(ve_core::ClipId, Time)> {
+    ui.view.read_with(cx, |w, _| {
+        w.document()
+            .project
+            .timeline
+            .track_of_kind(TrackKind::Video)
+            .unwrap()
+            .clips
+            .iter()
+            .map(|c| (c.id, c.start))
+            .collect()
+    })
+}
+
+fn ids(mut v: Vec<ve_core::ClipId>) -> Vec<ve_core::ClipId> {
+    v.sort_unstable();
+    v
+}
+
+fn selected(cx: &TestAppContext, ui: &Ui) -> Vec<ve_core::ClipId> {
+    let mut v = ui
+        .view
+        .read_with(cx, |w, _| w.document().selection().to_vec());
+    v.sort_unstable();
+    v
+}
+
+/// 在时间轴上点一下，可带修饰键。
+fn click_timeline(cx: &mut TestAppContext, ui: &Ui, secs: f32, track: f32, m: gpui_kit::Modifiers) {
+    cx.update_window(ui.win, |_, window, cx| {
+        window.click_with_options(
+            "timeline",
+            gpui_kit::test::ClickOptions::new()
+                .with_offset(timeline_point(secs, track))
+                .with_modifiers(m),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+fn ctrl() -> gpui_kit::Modifiers {
+    gpui_kit::Modifiers {
+        control: true,
+        ..Default::default()
+    }
+}
+
+/// 视频轨上 0–1、1–2、2–4 秒三段。
+fn three_clips(cx: &mut TestAppContext, ui: &Ui) -> Vec<ve_core::ClipId> {
+    import(cx, ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    import(cx, ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    ui.view
+        .read_with(cx, |w, _| w.engine().seek(Time::from_secs(1)));
+    frame(cx, ui);
+    press(cx, ui, "s");
+    let ids: Vec<_> = video_clips(cx, ui).into_iter().map(|(c, _)| c).collect();
+    assert_eq!(ids.len(), 3);
+    press(cx, ui, "escape");
+    ids
+}
+
+#[gpui_kit::test]
+fn ctrl_click_toggles_and_shift_click_selects_range(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    let c = three_clips(cx, &ui);
+    let none = gpui_kit::Modifiers::default();
+    let shift = gpui_kit::Modifiers {
+        shift: true,
+        ..Default::default()
+    };
+    click_timeline(cx, &ui, 0.5, 0.0, none);
+    click_timeline(cx, &ui, 3.0, 0.0, shift);
+    assert_eq!(
+        selected(cx, &ui),
+        ids(c.clone()),
+        "Shift 点击：起点到这里的一段"
+    );
+    click_timeline(cx, &ui, 1.5, 0.0, ctrl());
+    assert_eq!(selected(cx, &ui), ids(vec![c[0], c[2]]), "Ctrl 点击：减选");
+    click_timeline(cx, &ui, 1.5, 0.0, ctrl());
+    assert_eq!(selected(cx, &ui), ids(c.clone()), "Ctrl 点击：加选");
+    // 多选里单击其中一个（不拖）：只剩它
+    click_timeline(cx, &ui, 0.5, 0.0, none);
+    assert_eq!(selected(cx, &ui), ids(vec![c[0]]));
+}
+
+#[gpui_kit::test]
+fn dragging_one_of_selected_clips_moves_them_together(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    let c = three_clips(cx, &ui);
+    let origin = cx
+        .update_window(ui.win, |_, window, _| {
+            window.find("timeline").bounds().origin
+        })
+        .unwrap();
+    // 先删掉第三段（2–4 秒）腾出地方；再选中前两段，抓住第二段往后拖 1 秒（50 像素）
+    click_timeline(cx, &ui, 3.0, 0.0, gpui_kit::Modifiers::default());
+    press(cx, &ui, "delete");
+    click_timeline(cx, &ui, 0.5, 0.0, gpui_kit::Modifiers::default());
+    click_timeline(cx, &ui, 1.5, 0.0, ctrl());
+    let from = origin + timeline_point(1.5, 0.0);
+    cx.update_window(ui.win, |_, window, cx| {
+        window.drag(from, from + point(px(50.0), px(0.0)), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let starts: Vec<Time> = video_clips(cx, &ui).into_iter().map(|(_, t)| t).collect();
+    assert_eq!(starts, vec![Time::from_secs(1), Time::from_secs(2)]);
+    assert_eq!(selected(cx, &ui), ids(vec![c[0], c[1]]), "拖完选择不变");
+}
+
+#[gpui_kit::test]
+fn marquee_selects_touched_clips_and_escape_restores(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    let c = three_clips(cx, &ui);
+    let origin = cx
+        .update_window(ui.win, |_, window, _| {
+            window.find("timeline").bounds().origin
+        })
+        .unwrap();
+    click_timeline(cx, &ui, 0.5, 0.0, gpui_kit::Modifiers::default());
+    // 从空白处（5 秒）框到 1.5 秒：碰到第二、三段，换掉原来的选择
+    let from = origin + timeline_point(5.0, 0.0);
+    let to = origin + timeline_point(1.5, 0.0);
+    cx.update_window(ui.win, |_, window, cx| window.drag(from, to, cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(selected(cx, &ui), ids(vec![c[1], c[2]]));
+    // 按住 Ctrl 框：在原有选择上加；框到一半按 Esc 回到框之前
+    click_timeline(cx, &ui, 0.5, 0.0, gpui_kit::Modifiers::default());
+    press_and_move_with(cx, &ui, from, origin + timeline_point(3.0, 0.0), ctrl());
+    assert_eq!(selected(cx, &ui), ids(vec![c[0], c[2]]));
+    press(cx, &ui, "escape");
+    assert_eq!(selected(cx, &ui), ids(vec![c[0]]));
+    release(cx, &ui, to);
+    assert_eq!(selected(cx, &ui), ids(vec![c[0]]));
+}
+
+#[gpui_kit::test]
+fn alt_drag_in_preview_skips_snapping(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click_timeline(cx, &ui, 0.5, 0.0, gpui_kit::Modifiers::default());
+    frame(cx, &ui);
+    let from = preview_center(cx, &ui);
+    let to = from + point(px(3.0), px(0.0));
+    // 不按 Alt：离中线 3 像素，吸回中间
+    press_and_move(cx, &ui, from, to);
+    release(cx, &ui, to);
+    assert_eq!(first_video_transform(cx, &ui).x, 0.0);
+    let alt = gpui_kit::Modifiers {
+        alt: true,
+        ..Default::default()
+    };
+    press_and_move_with(cx, &ui, from, to, alt);
+    release(cx, &ui, to);
+    assert!(first_video_transform(cx, &ui).x > 0.0, "按住 Alt 不吸附");
 }

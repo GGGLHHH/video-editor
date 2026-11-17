@@ -66,6 +66,31 @@ pub mod palette {
     pub fn selection() -> Hsla {
         rgb(0xff_c94a).into()
     }
+    /// 鼠标悬停的片段描边（比选中弱得多）。
+    #[must_use]
+    pub fn hover() -> Hsla {
+        rgba(0xffff_ff80).into()
+    }
+    /// 拖动中片段原位置的影子。
+    #[must_use]
+    pub fn ghost() -> Hsla {
+        rgba(0xffff_ff1f).into()
+    }
+    /// 框选矩形的填充。
+    #[must_use]
+    pub fn marquee() -> Hsla {
+        rgba(0xffc9_4a26).into()
+    }
+    /// 选中片段上的整体蒙色。
+    #[must_use]
+    pub fn selection_tint() -> Hsla {
+        rgba(0xffc9_4a40).into()
+    }
+    /// 选中片段标题栏（亮底）上的文字。
+    #[must_use]
+    pub fn selection_text() -> Hsla {
+        rgb(0x1a_1608).into()
+    }
     /// 播放头。
     #[must_use]
     pub fn playhead() -> Hsla {

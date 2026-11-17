@@ -8,8 +8,9 @@ use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{IconName, h_flex, v_flex};
 use gpui_kit::{
-    Bounds, Context, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, RenderImage,
-    SharedString, Styled as _, Window, canvas, div, img, px,
+    Bounds, Context, InteractiveElement as _, IntoElement, MouseButton, MouseUpEvent,
+    ParentElement as _, Pixels, RenderImage, SharedString, Styled as _, Window, canvas, div, img,
+    px,
 };
 use std::sync::Arc;
 use ve_core::format_timecode;
@@ -27,8 +28,14 @@ pub struct PreviewState {
     pub bounds: Bounds<Pixels>,
     /// 显示过的帧数（性能统计）。
     pub frames_shown: u64,
+    /// 相邻两次换帧间隔超过 25 ms 的次数（性能统计：掉帧）。
+    pub long_gaps: u64,
+    /// 上一次换帧的时刻。
+    last_shown: Option<std::time::Instant>,
     /// 字幕字体的 em / 行高（见 [`ass_em_ratio`]），第一次渲染时按实际字体度量算出。
     pub em_ratio: Option<f32>,
+    /// 正在预览上拖动的图层。
+    pub(crate) drag: Option<crate::preview_edit::PreviewDrag>,
 }
 
 /// BGRA 帧 → 可直接上传的图片（GPUI 的 `RenderImage` 内部就是 BGRA）。
@@ -99,6 +106,15 @@ impl Workspace {
         }
         self.preview.retired = std::mem::replace(&mut self.preview.image, next);
         self.preview.frames_shown += 1;
+        let now = std::time::Instant::now();
+        if self
+            .preview
+            .last_shown
+            .replace(now)
+            .is_some_and(|prev| now - prev > std::time::Duration::from_millis(25))
+        {
+            self.preview.long_gaps += 1;
+        }
     }
 
     pub(crate) fn render_preview(&self, cx: &Context<'_, Self>) -> impl IntoElement {
@@ -139,6 +155,16 @@ impl Workspace {
             .relative()
             .overflow_hidden()
             .bg(palette::preview_bg())
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::preview_mouse_down))
+            .on_mouse_move(cx.listener(Self::preview_mouse_move))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.preview_mouse_up(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.preview_mouse_up(cx)),
+            )
             .child(
                 canvas(
                     move |bounds, _, cx| this.update(cx, |w, _| w.preview.bounds = bounds),
@@ -169,7 +195,8 @@ impl Workspace {
                     .w(video.size.width)
                     // 底边对齐、向上长（和 libass 一致），多行时不会掉出画面
                     .bottom(self.preview.bounds.size.height - (vy + video.size.height) + margin)
-            }));
+            }))
+            .children(self.render_selection_box(cx));
 
         v_flex()
             .size_full()

@@ -90,6 +90,7 @@ impl ExportForm {
             frame_rate: s.frame_rate,
             video_bitrate_kbps: kbps,
             encoder: self.encoder,
+            render: ve_export::RenderConfig::default(),
         }
     }
 }
@@ -251,13 +252,17 @@ impl Workspace {
         let spawned = std::thread::Builder::new()
             .name("ve-export".into())
             .spawn(move || {
-                let result = ve_export::export(
-                    &project,
-                    &settings,
-                    |p| drop(tx.try_send(Msg::Progress(p))),
-                    &cancel,
-                )
-                .map_err(|e| e.to_string());
+                // 导出里任何意外的 panic 也要变成失败消息，否则界面会一直停在某个进度
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    ve_export::export(
+                        &project,
+                        &settings,
+                        |p| drop(tx.try_send(Msg::Progress(p))),
+                        &cancel,
+                    )
+                    .map_err(|e| e.to_string())
+                }))
+                .unwrap_or_else(|_| Err("导出时出现内部错误".to_owned()));
                 drop(tx.try_send(Msg::Done(result)));
             });
         if let Err(e) = spawned {

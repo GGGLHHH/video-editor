@@ -32,6 +32,9 @@ mod generated {
             ZoomIn,
             ZoomOut,
             AddSubtitle,
+            Cancel,
+            SelectAll,
+            DeselectAll,
         ]
     );
 }
@@ -71,5 +74,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-=", ZoomIn, Some(NO_INPUT)),
         KeyBinding::new("ctrl--", ZoomOut, Some(NO_INPUT)),
         KeyBinding::new("t", AddSubtitle, Some(NO_INPUT)),
+        // Esc：拖到一半先取消拖动（回到原位），否则取消选择
+        KeyBinding::new("escape", Cancel, Some(NO_INPUT)),
+        KeyBinding::new("ctrl-a", SelectAll, Some(NO_INPUT)),
+        KeyBinding::new("ctrl-shift-a", DeselectAll, Some(NO_INPUT)),
     ]);
 }

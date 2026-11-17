@@ -1,10 +1,11 @@
 //! 时间轴拖拽：拖标尺定位、拖片段移动（可换轨、吸附）、拖边缘修剪。纯逻辑。
 //!
-//! 位置都吸附到帧；靠近播放头或其他片段边缘（8 像素内）时吸过去。
+//! 位置都吸附到帧；靠近播放头或其他片段边缘（8 像素内）时吸过去（按住 Alt 时只吸到帧）。
+//! 拖的是多选里的一个片段时，整组在各自轨道上一起平移。
 
 use super::{Hit, TimelineGeometry, Zone};
 use crate::document::Document;
-use ve_core::edit::{move_clip, trim_end, trim_start};
+use ve_core::edit::{move_clip, move_clips, trim_end, trim_start};
 use ve_core::snap::{snap, snap_targets};
 use ve_core::{ClipId, FrameRate, Time};
 
@@ -85,7 +86,19 @@ impl Drag {
         }
     }
 
+    /// 拖的片段在多选里时，整组一起平移；否则只动它自己（返回空）。
+    #[must_use]
+    pub fn group(&self, doc: &Document) -> Vec<ClipId> {
+        match *self {
+            Self::Move { clip, .. } if doc.is_selected(clip) && doc.selection().len() > 1 => {
+                doc.selection().to_vec()
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// 鼠标移动到 `(x, y)`：更新工程（编辑失败则保持上一个合法状态）。
+    /// `snapping` 为假（按住 Alt）时不吸附播放头和片段边缘，只吸到帧。
     pub fn update(
         &mut self,
         doc: &mut Document,
@@ -93,9 +106,16 @@ impl Drag {
         x: f32,
         y: f32,
         playhead: Time,
+        snapping: bool,
     ) -> DragOutcome {
         let pointer = geo.x_to_time(x).max(Time::ZERO);
-        let snapper = Snapper::new(doc, geo, playhead, self.clip());
+        let group = self.group(doc);
+        let exclude = if group.is_empty() {
+            self.clip().into_iter().collect()
+        } else {
+            group.clone()
+        };
+        let snapper = Snapper::new(doc, geo, playhead, &exclude, snapping);
         match *self {
             Self::Scrub => DragOutcome {
                 seek: Some(snapper.rate.snap(pointer)),
@@ -107,7 +127,14 @@ impl Drag {
                 duration,
             } => {
                 let (start, line) = snapper.place_range((pointer - grab).max(Time::ZERO), duration);
-                move_to_hovered_track(doc, geo, clip, y, start);
+                if group.is_empty() {
+                    move_to_hovered_track(doc, geo, clip, y, start);
+                } else if let Some((_, c)) = doc.project.timeline.find_clip(clip) {
+                    let delta = start - c.start;
+                    if delta != Time::ZERO {
+                        let _ = doc.edit(|p| move_clips(p, &group, delta));
+                    }
+                }
                 DragOutcome {
                     seek: None,
                     snap: line,
@@ -145,11 +172,15 @@ impl Snapper {
         doc: &Document,
         geo: &TimelineGeometry,
         playhead: Time,
-        exclude: Option<ClipId>,
+        exclude: &[ClipId],
+        snapping: bool,
     ) -> Self {
-        let exclude: Vec<ClipId> = exclude.into_iter().collect();
         Self {
-            targets: snap_targets(&doc.project.timeline, playhead, &exclude),
+            targets: if snapping {
+                snap_targets(&doc.project.timeline, playhead, exclude)
+            } else {
+                Vec::new()
+            },
             tolerance: Time::from_secs_f64(f64::from(SNAP_PX / geo.px_per_second)),
             rate: doc.project.settings.frame_rate,
         }
@@ -234,10 +265,10 @@ mod tests {
         let (mut d, _, g) = setup();
         let mut drag = Drag::begin(&d, &g, x(&g, 3.2), 5.0, Time::ZERO).unwrap();
         assert!(matches!(drag, Drag::Scrub));
-        let out = drag.update(&mut d, &g, x(&g, 3.2), 5.0, Time::ZERO);
+        let out = drag.update(&mut d, &g, x(&g, 3.2), 5.0, Time::ZERO, true);
         assert_eq!(out.seek, Some(Time::from_millis(3200)));
         // 拖出左边也夹到 0
-        let left_of_zero = drag.update(&mut d, &g, g.header_width - 100.0, 5.0, Time::ZERO);
+        let left_of_zero = drag.update(&mut d, &g, g.header_width - 100.0, 5.0, Time::ZERO, true);
         assert_eq!(left_of_zero.seek, Some(Time::ZERO));
     }
 
@@ -249,17 +280,24 @@ mod tests {
         let mut drag = Drag::begin(&d, &g, x(&g, 6.5), row(&g, 0.0), Time::ZERO).unwrap();
         assert!(matches!(drag, Drag::Move { .. }));
         // 拖到 12.06 秒：起点 10.56，不靠近任何目标 → 吸到最近的帧（第 317 帧）
-        drag.update(&mut d, &g, x(&g, 12.06), row(&g, 0.0), Time::ZERO);
+        drag.update(&mut d, &g, x(&g, 12.06), row(&g, 0.0), Time::ZERO, true);
         assert_eq!(
             start_of(&d, ids.v2),
             FrameRate::new(30, 1).time_of_frame(317)
         );
         // 拖到起点 8.04 秒：离 a1 终点（8 秒）4px，吸过去
-        let out = drag.update(&mut d, &g, x(&g, 9.54), row(&g, 0.0), Time::ZERO);
+        let out = drag.update(&mut d, &g, x(&g, 9.54), row(&g, 0.0), Time::ZERO, true);
         assert_eq!(start_of(&d, ids.v2), Time::from_secs(8));
         assert_eq!(out.snap, Some(Time::from_secs(8)));
         // 终点吸到播放头（20 秒）：起点 16.97 → 终点 19.97
-        drag.update(&mut d, &g, x(&g, 18.47), row(&g, 0.0), Time::from_secs(20));
+        drag.update(
+            &mut d,
+            &g,
+            x(&g, 18.47),
+            row(&g, 0.0),
+            Time::from_secs(20),
+            true,
+        );
         assert_eq!(start_of(&d, ids.v2), Time::from_secs(17));
         d.end_gesture();
         assert!(d.undo());
@@ -270,10 +308,10 @@ mod tests {
     fn drag_into_overlap_keeps_last_valid_position() {
         let (mut d, ids, g) = setup();
         let mut drag = Drag::begin(&d, &g, x(&g, 6.0), row(&g, 0.0), Time::ZERO).unwrap();
-        drag.update(&mut d, &g, x(&g, 21.0), row(&g, 0.0), Time::ZERO);
+        drag.update(&mut d, &g, x(&g, 21.0), row(&g, 0.0), Time::ZERO, true);
         let ok = start_of(&d, ids.v2);
         // 拖到和 v1 重叠：保持上一个合法位置
-        drag.update(&mut d, &g, x(&g, 3.0), row(&g, 0.0), Time::ZERO);
+        drag.update(&mut d, &g, x(&g, 3.0), row(&g, 0.0), Time::ZERO, true);
         assert_eq!(start_of(&d, ids.v2), ok);
     }
 
@@ -281,13 +319,13 @@ mod tests {
     fn drag_to_audio_track_changes_track_and_wrong_kind_stays() {
         let (mut d, ids, g) = setup();
         let mut drag = Drag::begin(&d, &g, x(&g, 6.0), row(&g, 0.0), Time::ZERO).unwrap();
-        drag.update(&mut d, &g, x(&g, 21.0), row(&g, 1.0), Time::ZERO);
+        drag.update(&mut d, &g, x(&g, 21.0), row(&g, 1.0), Time::ZERO, true);
         assert_eq!(
             d.project.timeline.find_clip(ids.v2).unwrap().0,
             ids.audio_track
         );
         // 拖到字幕轨：类型不符，留在原轨（音频轨）
-        drag.update(&mut d, &g, x(&g, 25.0), row(&g, 2.0), Time::ZERO);
+        drag.update(&mut d, &g, x(&g, 25.0), row(&g, 2.0), Time::ZERO, true);
         assert_eq!(
             d.project.timeline.find_clip(ids.v2).unwrap().0,
             ids.audio_track
@@ -299,16 +337,55 @@ mod tests {
         let (mut d, ids, g) = setup();
         let mut left = Drag::begin(&d, &g, x(&g, 5.0) + 2.0, row(&g, 0.0), Time::ZERO).unwrap();
         assert!(matches!(left, Drag::TrimStart { .. }));
-        left.update(&mut d, &g, x(&g, 6.0), row(&g, 0.0), Time::ZERO);
+        left.update(&mut d, &g, x(&g, 6.0), row(&g, 0.0), Time::ZERO, true);
         let c = std::sync::Arc::clone(d.project.timeline.find_clip(ids.v2).unwrap().1);
         assert_eq!((c.start, c.end()), (Time::from_secs(6), Time::from_secs(8)));
         let mut right = Drag::begin(&d, &g, x(&g, 8.0) - 2.0, row(&g, 0.0), Time::ZERO).unwrap();
         assert!(matches!(right, Drag::TrimEnd { .. }));
-        right.update(&mut d, &g, x(&g, 9.0), row(&g, 0.0), Time::ZERO);
+        right.update(&mut d, &g, x(&g, 9.0), row(&g, 0.0), Time::ZERO, true);
         assert_eq!(
             d.project.timeline.find_clip(ids.v2).unwrap().1.end(),
             Time::from_secs(9)
         );
+    }
+
+    #[test]
+    fn dragging_a_selected_clip_moves_the_whole_selection() {
+        let (mut d, ids, g) = setup();
+        d.set_selection(vec![ids.v2, ids.a1]);
+        let mut drag = Drag::begin(&d, &g, x(&g, 6.5), row(&g, 0.0), Time::ZERO).unwrap();
+        // 往后 10 秒，鼠标还拖到了音频行：多选时只平移，不换轨
+        drag.update(&mut d, &g, x(&g, 16.5), row(&g, 1.0), Time::ZERO, true);
+        assert_eq!(start_of(&d, ids.v2), Time::from_secs(15));
+        assert_eq!(start_of(&d, ids.a1), Time::from_secs(10));
+        assert_eq!(
+            d.project.timeline.find_clip(ids.v2).unwrap().0,
+            ids.video_track
+        );
+        assert_eq!(start_of(&d, ids.v1), Time::ZERO, "没选中的不动");
+    }
+
+    #[test]
+    fn dragging_an_unselected_clip_moves_only_it() {
+        let (mut d, ids, g) = setup();
+        d.set_selection(vec![ids.v1, ids.a1]);
+        let mut drag = Drag::begin(&d, &g, x(&g, 6.5), row(&g, 0.0), Time::ZERO).unwrap();
+        drag.update(&mut d, &g, x(&g, 16.5), row(&g, 0.0), Time::ZERO, true);
+        assert_eq!(start_of(&d, ids.v2), Time::from_secs(15));
+        assert_eq!(start_of(&d, ids.a1), Time::ZERO);
+    }
+
+    #[test]
+    fn snapping_off_places_on_frames_only() {
+        let (mut d, ids, g) = setup();
+        let mut drag = Drag::begin(&d, &g, x(&g, 6.5), row(&g, 0.0), Time::ZERO).unwrap();
+        // 起点 8.04 秒离 a1 终点（8 秒）4 像素：吸附关掉时只吸到帧（第 241 帧）
+        let out = drag.update(&mut d, &g, x(&g, 9.54), row(&g, 0.0), Time::ZERO, false);
+        assert_eq!(
+            start_of(&d, ids.v2),
+            FrameRate::new(30, 1).time_of_frame(241)
+        );
+        assert_eq!(out.snap, None);
     }
 
     #[test]

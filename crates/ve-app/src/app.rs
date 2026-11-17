@@ -39,9 +39,11 @@ pub struct Args {
     pub media: Vec<PathBuf>,
     /// 播放性能测试：播放这么多秒后在日志里输出帧率并退出。
     pub bench_seconds: Option<u64>,
+    /// 播放性能测试时把素材铺成几层（见 `ve_core::bench`），默认 1。
+    pub bench_layers: usize,
 }
 
-/// 解析命令行：`ve-app [工程.vep] [素材...] [--bench-playback 素材 --seconds N]`。
+/// 解析命令行：`ve-app [工程.vep] [素材...] [--bench-playback 素材 --seconds N --layers N]`。
 #[must_use]
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Args {
     let mut out = Args::default();
@@ -53,6 +55,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Args {
                 out.bench_seconds = out.bench_seconds.or(Some(10));
             }
             "--seconds" => out.bench_seconds = it.next().and_then(|s| s.parse().ok()),
+            "--layers" => out.bench_layers = it.next().and_then(|s| s.parse().ok()).unwrap_or(1),
             _ if a.to_ascii_lowercase().ends_with(".vep") => out.project = Some(PathBuf::from(a)),
             _ => out.media.push(PathBuf::from(a)),
         }
@@ -116,5 +119,9 @@ mod tests {
             (vec![PathBuf::from("z.mp4")], Some(30))
         );
         assert_eq!(args(&["--bench-playback", "z.mp4"]).bench_seconds, Some(10));
+        assert_eq!(
+            args(&["--bench-playback", "z.mp4", "--layers", "3"]).bench_layers,
+            3
+        );
     }
 }

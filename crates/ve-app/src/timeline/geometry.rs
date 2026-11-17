@@ -49,6 +49,8 @@ pub struct TimelineGeometry {
     pub px_per_second: f32,
     /// 横向滚动（像素）。
     pub scroll_x: f32,
+    /// 纵向滚动（像素）：轨道多了放不下时，轨道行在标尺下面上下滚。
+    pub scroll_y: f32,
     /// 每条轨道高。
     pub track_height: f32,
     /// 标尺高。
@@ -62,6 +64,7 @@ impl Default for TimelineGeometry {
         Self {
             px_per_second: 50.0,
             scroll_x: 0.0,
+            scroll_y: 0.0,
             track_height: 56.0,
             ruler_height: 28.0,
             header_width: 72.0,
@@ -101,7 +104,7 @@ impl TimelineGeometry {
         if y < self.ruler_height {
             return None;
         }
-        let i = ((y - self.ruler_height) / self.track_height).floor() as usize;
+        let i = ((y - self.ruler_height + self.scroll_y) / self.track_height).floor() as usize;
         (i < track_count).then_some(i)
     }
 
@@ -147,6 +150,25 @@ impl TimelineGeometry {
         Hit::Track(track.id)
     }
 
+    /// 框选：屏幕上 `a`、`b` 两点围成的矩形碰到的片段（按轨道从上到下、时间先后）。
+    #[must_use]
+    pub fn clips_in_rect(&self, timeline: &Timeline, a: (f32, f32), b: (f32, f32)) -> Vec<ClipId> {
+        let (left, right) = (a.0.min(b.0), a.0.max(b.0));
+        let (top, bottom) = (a.1.min(b.1), a.1.max(b.1));
+        timeline
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                let y0 = self.track_top(*i);
+                y0 < bottom && y0 + self.track_height > top
+            })
+            .flat_map(|(_, t)| t.clips.iter())
+            .filter(|c| self.time_to_x(c.start) < right && self.time_to_x(c.end()) > left)
+            .map(|c| c.id)
+            .collect()
+    }
+
     /// 以横坐标 `anchor_x` 为中心缩放（该处时间不动），缩放比夹在范围内。
     pub fn zoom_around(&mut self, anchor_x: f32, factor: f32) {
         let t = self.x_to_time(anchor_x);
@@ -154,6 +176,24 @@ impl TimelineGeometry {
             (self.px_per_second * factor).clamp(MIN_PX_PER_SECOND, MAX_PX_PER_SECOND);
         let x_now = self.time_to_x(t);
         self.scroll_by(x_now - anchor_x);
+    }
+
+    /// 第 `i` 条轨道顶边的纵坐标（算上纵向滚动）。
+    #[must_use]
+    #[expect(clippy::cast_precision_loss, reason = "轨道数很少")]
+    pub fn track_top(&self, i: usize) -> f32 {
+        self.ruler_height + self.track_height * i as f32 - self.scroll_y
+    }
+
+    /// 纵向滚动，夹在「刚好露出最后一条轨」以内；放得下时不滚。
+    pub fn scroll_tracks_by(&mut self, dy: f32, track_count: usize, viewport_height: f32) {
+        let max = (self.content_height(track_count) - viewport_height).max(0.0);
+        self.scroll_y = (self.scroll_y + dy).clamp(0.0, max);
+    }
+
+    /// 轨道数或可视高度变了以后，把纵向滚动重新夹回范围内。
+    pub fn clamp_scroll_y(&mut self, track_count: usize, viewport_height: f32) {
+        self.scroll_tracks_by(0.0, track_count, viewport_height);
     }
 
     /// 横向滚动（不小于 0）。
@@ -199,6 +239,27 @@ mod tests {
             assert!((back - t).0.abs() <= Time::from_millis(1).0, "{ms}");
         }
         assert!((g.time_to_x(Time::from_secs(3)) - (g.header_width + 300.0 - 250.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn rect_selects_clips_it_touches_on_rows_it_spans() {
+        let (p, ids) = sample_project();
+        let mut g = geo();
+        let x = |s: f32| g.header_width + s * 100.0;
+        let row = |g: &TimelineGeometry, i: f32| g.ruler_height + g.track_height * i;
+        // 视频、音频两行中间，6–7 秒：v2（5–8）、a1（0–8）
+        let mut got = g.clips_in_rect(&p.timeline, (x(6.0), row(&g, 0.5)), (x(7.0), row(&g, 1.5)));
+        got.sort_unstable();
+        assert_eq!(got, vec![ids.v2, ids.a1]);
+        // 反着拖一样；只扫到字幕行 3.5–4 秒：s1 是 1–3，扫不到
+        let none = g.clips_in_rect(&p.timeline, (x(4.0), row(&g, 2.9)), (x(3.5), row(&g, 2.1)));
+        assert_eq!(none, Vec::<ClipId>::new());
+        // 纵向滚动后按屏幕位置算：滚掉一行，屏幕第 0 行是音频轨
+        g.scroll_y = g.track_height;
+        assert_eq!(
+            g.clips_in_rect(&p.timeline, (x(1.0), row(&g, 0.2)), (x(2.0), row(&g, 0.8))),
+            vec![ids.a1]
+        );
     }
 
     #[test]
@@ -313,5 +374,23 @@ mod tests {
             ..geo()
         };
         assert!(sparse.tick_step() >= Time::from_secs(10));
+    }
+
+    #[test]
+    fn vertical_scroll_shifts_rows_and_clamps() {
+        let mut g = TimelineGeometry::default();
+        // 6 条轨，视口 200 像素高：内容 28 + 6×56 = 364，最多滚 164
+        g.scroll_tracks_by(100.0, 6, 200.0);
+        assert!((g.scroll_y - 100.0).abs() < 1e-3);
+        assert!((g.track_top(2) - (28.0 + 112.0 - 100.0)).abs() < 1e-3);
+        // 标尺下面第一条可见的是第 1 行（第 0 行滚上去了）
+        assert_eq!(g.track_index_at(30.0, 6), Some(1));
+        g.scroll_tracks_by(1000.0, 6, 200.0);
+        assert!((g.scroll_y - 164.0).abs() < 1e-3);
+        g.scroll_tracks_by(-1000.0, 6, 200.0);
+        assert_eq!(g.scroll_y, 0.0);
+        // 放得下时不滚
+        g.scroll_tracks_by(50.0, 2, 500.0);
+        assert_eq!(g.scroll_y, 0.0);
     }
 }

@@ -2,6 +2,7 @@
 
 pub mod geometry;
 pub mod interaction;
+pub mod tracks;
 pub mod view;
 
 pub use geometry::{Hit, TimelineGeometry, Zone};

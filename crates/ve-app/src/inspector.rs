@@ -1,4 +1,4 @@
-//! 属性面板：选中媒体片段时调音量、淡入淡出；选中字幕时改文字。
+//! 属性面板：选中媒体片段时调音量、淡入淡出（视频轨片段还有「画面」区）；选中字幕时改文字。
 
 use crate::workspace::Workspace;
 use gpui_kit::base::TestSupportExt as _;
@@ -21,8 +21,10 @@ pub struct Inspector {
     fade_out: Entity<InputState>,
     text: Entity<TextareaState>,
     /// 控件当前对应的片段。
-    bound: Option<ClipId>,
+    pub(crate) bound: Option<ClipId>,
     gain_gesture: bool,
+    /// 「画面」区。
+    pub(crate) transform: crate::inspector_transform::TransformFields,
 }
 
 fn secs_text(t: Time) -> String {
@@ -50,7 +52,9 @@ impl Inspector {
         let fade_in = cx.new(|cx| InputState::new(window, cx).placeholder("0.00"));
         let fade_out = cx.new(|cx| InputState::new(window, cx).placeholder("0.00"));
         let text = cx.new(|cx| TextareaState::new(window, cx).rows(4));
-        let subs = vec![
+        let (transform, transform_subs) =
+            crate::inspector_transform::TransformFields::new(window, cx);
+        let mut subs = vec![
             cx.subscribe_in(
                 &gain,
                 window,
@@ -93,6 +97,7 @@ impl Inspector {
                 },
             ),
         ];
+        subs.extend(transform_subs);
         (
             Self {
                 gain,
@@ -101,6 +106,7 @@ impl Inspector {
                 text,
                 bound: None,
                 gain_gesture: false,
+                transform,
             },
             subs,
         )
@@ -187,7 +193,8 @@ impl Workspace {
                     .then(|| self.doc.edit(|p| set_fades(p, clip, fade_in, fade_out)))
             }
         };
-        if edited.is_some() {
+        let transformed = self.commit_pending_transform(cx);
+        if edited.is_some() || transformed {
             self.sync_engine();
         }
     }
@@ -220,6 +227,7 @@ impl Workspace {
                 self.inspector.fade_out.update(cx, |s, cx| {
                     s.set_value(secs_text(clip.fade_out), window, cx);
                 });
+                self.fill_transform(&clip.transform, window, cx);
             }
             ClipContent::Subtitle { text } => {
                 let text = text.clone();
@@ -286,6 +294,7 @@ impl Workspace {
                             .child(Input::new(&self.inspector.fade_in).id("fade-in"))
                             .child(div().text_sm().text_color(muted).child("淡出（秒）"))
                             .child(Input::new(&self.inspector.fade_out))
+                            .children(self.render_transform_section(cx))
                     }
                     ClipContent::Subtitle { .. } => common
                         .child(
