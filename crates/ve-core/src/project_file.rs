@@ -1,6 +1,6 @@
 //! 工程文件（JSON）读写。
 //!
-//! 顶层 `{"format":"ve-project","version":3,...}`（第 1、2 版也能读）。素材路径同时存绝对路径和
+//! 顶层 `{"format":"ve-project","version":4,...}`（第 1–3 版也能读）。素材路径同时存绝对路径和
 //! 相对工程文件的路径：整个文件夹搬走后仍能找到素材。
 
 use crate::{Asset, AssetId, IdGen, InvariantError, Project, ProjectSettings, Timeline};
@@ -10,9 +10,10 @@ use std::{fs, io};
 use thiserror::Error;
 
 const FORMAT: &str = "ve-project";
-/// 当前写出的版本。第 2 版加了片段的 `transform`，第 3 版加了 `transform.rotation`。
+/// 当前写出的版本。第 2 版加了片段的 `transform`，第 3 版加了 `transform.rotation`，
+/// 第 4 版加了片段的关键帧动画 `animation`。
 /// 升版本是为了让旧版程序拒绝读新文件，而不是悄悄丢掉它不认识的字段。
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 /// 能读的最旧版本（缺的字段取默认值）。
 const OLDEST_READABLE: u32 = 1;
 
@@ -226,7 +227,7 @@ mod tests {
         save_project(&project, &file).unwrap();
         let mut json: serde_json::Value =
             serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
-        assert_eq!(json["version"], 3);
+        assert_eq!(json["version"], 4);
         // 第 2 版文件：transform 里没有 rotation，读进来是 0
         let mut v2 = json.clone();
         v2["version"] = 2.into();
@@ -258,7 +259,49 @@ mod tests {
         }
         save_project(&loaded, &file).unwrap();
         let again: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
-        assert_eq!(again["version"], 3);
+        assert_eq!(again["version"], 4);
+    }
+
+    #[test]
+    fn animation_round_trips_and_v3_file_loads() {
+        let (mut project, ids) = sample_project();
+        let tr = project
+            .timeline
+            .track_of_kind_mut(crate::TrackKind::Video)
+            .unwrap();
+        let mut c = (*tr.clips[0]).clone();
+        c.animation
+            .upsert(crate::Prop::Scale, crate::Time::ZERO, 1.0);
+        c.animation
+            .upsert(crate::Prop::Scale, crate::Time::from_secs(2), 1.5);
+        tr.clips[0] = Arc::new(c);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.vep");
+        save_project(&project, &file).unwrap();
+        let loaded = load_project(&file).unwrap().project;
+        assert_eq!(
+            loaded.timeline.find_clip(ids.v1).unwrap().1.animation,
+            project.timeline.find_clip(ids.v1).unwrap().1.animation
+        );
+        // 第 3 版文件（没有 animation 字段）照常能读
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        json["version"] = 3.into();
+        for track in json["timeline"]["tracks"].as_array_mut().unwrap() {
+            for clip in track["clips"].as_array_mut().unwrap() {
+                clip.as_object_mut().unwrap().remove("animation");
+            }
+        }
+        fs::write(&file, serde_json::to_vec(&json).unwrap()).unwrap();
+        let v3 = load_project(&file).unwrap().project;
+        assert!(
+            v3.timeline
+                .find_clip(ids.v1)
+                .unwrap()
+                .1
+                .animation
+                .is_empty()
+        );
     }
 
     #[test]

@@ -54,9 +54,18 @@ pub struct Clip {
     /// 画面属性（只对视频轨上的媒体片段起作用）。第 1 版工程文件里没有这个字段，取默认值。
     #[serde(default)]
     pub transform: Transform,
+    /// 画面属性的关键帧动画（时间相对片段起点）；为空时不写进文件。第 4 版工程文件加的。
+    #[serde(default, skip_serializing_if = "crate::Animation::is_empty")]
+    pub animation: crate::Animation,
 }
 
 impl Clip {
+    /// 片段内 `offset` 时刻（相对片段起点）的画面属性：有关键帧的属性按动画求值，其余用固定值。
+    #[must_use]
+    pub fn transform_at(&self, offset: Time) -> Transform {
+        self.animation.apply(&self.transform, offset)
+    }
+
     /// 时间轴上的终点（不含）。
     #[must_use]
     pub fn end(&self) -> Time {
@@ -321,7 +330,7 @@ fn check_clip(
     if !clip.gain_db.is_finite() {
         return Err(InvariantError::BadGain { clip: id });
     }
-    if !clip.transform.is_valid() {
+    if !clip.transform.is_valid() || !clip.animation.is_valid() {
         return Err(InvariantError::BadTransform { clip: id });
     }
     if clip.fade_in < Time::ZERO
@@ -371,6 +380,39 @@ mod tests {
         assert!(project.timeline.track_of_kind(TrackKind::Audio).is_some());
         assert_eq!(project.timeline.duration(), Time::ZERO);
         project.timeline.check_invariants(&project.assets).unwrap();
+    }
+
+    #[test]
+    fn transform_at_follows_animation_and_invalid_animation_rejected() {
+        let (mut project, ids) = sample_project();
+        let tr = project
+            .timeline
+            .track_of_kind_mut(TrackKind::Video)
+            .unwrap();
+        let mut c = (*tr.clips[0]).clone();
+        assert_eq!(
+            c.transform_at(Time::from_secs(1)),
+            c.transform,
+            "没动画：固定值"
+        );
+        c.animation.upsert(crate::Prop::Opacity, Time::ZERO, 0.0);
+        c.animation
+            .upsert(crate::Prop::Opacity, Time::from_secs(2), 1.0);
+        c.animation.set_easing(Time::ZERO, crate::Easing::Linear);
+        assert!((c.transform_at(Time::from_secs(1)).opacity - 0.5).abs() < 1e-6);
+        tr.clips[0] = Arc::new(c.clone());
+        project.timeline.check_invariants(&project.assets).unwrap();
+        // 关键帧值不合法：不变式拦住
+        c.animation.upsert(crate::Prop::Scale, Time::ZERO, 0.0);
+        let video = project
+            .timeline
+            .track_of_kind_mut(TrackKind::Video)
+            .unwrap();
+        video.clips[0] = Arc::new(c);
+        assert_eq!(
+            project.timeline.check_invariants(&project.assets),
+            Err(InvariantError::BadTransform { clip: ids.v1 })
+        );
     }
 
     #[test]

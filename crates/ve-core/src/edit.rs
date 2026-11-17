@@ -35,6 +35,9 @@ pub enum EditError {
     /// 这是该类型的最后一条轨道，不能删。
     #[error("至少要留一条这种轨道")]
     LastTrack,
+    /// 这个时刻没有关键帧。
+    #[error("这里没有关键帧")]
+    NoKeyframe,
 }
 
 /// 增益范围（dB）。
@@ -130,6 +133,7 @@ fn new_media_clip(
         fade_in: Time::ZERO,
         fade_out: Time::ZERO,
         transform: Transform::default(),
+        animation: crate::Animation::default(),
     })
 }
 
@@ -280,6 +284,8 @@ pub fn trim_start(project: &mut Project, clip: ClipId, new_start: Time) -> Resul
         if let ClipContent::Media { source_in, .. } = &mut c.content {
             *source_in += start - c.start;
         }
+        // 关键帧时间相对片段起点：起点后移多少，关键帧就前移多少，仍对着原来的内容
+        c.animation.shift(c.start - start);
         c.start = start;
         c.duration = end - start;
         clamp_fades(&mut c);
@@ -341,6 +347,9 @@ fn split_in(
     }
     let mut left = (**original).clone();
     let mut right = (**original).clone();
+    let (left_anim, right_anim) = original.animation.split(at - original.start);
+    left.animation = left_anim;
+    right.animation = right_anim;
     left.duration = at - left.start;
     left.fade_out = Time::ZERO;
     clamp_fades(&mut left);
@@ -523,16 +532,115 @@ pub fn set_transform(project: &mut Project, clip: ClipId, t: Transform) -> Resul
     if !t.is_valid() {
         return Err(EditError::InvalidValue);
     }
+    ensure_video(project, clip)?;
+    update_clip(project, clip, |c| {
+        c.transform = t;
+        Ok(())
+    })
+}
+
+/// 片段要在视频轨上（画面属性和关键帧只对视频轨有意义）。
+fn ensure_video(project: &Project, clip: ClipId) -> Result<(), EditError> {
     let (track, _) = project
         .timeline
         .find_clip(clip)
         .ok_or(EditError::ClipNotFound(clip))?;
-    if project.timeline.track(track).map(|tr| tr.kind) != Some(TrackKind::Video) {
-        return Err(EditError::WrongTrackKind);
-    }
-    update_clip(project, clip, |c| {
-        c.transform = t;
+    if project.timeline.track(track).map(|tr| tr.kind) == Some(TrackKind::Video) {
         Ok(())
+    } else {
+        Err(EditError::WrongTrackKind)
+    }
+}
+
+/// 重置画面属性：回到默认值，清掉关键帧动画。
+///
+/// # Errors
+/// 片段不存在、不是视频轨上的片段。
+pub fn reset_transform(project: &mut Project, clip: ClipId) -> Result<(), EditError> {
+    ensure_video(project, clip)?;
+    update_clip(project, clip, |c| {
+        c.transform = Transform::default();
+        c.animation = crate::Animation::default();
+        Ok(())
+    })
+}
+
+/// 在片段内 `at` 时刻（相对片段起点）打关键帧：把那一刻所有画面属性都记下来。
+///
+/// # Errors
+/// 片段不存在、不是视频轨上的片段。
+pub fn add_keyframe(project: &mut Project, clip: ClipId, at: Time) -> Result<(), EditError> {
+    ensure_video(project, clip)?;
+    update_clip(project, clip, |c| {
+        let now = c.transform_at(at);
+        for prop in crate::Prop::TRANSFORM {
+            c.animation.upsert(prop, at, prop.get(&now));
+        }
+        Ok(())
+    })
+}
+
+/// 界面改画面属性统一走这里：片段没有动画时改固定值；有动画时，有关键帧的属性在 `at`
+/// （相对片段起点）新建或更新关键帧，其余属性改固定值。
+///
+/// # Errors
+/// 片段不存在、不是视频轨上的片段、数值违反不变式。
+pub fn apply_transform_at(
+    project: &mut Project,
+    clip: ClipId,
+    at: Time,
+    t: Transform,
+) -> Result<(), EditError> {
+    if !t.is_valid() {
+        return Err(EditError::InvalidValue);
+    }
+    ensure_video(project, clip)?;
+    update_clip(project, clip, |c| {
+        for prop in crate::Prop::TRANSFORM {
+            let value = prop.get(&t);
+            if c.animation.keys(prop).is_empty() {
+                prop.set(&mut c.transform, value);
+            } else {
+                c.animation.upsert(prop, at, value);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// 删掉片段内 `at` 时刻的关键帧。删完一个都不剩时，固定值取删之前那一刻的值，画面不跳。
+///
+/// # Errors
+/// 片段不存在、那一刻没有关键帧。
+pub fn remove_keyframe(project: &mut Project, clip: ClipId, at: Time) -> Result<(), EditError> {
+    update_clip(project, clip, |c| {
+        let now = c.transform_at(at);
+        if !c.animation.remove_at(at) {
+            return Err(EditError::NoKeyframe);
+        }
+        if c.animation.is_empty() {
+            c.transform = now;
+        }
+        Ok(())
+    })
+}
+
+/// 设置片段内 `at` 时刻关键帧的缓动（作用在它到下一个关键帧这一段）。
+///
+/// # Errors
+/// 片段不存在、那一刻没有关键帧。
+pub fn set_keyframe_easing(
+    project: &mut Project,
+    clip: ClipId,
+    at: Time,
+    easing: crate::Easing,
+) -> Result<(), EditError> {
+    update_clip(project, clip, |c| {
+        if c.animation.set_easing(at, easing) {
+            Ok(())
+        } else {
+            Err(EditError::NoKeyframe)
+        }
     })
 }
 
@@ -569,6 +677,7 @@ pub fn add_subtitle(
         fade_in: Time::ZERO,
         fade_out: Time::ZERO,
         transform: Transform::default(),
+        animation: crate::Animation::default(),
     };
     project.timeline.tracks[ti].insert_sorted(Arc::new(clip));
     Ok(id)
@@ -1025,6 +1134,148 @@ mod tests {
             p.timeline.check_invariants(&p.assets),
             Err(crate::InvariantError::BadTransform { .. })
         ));
+    }
+
+    fn scale_at(p: &Project, id: ClipId, offset: Time) -> f32 {
+        clip(p, id).transform_at(offset).scale
+    }
+
+    #[test]
+    fn add_keyframe_records_every_property_and_edits_upsert() {
+        let (mut p, ids) = sample_project();
+        let half = Transform {
+            scale: 0.5,
+            ..Transform::default()
+        };
+        // 没有动画：apply_transform_at 就是改固定值
+        apply_transform_at(&mut p, ids.v1, Time::from_secs(1), half).unwrap();
+        assert_eq!(clip(&p, ids.v1).transform, half);
+        assert!(clip(&p, ids.v1).animation.is_empty());
+        // 打关键帧：所有画面属性都记下来
+        add_keyframe(&mut p, ids.v1, Time::ZERO).unwrap();
+        let a = &clip(&p, ids.v1).animation;
+        assert_eq!(a.props().count(), crate::Prop::TRANSFORM.len());
+        assert_eq!(a.times(), vec![Time::ZERO]);
+        // 有动画后在别处改属性：在那里新建关键帧
+        let full = Transform::default();
+        apply_transform_at(&mut p, ids.v1, Time::from_secs(2), full).unwrap();
+        assert_eq!(
+            clip(&p, ids.v1).animation.times(),
+            vec![Time::ZERO, Time::from_secs(2)]
+        );
+        assert!((scale_at(&p, ids.v1, Time::from_secs(2)) - 1.0).abs() < 1e-6);
+        // 中间是缓入缓出：正中间正好一半
+        assert!((scale_at(&p, ids.v1, Time::from_secs(1)) - 0.75).abs() < 1e-6);
+        // 同一处再改：更新而不是新增
+        apply_transform_at(&mut p, ids.v1, Time::from_secs(2), half).unwrap();
+        assert_eq!(clip(&p, ids.v1).animation.times().len(), 2);
+        assert!((scale_at(&p, ids.v1, Time::from_secs(2)) - 0.5).abs() < 1e-6);
+        assert_valid(&p);
+        // 不合法的值、不是视频轨的片段
+        let bad = Transform {
+            scale: 0.0,
+            ..Transform::default()
+        };
+        assert_eq!(
+            apply_transform_at(&mut p, ids.v1, Time::ZERO, bad),
+            Err(EditError::InvalidValue)
+        );
+        assert_eq!(
+            add_keyframe(&mut p, ids.a1, Time::ZERO),
+            Err(EditError::WrongTrackKind)
+        );
+    }
+
+    #[test]
+    fn removing_the_last_keyframe_keeps_the_picture() {
+        let (mut p, ids) = sample_project();
+        let half = Transform {
+            scale: 0.5,
+            ..Transform::default()
+        };
+        add_keyframe(&mut p, ids.v1, Time::ZERO).unwrap();
+        apply_transform_at(&mut p, ids.v1, Time::from_secs(2), half).unwrap();
+        remove_keyframe(&mut p, ids.v1, Time::ZERO).unwrap();
+        assert_eq!(clip(&p, ids.v1).animation.times(), vec![Time::from_secs(2)]);
+        assert_eq!(
+            remove_keyframe(&mut p, ids.v1, Time::ZERO),
+            Err(EditError::NoKeyframe)
+        );
+        // 最后一个也删掉：动画清空，固定值取删之前那一刻的值，画面不跳
+        remove_keyframe(&mut p, ids.v1, Time::from_secs(2)).unwrap();
+        assert!(clip(&p, ids.v1).animation.is_empty());
+        assert!((clip(&p, ids.v1).transform.scale - 0.5).abs() < 1e-6);
+        assert_valid(&p);
+    }
+
+    #[test]
+    fn keyframe_easing_and_reset() {
+        let (mut p, ids) = sample_project();
+        add_keyframe(&mut p, ids.v1, Time::ZERO).unwrap();
+        set_keyframe_easing(&mut p, ids.v1, Time::ZERO, crate::Easing::Linear).unwrap();
+        assert_eq!(
+            clip(&p, ids.v1).animation.easing_at(Time::ZERO),
+            Some(crate::Easing::Linear)
+        );
+        assert_eq!(
+            set_keyframe_easing(&mut p, ids.v1, Time::from_secs(3), crate::Easing::Linear),
+            Err(EditError::NoKeyframe)
+        );
+        // 重置：画面属性回默认，动画清掉
+        reset_transform(&mut p, ids.v1).unwrap();
+        assert!(clip(&p, ids.v1).animation.is_empty());
+        assert!(clip(&p, ids.v1).transform.is_default());
+    }
+
+    /// 时间轴上 `t` 时刻，`ids` 里正在播的那个片段的画面属性。
+    fn picture_at(p: &Project, ids: &[ClipId], t: Time) -> Transform {
+        let c = ids
+            .iter()
+            .map(|id| clip(p, *id))
+            .find(|c| c.start <= t && t < c.end())
+            .unwrap();
+        c.transform_at(t - c.start)
+    }
+
+    fn animate_linear(p: &mut Project, id: ClipId, from: Time, to: Time, a: f32, b: f32) {
+        let at = |s: f32| Transform {
+            x: s,
+            ..Transform::default()
+        };
+        add_keyframe(p, id, from).unwrap();
+        apply_transform_at(p, id, from, at(a)).unwrap();
+        apply_transform_at(p, id, to, at(b)).unwrap();
+        set_keyframe_easing(p, id, from, crate::Easing::Linear).unwrap();
+    }
+
+    #[test]
+    fn trim_start_keeps_keyframes_on_the_content() {
+        let (mut p, ids) = sample_project();
+        // v2 在 5–8 秒；动画在片段内 0–2 秒，x 从 0 到 0.4
+        animate_linear(&mut p, ids.v2, Time::ZERO, Time::from_secs(2), 0.0, 0.4);
+        let times = [6.0, 6.5, 7.0, 7.5].map(Time::from_secs_f64);
+        let before = times.map(|t| picture_at(&p, &[ids.v2], t).x);
+        trim_start(&mut p, ids.v2, Time::from_secs(6)).unwrap();
+        let after = times.map(|t| picture_at(&p, &[ids.v2], t).x);
+        for (b, a) in before.iter().zip(&after) {
+            assert!((b - a).abs() < 1e-6, "{before:?} / {after:?}");
+        }
+        assert_valid(&p);
+    }
+
+    #[test]
+    fn split_keeps_the_motion_on_both_halves() {
+        let (mut p, ids) = sample_project();
+        // v1 在 0–5 秒；x 从 0 到 0.4（片段内 0–4 秒，匀速）
+        animate_linear(&mut p, ids.v1, Time::ZERO, Time::from_secs(4), 0.0, 0.4);
+        let times = [0.5, 1.0, 1.9, 2.0, 2.5, 3.9, 4.5].map(Time::from_secs_f64);
+        let before = times.map(|t| picture_at(&p, &[ids.v1], t).x);
+        let right = split_at(&mut p, ids.v1, Time::from_secs(2)).unwrap();
+        let after = times.map(|t| picture_at(&p, &[ids.v1, right], t).x);
+        for (b, a) in before.iter().zip(&after) {
+            assert!((b - a).abs() < 1e-5, "{before:?} / {after:?}");
+        }
+        assert_valid(&p);
     }
 
     #[test]
