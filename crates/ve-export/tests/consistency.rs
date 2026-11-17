@@ -5,7 +5,9 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
-use ve_core::edit::{add_track, append_asset, insert_asset_at, set_transform};
+use ve_core::edit::{
+    add_keyframe, add_track, append_asset, apply_transform_at, insert_asset_at, set_transform,
+};
 use ve_core::{Asset, AssetId, FrameRate, Project, Time, TrackKind, Transform};
 use ve_engine::{AudioBackend, Engine, EngineConfig};
 use ve_export::{Encoder, ExportSettings, export};
@@ -184,4 +186,32 @@ fn export_size_differs_from_project() {
     let half = (preview.0 / 2, preview.1 / 2, preview.2 / 2, preview.3 / 2);
     let exported = red_box(&exported_frame(&p, 640, 360, t));
     assert_box_close(half, exported, "按比例换算后的画中画边界");
+}
+
+#[test]
+fn export_matches_preview_mid_animation() {
+    // 红色画中画：片段内 0 秒在 (0.3, 0.3)、缩放 0.33，2 秒移到 (0.1, 0.3)、缩放 0.2
+    let mut p = three_layers(640, 360);
+    let red = p.timeline.tracks[1].clips[0].id;
+    add_keyframe(&mut p, red, Time::ZERO).unwrap();
+    let later = Transform {
+        x: 0.1,
+        y: 0.3,
+        scale: 0.2,
+        ..Transform::default()
+    };
+    apply_transform_at(&mut p, red, Time::from_secs(2), later).unwrap();
+    let t = RATE.time_of_frame(30);
+    let preview = preview_frame(&p, t);
+    let exported = exported_frame(&p, 640, 360, t);
+    let score = psnr(&preview, &exported);
+    assert!(score >= 35.0, "PSNR {score:.1} dB");
+    let moving = red_box(&preview);
+    assert_box_close(moving, red_box(&exported), "动画中途的画中画边界");
+    // 确实动了：和第 0 帧的位置不同
+    let start = red_box(&preview_frame(&p, Time::ZERO));
+    assert!(
+        moving.0 + 10 < start.0,
+        "画中画应往左移：{start:?} → {moving:?}"
+    );
 }

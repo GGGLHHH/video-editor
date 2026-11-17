@@ -147,7 +147,7 @@ fn layer_frames(
             None => Stepper {
                 decoder: VideoDecoder::open(
                     &asset.path,
-                    decode_target(canvas, l.transform.scale, max_texture),
+                    decode_target(canvas, l.max_scale, max_texture),
                 )
                 .map_err(|e| render_error(&asset.name, &e))?,
                 current: None,
