@@ -1,0 +1,26 @@
+[package]
+name = "ve-export"
+description = "导出：ASS 字幕、ffmpeg 滤镜图命令、进度"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ve-core.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+pathdiff.workspace = true
+ve-core = { workspace = true, features = ["testing"] }
+ve-media = { workspace = true, features = ["test-fixtures"] }
