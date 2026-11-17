@@ -1,0 +1,19 @@
+[package]
+name = "gpui-frames"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "一次性实验：FFmpeg 解出的原始帧逐帧交给 GPUI 显示，测帧率和内存"
+
+[dependencies]
+gpui = "0.2.2"
+image = "0.25.1"
+smol = "2"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
+[profile.release]
+debug = 1
