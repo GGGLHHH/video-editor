@@ -99,3 +99,9 @@ crates/
 | [docs/superpowers/plans/2026-11-17-mvp.md](docs/superpowers/plans/2026-11-17-mvp.md) | 实现计划 |
 | [docs/decisions.md](docs/decisions.md) | 决策记录 |
 | [docs/plan.md](docs/plan.md) | 进度 |
+
+## 许可证
+
+本项目源码以 [Apache-2.0](LICENSE) 许可证发布。
+
+本仓库不包含 FFmpeg。运行时用到的 FFmpeg 库和 `ffmpeg.exe` 按它们自己的许可证（LGPL / GPL）提供。如果要把程序和带 GPL 组件（如 x264）的 FFmpeg 构建打包一起分发，需要同时遵守 GPL：附上 FFmpeg 的许可证，并提供对应源码。
