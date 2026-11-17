@@ -26,6 +26,14 @@ pub enum Fixture {
     TsWithOffset,
     /// 2 秒 mp3，带封面图（封面是一条 `attached_pic` 视频流）。
     Mp3WithCover,
+    /// 1280×720 纯色 (R=0xC0, G=0x20, B=0x20)，按 BT.709 有限范围编码并标注。
+    Bt709Red,
+    /// 640×360 同样的颜色，按 BT.601 编码、不标注色彩空间。
+    Bt601Red,
+    /// 64×64 PNG：左半边红色、alpha 128，右半边全透明。
+    PngHalfAlpha,
+    /// 64×64 PNG：左半边不透明红色，右半边全透明、但颜色存的是白色（常见的台标导出方式）。
+    PngRedOnClearWhite,
 }
 
 impl Fixture {
@@ -39,6 +47,10 @@ impl Fixture {
             Self::Mp3WithCover => "with_cover.mp3",
             Self::TsWithOffset => "offset.ts",
             Self::ShortVideoLongAudio => "short_video_long_audio.mp4",
+            Self::Bt709Red => "bt709_red.mp4",
+            Self::Bt601Red => "bt601_red.mp4",
+            Self::PngHalfAlpha => "half_alpha.png",
+            Self::PngRedOnClearWhite => "red_on_clear_white.png",
         }
     }
 
@@ -68,6 +80,18 @@ impl Fixture {
             // 只出一帧作封面（不用 -frames:v，那会把整个文件截断）
             Self::Mp3WithCover => {
                 "-f lavfi -i sine=frequency=440:sample_rate=48000:duration=2 -f lavfi -i color=c=red:s=64x36:d=0.04:r=25 -map 0:a -map 1:v -c:a libmp3lame -c:v mjpeg -disposition:v attached_pic -id3v2_version 3"
+            }
+            Self::Bt709Red => {
+                "-f lavfi -i color=c=0xC02020:s=1280x720:r=30:d=0.5 -vf scale=out_color_matrix=bt709:out_range=tv,format=yuv420p -c:v libx264 -qp 0 -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv"
+            }
+            Self::Bt601Red => {
+                "-f lavfi -i color=c=0xC02020:s=640x360:r=30:d=0.5 -vf scale=out_color_matrix=bt601:out_range=tv,format=yuv420p -c:v libx264 -qp 0"
+            }
+            Self::PngHalfAlpha => {
+                "-f lavfi -i color=c=red@0.5:s=32x64,format=rgba,pad=64:64:0:0:color=black@0 -frames:v 1"
+            }
+            Self::PngRedOnClearWhite => {
+                "-f lavfi -i color=c=red:s=32x64,format=rgba,pad=64:64:0:0:color=white@0 -frames:v 1"
             }
         };
         line.split_whitespace()

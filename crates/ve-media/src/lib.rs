@@ -13,5 +13,5 @@ pub use audio::{AudioDecoder, OUTPUT_CHANNELS, OUTPUT_SAMPLE_RATE};
 pub use error::MediaError;
 pub use probe::{ProbeResult, STILL_DEFAULT_DURATION, probe};
 pub use thumbs::thumbnails;
-pub use video::{ScaleTarget, VideoDecoder, VideoFrame};
+pub use video::{ScaleTarget, VideoDecoder, VideoFrame, fit_size};
 pub use waveform::waveform_peaks;

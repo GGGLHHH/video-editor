@@ -18,6 +18,7 @@ workspace = true
 ve-core.workspace = true
 ffmpeg-next.workspace = true
 thiserror.workspace = true
+log.workspace = true
 
 [features]
 # 给下游 crate 的测试用：按需生成测试素材

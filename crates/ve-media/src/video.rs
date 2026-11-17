@@ -73,8 +73,11 @@ pub struct VideoDecoder {
     stream: usize,
     tb: ff::Rational,
     decoder: ff::decoder::Video,
-    scaler: Option<ff::software::scaling::Context>,
+    scaler: Option<Scaler>,
     scaled: ff::frame::Video,
+    /// 带透明的素材：先在原尺寸转成 BGRA 并预乘，再缩放（先预乘再插值，边缘才不会混进透明处的颜色）。
+    native_scaler: Option<Scaler>,
+    native: ff::frame::Video,
     out: (u32, u32),
     src: (u32, u32),
     rate: FrameRate,
@@ -133,6 +136,8 @@ impl VideoDecoder {
             decoder,
             scaler: None,
             scaled: ff::frame::Video::empty(),
+            native_scaler: None,
+            native: ff::frame::Video::empty(),
             out: fit_size(src.0, src.1, target),
             src,
             rate: video.frame_rate,
@@ -200,30 +205,58 @@ impl VideoDecoder {
         )
     }
 
-    /// 颜色转换 + 缩放成紧密排列的 BGRA。
+    /// 颜色转换 + 缩放成紧密排列的 BGRA（预乘透明）。
     fn convert(&mut self, raw: &ff::frame::Video, pts: Time) -> Result<VideoFrame, MediaError> {
         let (w, h) = self.out;
-        let rebuild = self.scaler.as_ref().is_none_or(|s| {
-            let i = s.input();
-            i.format != raw.format() || i.width != raw.width() || i.height != raw.height()
-        });
-        if rebuild {
-            self.scaler = Some(ff::software::scaling::Context::get(
+        let alpha = has_alpha(raw.format());
+        if alpha {
+            // 第一步：原尺寸转 BGRA，预乘
+            let (sw, sh) = (raw.width(), raw.height());
+            ensure_scaler(
+                &mut self.native_scaler,
+                raw,
                 raw.format(),
-                raw.width(),
-                raw.height(),
-                ff::format::Pixel::BGRA,
-                w,
-                h,
-                ff::software::scaling::Flags::BILINEAR,
-            )?);
+                (sw, sh),
+                (sw, sh),
+            )?;
+            if let Some(s) = self.native_scaler.as_mut() {
+                s.0.run(raw, &mut self.native)?;
+            }
+            premultiply_frame(&mut self.native, sw, sh);
+            if (sw, sh) != (w, h) {
+                // 第二步：预乘过的 BGRA 再缩放
+                let native = &self.native;
+                ensure_scaler(
+                    &mut self.scaler,
+                    native,
+                    ff::format::Pixel::BGRA,
+                    (sw, sh),
+                    (w, h),
+                )?;
+                if let Some(s) = self.scaler.as_mut() {
+                    s.0.run(native, &mut self.scaled)?;
+                }
+            }
+        } else {
+            ensure_scaler(
+                &mut self.scaler,
+                raw,
+                raw.format(),
+                (raw.width(), raw.height()),
+                (w, h),
+            )?;
+            if let Some(s) = self.scaler.as_mut() {
+                s.0.run(raw, &mut self.scaled)?;
+            }
         }
-        if let Some(scaler) = self.scaler.as_mut() {
-            scaler.run(raw, &mut self.scaled)?;
-        }
+        let src = if alpha && (raw.width(), raw.height()) == (w, h) {
+            &self.native
+        } else {
+            &self.scaled
+        };
         let row = w as usize * 4;
-        let stride = self.scaled.stride(0);
-        let plane = self.scaled.data(0);
+        let stride = src.stride(0);
+        let plane = src.data(0);
         let mut data = Vec::with_capacity(row * h as usize);
         for y in 0..h as usize {
             data.extend_from_slice(&plane[y * stride..y * stride + row]);
@@ -329,6 +362,136 @@ impl VideoDecoder {
     }
 }
 
+/// swscale 上下文。ffmpeg-next 没给它实现 `Send`，但 `SwsContext` 没有线程亲和性：
+/// 只要同一时刻只有一个线程在用，就可以在线程之间移动。预览要把解码器交给别的线程并行解码。
+struct Scaler(ff::software::scaling::Context);
+
+#[expect(
+    unsafe_code,
+    clippy::non_send_fields_in_send_ty,
+    reason = "ffmpeg-next 没给 swscale 上下文实现 Send；理由见下面的 SAFETY"
+)]
+// SAFETY: `SwsContext` 不依赖创建它的线程；`Scaler` 只能通过 `VideoDecoder` 的 `&mut self` 访问，
+// 不会被两个线程同时使用。
+unsafe impl Send for Scaler {}
+
+/// 像素格式的描述标志（`AV_PIX_FMT_FLAG_*`）。
+fn pixel_flags(format: ff::format::Pixel) -> u64 {
+    format.descriptor().map_or(0, |d| {
+        // SAFETY: `descriptor()` 只在 FFmpeg 的静态描述表里有这一项时才返回，指针指向静态数据，永远有效。
+        #[expect(unsafe_code, reason = "ffmpeg-next 没有暴露像素格式标志")]
+        unsafe {
+            (*d.as_ptr()).flags
+        }
+    })
+}
+
+/// 源像素格式带透明通道。
+fn has_alpha(format: ff::format::Pixel) -> bool {
+    let alpha = ff::ffi::AV_PIX_FMT_FLAG_ALPHA as u64;
+    pixel_flags(format) & alpha != 0
+}
+
+/// YUV 素材该用的色彩矩阵（`SWS_CS_*`）：按素材标注；没标注时高度 ≥ 720 按 BT.709，否则按 BT.601。
+const fn yuv_matrix(space: ff::color::Space, height: u32) -> std::ffi::c_int {
+    use ff::color::Space;
+    match space {
+        Space::BT709 => ff::ffi::SWS_CS_ITU709,
+        Space::BT470BG | Space::SMPTE170M => ff::ffi::SWS_CS_ITU601,
+        Space::SMPTE240M => ff::ffi::SWS_CS_SMPTE240M,
+        Space::FCC => ff::ffi::SWS_CS_FCC,
+        Space::BT2020NCL | Space::BT2020CL => ff::ffi::SWS_CS_BT2020,
+        _ if height >= 720 => ff::ffi::SWS_CS_ITU709,
+        _ => ff::ffi::SWS_CS_ITU601,
+    }
+}
+
+/// 按素材的色彩矩阵和范围设置 swscale（RGB 源不用设置）。
+/// swscale 默认一律按 BT.601 有限范围处理，高清素材（BT.709）颜色会偏。
+fn set_yuv_matrix(scaler: &mut ff::software::scaling::Context, raw: &ff::frame::Video) {
+    let rgb = ff::ffi::AV_PIX_FMT_FLAG_RGB as u64;
+    if pixel_flags(raw.format()) & rgb != 0 {
+        return;
+    }
+    let full_range = raw.color_range() == ff::color::Range::JPEG
+        || raw
+            .format()
+            .descriptor()
+            .is_some_and(|d| d.name().starts_with("yuvj"));
+    let matrix = yuv_matrix(raw.color_space(), raw.height());
+    // SAFETY: `scaler` 是刚建好的有效上下文；`sws_getCoefficients` 返回指向 FFmpeg 静态表的指针，
+    // `sws_setColorspaceDetails` 只读这两张表，不保留指针。
+    #[expect(unsafe_code, reason = "ffmpeg-next 没有封装 sws_setColorspaceDetails")]
+    let status = unsafe {
+        let src = ff::ffi::sws_getCoefficients(matrix);
+        let dst = ff::ffi::sws_getCoefficients(ff::ffi::SWS_CS_DEFAULT);
+        ff::ffi::sws_setColorspaceDetails(
+            scaler.as_mut_ptr(),
+            src,
+            std::ffi::c_int::from(full_range),
+            dst,
+            1,
+            0,
+            1 << 16,
+            1 << 16,
+        )
+    };
+    if status < 0 {
+        log::warn!("设置色彩矩阵失败（{status}），按 swscale 默认处理");
+    }
+}
+
+/// 输入格式或尺寸变了才重建缩放上下文；`frame` 用来取色彩矩阵和范围。
+fn ensure_scaler(
+    slot: &mut Option<Scaler>,
+    frame: &ff::frame::Video,
+    format: ff::format::Pixel,
+    from: (u32, u32),
+    to: (u32, u32),
+) -> Result<(), MediaError> {
+    let current = slot.as_ref().is_some_and(|s| {
+        let (i, o) = (s.0.input(), s.0.output());
+        i.format == format && (i.width, i.height) == from && (o.width, o.height) == to
+    });
+    if !current {
+        let mut scaler = ff::software::scaling::Context::get(
+            format,
+            from.0,
+            from.1,
+            ff::format::Pixel::BGRA,
+            to.0,
+            to.1,
+            ff::software::scaling::Flags::BILINEAR,
+        )?;
+        set_yuv_matrix(&mut scaler, frame);
+        *slot = Some(Scaler(scaler));
+    }
+    Ok(())
+}
+
+/// BGRA 帧原地预乘（按行，跳过每行的对齐填充）。
+fn premultiply_frame(frame: &mut ff::frame::Video, width: u32, height: u32) {
+    let stride = frame.stride(0);
+    let row = width as usize * 4;
+    let data = frame.data_mut(0);
+    for y in 0..height as usize {
+        premultiply(&mut data[y * stride..y * stride + row]);
+    }
+}
+
+/// BGRA 原地预乘透明度。
+fn premultiply(data: &mut [u8]) {
+    for px in data.as_chunks_mut::<4>().0 {
+        let a = u16::from(px[3]);
+        for c in &mut px[..3] {
+            // 结果 ≤ 255，截断安全
+            #[expect(clippy::cast_possible_truncation, reason = "c·a/255 ≤ 255")]
+            let v = ((u16::from(*c) * a + 127) / 255) as u8;
+            *c = v;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +519,77 @@ mod tests {
 
     fn open(target: ScaleTarget) -> VideoDecoder {
         VideoDecoder::open(&fixture(Fixture::FrameIndexed30), target).unwrap()
+    }
+
+    /// 中心像素的 (B, G, R, A)。
+    fn center_bgra(f: &VideoFrame) -> [u8; 4] {
+        pixel(f, f.width / 2, f.height / 2)
+    }
+
+    fn pixel(f: &VideoFrame, x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * f.width + x) * 4) as usize;
+        [f.data[i], f.data[i + 1], f.data[i + 2], f.data[i + 3]]
+    }
+
+    fn assert_near(got: [u8; 4], want: [u8; 4], tol: u8, what: &str) {
+        for (g, w) in got.iter().zip(want) {
+            assert!(g.abs_diff(w) <= tol, "{what}：期望 {want:?}，实际 {got:?}");
+        }
+    }
+
+    fn first_frame(kind: Fixture) -> VideoFrame {
+        let mut d = VideoDecoder::open(&fixture(kind), FULL).unwrap();
+        d.next_frame().unwrap().unwrap()
+    }
+
+    #[test]
+    fn bt709_tagged_source_decodes_to_original_rgb() {
+        let f = first_frame(Fixture::Bt709Red);
+        // 文件里实际编码的是 YUV (72, 111, 197)，按 BT.709 有限范围精确换算是 RGB (189, 32, 29)；
+        // 和原色 (192, 32, 32) 的差来自 8 位量化，不是解码的问题。按 BT.601 解会得到 (175, 14, 30)。
+        assert_near(center_bgra(&f), [29, 32, 189, 255], 2, "BT.709 素材");
+    }
+
+    #[test]
+    fn untagged_sd_uses_bt601() {
+        let f = first_frame(Fixture::Bt601Red);
+        assert_near(
+            center_bgra(&f),
+            [0x20, 0x20, 0xC0, 255],
+            3,
+            "未标注的标清素材",
+        );
+    }
+
+    #[test]
+    fn alpha_png_is_premultiplied() {
+        let f = first_frame(Fixture::PngHalfAlpha);
+        assert_near(pixel(&f, 8, 32), [0, 0, 127, 127], 1, "左半边");
+        assert_eq!(pixel(&f, 56, 32), [0, 0, 0, 0], "右半边");
+    }
+
+    #[test]
+    fn scaled_alpha_edges_have_no_halo() {
+        // 缩小时要先预乘再插值：否则透明处存的白色会混进边缘，台标周围一圈发白
+        let mut decoder = VideoDecoder::open(
+            &fixture(Fixture::PngRedOnClearWhite),
+            ScaleTarget {
+                max_width: 16,
+                max_height: 16,
+            },
+        )
+        .unwrap();
+        let frame = decoder.next_frame().unwrap().unwrap();
+        assert_eq!((frame.width, frame.height), (16, 16));
+        for x in 6..10 {
+            let [blue, green, red, alpha] = pixel(&frame, x, 8);
+            // 预乘后颜色不能超过透明度；红色台标的边缘不该有绿、蓝分量
+            assert!(
+                red <= alpha && green <= 8 && blue <= 8,
+                "x={x} 边缘像素 {:?}",
+                [blue, green, red, alpha]
+            );
+        }
     }
 
     const FULL: ScaleTarget = ScaleTarget {
