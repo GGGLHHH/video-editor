@@ -35,6 +35,10 @@ pub struct TimelineUi {
     pub hover: Option<ClipId>,
     /// 移动拖动中，被拖片段的原位置（轨道下标、起点、终点）。
     pub ghosts: Vec<(usize, Time, Time)>,
+    /// 鼠标样式（悬停 / 拖动时按位置变）。
+    pub cursor: gpui_kit::CursorStyle,
+    /// 鼠标最后的位置（时间轴本地坐标），松开后据此恢复悬停样式。
+    pub pointer: (f32, f32),
 }
 
 /// 框选。
@@ -127,6 +131,12 @@ impl Workspace {
         }
         self.timeline.ghosts = drag.map_or_else(Vec::new, |d| self.ghosts_for(&d));
         self.timeline.drag = drag;
+        self.timeline.pointer = (x, y);
+        self.timeline.cursor = super::interaction::cursor_for(
+            geo.hit_test(x, y, &self.doc.project.timeline),
+            drag.as_ref(),
+            self.timeline.marquee.is_some(),
+        );
         if let Some(mut d) = drag
             && matches!(d, Drag::Scrub)
         {
@@ -168,6 +178,7 @@ impl Workspace {
     ) {
         let (x, y) = self.local(e.position);
         let geo = self.timeline.geometry;
+        self.timeline.pointer = (x, y);
         let pressed = e.pressed_button == Some(MouseButton::Left);
         if self.timeline.marquee.is_some() || self.timeline.drag.is_some() {
             if !pressed {
@@ -176,13 +187,16 @@ impl Workspace {
                 return;
             }
         } else {
-            // 没在拖：更新悬停提示
-            let hover = match geo.hit_test(x, y, &self.doc.project.timeline) {
+            // 没在拖：更新悬停提示和鼠标样式
+            let hit = geo.hit_test(x, y, &self.doc.project.timeline);
+            let hover = match hit {
                 Hit::Clip { clip, .. } => Some(clip),
                 _ => None,
             };
-            if hover != self.timeline.hover {
+            let cursor = super::interaction::cursor_for(hit, None, false);
+            if hover != self.timeline.hover || cursor != self.timeline.cursor {
                 self.timeline.hover = hover;
+                self.timeline.cursor = cursor;
                 cx.notify();
             }
             return;
@@ -200,8 +214,9 @@ impl Workspace {
             return;
         };
         let revision = self.doc.revision();
-        // 按住 Alt：临时不吸附（只吸到帧），松开就恢复
-        let out = drag.update(&mut self.doc, &geo, x, y, self.playhead, !e.modifiers.alt);
+        // 吸附开关关着时只吸到帧；按住 Alt 临时取反，松开就恢复
+        let snapping = self.snapping_for(e.modifiers.alt);
+        let out = drag.update(&mut self.doc, &geo, x, y, self.playhead, snapping);
         self.timeline.drag = Some(drag);
         self.timeline.snap_line = out.snap;
         if let Some(t) = out.seek {
@@ -228,13 +243,25 @@ impl Workspace {
         }
         self.timeline.ghosts.clear();
         self.timeline.snap_line = None;
+        self.restore_timeline_cursor();
         self.after_change(window, cx);
+    }
+
+    /// 拖动结束或取消后，按鼠标所在位置恢复悬停时的样式。
+    pub(crate) fn restore_timeline_cursor(&mut self) {
+        let (x, y) = self.timeline.pointer;
+        let hit = self
+            .timeline
+            .geometry
+            .hit_test(x, y, &self.doc.project.timeline);
+        self.timeline.cursor = super::interaction::cursor_for(hit, None, false);
     }
 
     /// Esc 取消时间轴上进行中的操作：框选回到框之前的选择，拖动交给撤回手势。
     /// 返回是否有操作被取消；`true` 且是拖动时，调用方负责撤回手势。
     pub(crate) fn cancel_timeline_gesture(&mut self) -> (bool, bool) {
         self.timeline.pending_single = None;
+        self.restore_timeline_cursor();
         self.timeline.ghosts.clear();
         self.timeline.snap_line = None;
         if let Some(m) = self.timeline.marquee.take() {
@@ -329,6 +356,7 @@ impl Workspace {
             .relative()
             .overflow_hidden()
             .bg(palette::timeline_bg())
+            .cursor(self.timeline.cursor)
             .on_mouse_down(MouseButton::Left, cx.listener(Self::timeline_mouse_down))
             .on_mouse_move(cx.listener(Self::timeline_mouse_move))
             .on_mouse_up(

@@ -160,6 +160,34 @@ impl Drag {
     }
 }
 
+/// 鼠标样式：提示按下去会做什么。拖动中按拖的类型；框选中是十字；
+/// 悬停在片段中间是张开的手（可拖动），在片段边缘是左右箭头（可修剪）。
+#[must_use]
+pub const fn cursor_for(hit: Hit, drag: Option<&Drag>, marquee: bool) -> gpui_kit::CursorStyle {
+    use gpui_kit::CursorStyle;
+    if marquee {
+        return CursorStyle::Crosshair;
+    }
+    match (drag, hit) {
+        (Some(Drag::Move { .. }), _) => CursorStyle::ClosedHand,
+        (Some(Drag::TrimStart { .. } | Drag::TrimEnd { .. }), _)
+        | (
+            None,
+            Hit::Clip {
+                zone: Zone::LeftEdge | Zone::RightEdge,
+                ..
+            },
+        ) => CursorStyle::ResizeLeftRight,
+        (
+            None,
+            Hit::Clip {
+                zone: Zone::Body, ..
+            },
+        ) => CursorStyle::OpenHand,
+        _ => CursorStyle::Arrow,
+    }
+}
+
 /// 吸附：先吸目标（播放头、片段边缘），没有就吸到帧。
 struct Snapper {
     targets: Vec<Time>,
@@ -386,6 +414,39 @@ mod tests {
             FrameRate::new(30, 1).time_of_frame(241)
         );
         assert_eq!(out.snap, None);
+    }
+
+    #[test]
+    fn cursor_shows_what_a_press_would_do() {
+        use gpui_kit::CursorStyle;
+        let (d, ids, g) = setup();
+        let body = g.hit_test(x(&g, 6.5), row(&g, 0.0), &d.project.timeline);
+        let edge = g.hit_test(x(&g, 5.0) + 2.0, row(&g, 0.0), &d.project.timeline);
+        let empty = g.hit_test(x(&g, 30.0), row(&g, 0.0), &d.project.timeline);
+        assert_eq!(cursor_for(body, None, false), CursorStyle::OpenHand);
+        assert_eq!(cursor_for(edge, None, false), CursorStyle::ResizeLeftRight);
+        assert_eq!(cursor_for(empty, None, false), CursorStyle::Arrow);
+        assert_eq!(cursor_for(Hit::Ruler, None, false), CursorStyle::Arrow);
+        // 拖动中按拖的类型，不看鼠标下面是什么
+        let moving = Drag::begin(&d, &g, x(&g, 6.5), row(&g, 0.0), Time::ZERO).unwrap();
+        assert_eq!(
+            cursor_for(empty, Some(&moving), false),
+            CursorStyle::ClosedHand
+        );
+        let trim = Drag::TrimEnd { clip: ids.v2 };
+        assert_eq!(
+            cursor_for(body, Some(&trim), false),
+            CursorStyle::ResizeLeftRight
+        );
+        assert_eq!(
+            cursor_for(body, Some(&Drag::Scrub), false),
+            CursorStyle::Arrow
+        );
+        assert_eq!(
+            cursor_for(body, None, true),
+            CursorStyle::Crosshair,
+            "框选中"
+        );
     }
 
     #[test]

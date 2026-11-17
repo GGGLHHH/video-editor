@@ -27,6 +27,11 @@ serde_json.workspace = true
 log.workspace = true
 env_logger.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# 自定义系统光标（旋转光标）：GPUI 没有这个接口，直接调 Win32
+raw-window-handle.workspace = true
+windows-sys.workspace = true
+
 [dev-dependencies]
 pathdiff.workspace = true
 gpui-kit = { workspace = true, features = ["test-support"] }

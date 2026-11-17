@@ -1438,3 +1438,172 @@ fn alt_drag_in_preview_skips_snapping(cx: &mut TestAppContext) {
     release(cx, &ui, to);
     assert!(first_video_transform(cx, &ui).x > 0.0, "按住 Alt 不吸附");
 }
+
+/// 预览里画面区域（按工程宽高比放进预览框、居中）：（左, 上, 宽, 高）。
+fn video_rect(cx: &mut TestAppContext, ui: &Ui) -> (f32, f32, f32, f32) {
+    let b = cx
+        .update_window(ui.win, |_, window, _| window.find("preview").bounds())
+        .unwrap();
+    let (pw, ph) = (f32::from(b.size.width), f32::from(b.size.height));
+    let (cw, ch) = ui.view.read_with(cx, |w, _| {
+        let s = w.document().project.settings;
+        #[expect(clippy::cast_precision_loss, reason = "测试里的小尺寸")]
+        (s.width as f32, s.height as f32)
+    });
+    let k = (pw / cw).min(ph / ch);
+    let (w, h) = (cw * k, ch * k);
+    (
+        f32::from(b.origin.x) + (pw - w) / 2.0,
+        f32::from(b.origin.y) + (ph - h) / 2.0,
+        w,
+        h,
+    )
+}
+
+#[gpui_kit::test]
+fn rotate_handle_drag_and_rotation_field(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click_timeline(cx, &ui, 0.5, 0.0, gpui_kit::Modifiers::default());
+    frame(cx, &ui);
+    // 缩到一半，旋转手柄（上边中点再往上 24 像素）就落在画面里
+    type_into(cx, &ui, "tf-scale", "50");
+    let (vx, vy, vw, vh) = video_rect(cx, &ui);
+    let center = point(px(vx + vw / 2.0), px(vy + vh / 2.0));
+    let handle = point(center.x, px(vy + vh / 4.0 - 24.0));
+    // 从正上方拖到正右方：顺时针 90°（吸附开着，正好 90）
+    let to = point(center.x + px(vw / 3.0), center.y + px(2.0));
+    press_and_move(cx, &ui, handle, to);
+    release(cx, &ui, to);
+    let t = first_video_transform(cx, &ui);
+    assert!((t.rotation - 90.0).abs() < 1e-3, "{t:?}");
+    assert!((t.scale - 0.5).abs() < 1e-6, "旋转不改缩放");
+    // 一次拖动一步撤销
+    click(cx, &ui, "tb-undo");
+    assert_eq!(first_video_transform(cx, &ui).rotation, 0.0);
+    // 属性面板输入角度
+    type_into(cx, &ui, "tf-rotation", "-30");
+    assert!((first_video_transform(cx, &ui).rotation + 30.0).abs() < 1e-4);
+}
+
+#[gpui_kit::test]
+fn snapping_toggle_by_button_and_n_key(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click_timeline(cx, &ui, 0.5, 0.0, gpui_kit::Modifiers::default());
+    frame(cx, &ui);
+    let from = preview_center(cx, &ui);
+    let to = from + point(px(3.0), px(0.0));
+    // N 关掉吸附：离中线 3 像素也不吸
+    press(cx, &ui, "n");
+    press_and_move(cx, &ui, from, to);
+    release(cx, &ui, to);
+    let off = first_video_transform(cx, &ui).x;
+    assert!(off > 0.0, "吸附关着不吸");
+    // 关着时按住 Alt：临时打开吸附，吸回中线
+    let alt = gpui_kit::Modifiers {
+        alt: true,
+        ..Default::default()
+    };
+    let back = preview_center(cx, &ui) + point(px(3.0), px(0.0));
+    press_and_move_with(cx, &ui, back, back + point(px(1.0), px(0.0)), alt);
+    release(cx, &ui, back);
+    assert_eq!(first_video_transform(cx, &ui).x, 0.0, "Alt 临时取反");
+    // 工具栏按钮再打开：不按 Alt 也吸
+    click(cx, &ui, "tb-snap");
+    press_and_move(cx, &ui, from, to);
+    release(cx, &ui, to);
+    assert_eq!(first_video_transform(cx, &ui).x, 0.0);
+}
+
+/// 鼠标移到某处（不按键）。
+fn hover_at(cx: &mut TestAppContext, ui: &Ui, at: Point<Pixels>) {
+    use gpui_kit::{InputEvent as _, MouseMoveEvent};
+    cx.update_window(ui.win, |_, window, cx| {
+        window.dispatch_event(
+            MouseMoveEvent {
+                position: at,
+                pressed_button: None,
+                modifiers: gpui_kit::Modifiers::default(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+fn cursors(cx: &TestAppContext, ui: &Ui) -> (gpui_kit::CursorStyle, gpui_kit::CursorStyle) {
+    ui.view.read_with(cx, |w, _| w.pointer_cursors())
+}
+
+#[gpui_kit::test]
+fn cursor_shows_what_a_press_would_do(cx: &mut TestAppContext) {
+    use gpui_kit::CursorStyle;
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    let origin = cx
+        .update_window(ui.win, |_, window, _| {
+            window.find("timeline").bounds().origin
+        })
+        .unwrap();
+    // 时间轴：片段中间张开的手，边缘左右箭头，空白处箭头
+    hover_at(cx, &ui, origin + timeline_point(1.0, 0.0));
+    assert_eq!(cursors(cx, &ui).0, CursorStyle::OpenHand);
+    hover_at(
+        cx,
+        &ui,
+        origin + timeline_point(2.0, 0.0) - point(px(2.0), px(0.0)),
+    );
+    assert_eq!(cursors(cx, &ui).0, CursorStyle::ResizeLeftRight);
+    hover_at(cx, &ui, origin + timeline_point(8.0, 0.0));
+    assert_eq!(cursors(cx, &ui).0, CursorStyle::Arrow);
+    // 预览：画面上张开的手，按下拖动握拳，松开回到张开的手
+    let center = preview_center(cx, &ui);
+    hover_at(cx, &ui, center);
+    assert_eq!(cursors(cx, &ui).1, CursorStyle::OpenHand);
+    let to = center + point(px(30.0), px(0.0));
+    press_and_move(cx, &ui, center, to);
+    assert_eq!(cursors(cx, &ui).1, CursorStyle::ClosedHand);
+    release(cx, &ui, to);
+    assert_eq!(cursors(cx, &ui).1, CursorStyle::OpenHand);
+    // 选中后缩到一半：右上角是「/」向的缩放箭头
+    type_into(cx, &ui, "tf-x", "0");
+    type_into(cx, &ui, "tf-scale", "50");
+    let (vx, vy, vw, vh) = video_rect(cx, &ui);
+    hover_at(cx, &ui, point(px(vx + vw * 0.75), px(vy + vh * 0.25)));
+    assert_eq!(cursors(cx, &ui).1, CursorStyle::ResizeUpRightDownLeft);
+    // 旋转手柄：手指
+    hover_at(cx, &ui, point(px(vx + vw / 2.0), px(vy + vh * 0.25 - 24.0)));
+    assert_eq!(cursors(cx, &ui).1, CursorStyle::PointingHand);
+}
+
+#[gpui_kit::test]
+fn dragging_just_outside_a_corner_rotates(cx: &mut TestAppContext) {
+    use gpui_kit::CursorStyle;
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click_timeline(cx, &ui, 0.5, 0.0, gpui_kit::Modifiers::default());
+    frame(cx, &ui);
+    type_into(cx, &ui, "tf-scale", "50");
+    let (vx, vy, vw, vh) = video_rect(cx, &ui);
+    let center = (vx + vw / 2.0, vy + vh / 2.0);
+    // 右下角外侧 14 像素（斜向）：旋转区
+    let corner = (vx + vw * 0.75, vy + vh * 0.75);
+    let from = point(px(corner.0 + 10.0), px(corner.1 + 10.0));
+    hover_at(cx, &ui, from);
+    // 无界面测试拿不到系统窗口，自定义旋转光标装不上，退回手指
+    assert_eq!(cursors(cx, &ui).1, CursorStyle::PointingHand);
+    // 绕中心拖到右上角外侧的同一方向：转了 -90°（逆时针）
+    let to = point(
+        px(center.0 + (f32::from(from.y) - center.1)),
+        px(center.1 - (f32::from(from.x) - center.0)),
+    );
+    press_and_move(cx, &ui, from, to);
+    release(cx, &ui, to);
+    let t = first_video_transform(cx, &ui);
+    assert!((t.rotation + 90.0).abs() < 1e-2, "{t:?}");
+    assert!((t.scale - 0.5).abs() < 1e-6);
+}

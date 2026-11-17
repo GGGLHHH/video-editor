@@ -8,7 +8,7 @@ use crate::document::Document;
 use crate::inspector::Inspector;
 use crate::preview::PreviewState;
 use crate::timeline::view::TimelineUi;
-use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::base::{Selectable as _, TestSupportExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{
@@ -48,6 +48,8 @@ pub struct Workspace {
     pub(crate) preview: PreviewState,
     pub(crate) playhead: Time,
     pub(crate) timeline: TimelineUi,
+    /// 吸附开关：时间轴拖片段、预览上移动和旋转都看它；按住 Alt 临时取反。
+    pub(crate) snapping: bool,
     pub(crate) inspector: Inspector,
     pub(crate) export: Option<crate::export_ui::ExportProgress>,
     /// 上一次成功导出的文件。
@@ -109,6 +111,7 @@ impl Workspace {
             media: HashMap::new(),
             preview: PreviewState::default(),
             playhead: Time::ZERO,
+            snapping: true,
             timeline: TimelineUi::default(),
             inspector,
             export: None,
@@ -297,6 +300,9 @@ impl Workspace {
     /// 正在框选时回到框之前的选择；否则取消选择。
     fn cancel(&mut self, _: &act::Cancel, window: &mut Window, cx: &mut Context<'_, Self>) {
         let preview = self.preview.drag.take().is_some();
+        if preview {
+            crate::platform_cursor::clear();
+        }
         let (timeline_busy, timeline_drag) = self.cancel_timeline_gesture();
         if preview || timeline_drag {
             self.doc.cancel_gesture();
@@ -313,6 +319,22 @@ impl Workspace {
             self.doc.clear_selection();
         }
         self.after_change(window, cx);
+    }
+
+    /// 当前的鼠标样式：（时间轴，预览）。
+    #[must_use]
+    pub const fn pointer_cursors(&self) -> (gpui_kit::CursorStyle, gpui_kit::CursorStyle) {
+        (self.timeline.cursor, self.preview.cursor)
+    }
+
+    fn toggle_snapping(
+        &mut self,
+        _: &act::ToggleSnapping,
+        _: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.snapping = !self.snapping;
+        cx.notify();
     }
 
     fn select_all(&mut self, _: &act::SelectAll, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -436,6 +458,14 @@ impl Workspace {
                     .icon(IconName::Delete)
                     .on_click(cx.listener(|this, _, w, cx| this.delete(&act::Delete, w, cx))),
             )
+            .child(
+                tool("tb-snap", "吸附 N")
+                    .selected(self.snapping)
+                    .tooltip("吸附开关：拖动时贴到播放头、片段和画面边缘（按住 Alt 临时取反）")
+                    .on_click(cx.listener(|this, _, w, cx| {
+                        this.toggle_snapping(&act::ToggleSnapping, w, cx);
+                    })),
+            )
             .child(tool("tb-subtitle", "加字幕 T").on_click(
                 cx.listener(|this, _, w, cx| this.add_subtitle(&act::AddSubtitle, w, cx)),
             ))
@@ -514,6 +544,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::import_srt))
             .on_action(cx.listener(Self::export_srt))
             .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::toggle_snapping))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::deselect_all))
             .on_action(cx.listener(Self::undo))
@@ -555,5 +586,7 @@ pub(crate) fn notify(note: Notification, window: &mut Window, cx: &mut App) {
 
 /// 打开主窗口时用：在 `cx.new` 里构造。
 pub fn build(engine: Engine, window: &mut Window, cx: &mut App) -> Entity<Workspace> {
+    // 旋转光标要直接调系统（GPUI 没有自定义光标）；装不上（无界面测试、非 Windows）就退回手指光标
+    crate::platform_cursor::install(window);
     cx.new(|cx| Workspace::new(engine, window, cx))
 }

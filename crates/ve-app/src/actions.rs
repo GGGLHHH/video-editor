@@ -35,6 +35,7 @@ mod generated {
             Cancel,
             SelectAll,
             DeselectAll,
+            ToggleSnapping,
         ]
     );
 }
@@ -78,5 +79,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", Cancel, Some(NO_INPUT)),
         KeyBinding::new("ctrl-a", SelectAll, Some(NO_INPUT)),
         KeyBinding::new("ctrl-shift-a", DeselectAll, Some(NO_INPUT)),
+        // 吸附开关（S 已经是分割；Resolve 也用 N）
+        KeyBinding::new("n", ToggleSnapping, Some(NO_INPUT)),
     ]);
 }

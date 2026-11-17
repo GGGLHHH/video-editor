@@ -7950,6 +7950,7 @@ dependencies = [
  "image",
  "log",
  "pathdiff",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "smol",
@@ -7958,6 +7959,7 @@ dependencies = [
  "ve-engine",
  "ve-export",
  "ve-media",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -3,6 +3,7 @@
 use crate::actions as act;
 use crate::theme::palette;
 use crate::workspace::Workspace;
+use gpui_kit::StatefulInteractiveElement as _;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -36,6 +37,8 @@ pub struct PreviewState {
     pub em_ratio: Option<f32>,
     /// 正在预览上拖动的图层。
     pub(crate) drag: Option<crate::preview_edit::PreviewDrag>,
+    /// 鼠标样式（悬停 / 拖动时按位置变）。
+    pub(crate) cursor: gpui_kit::CursorStyle,
 }
 
 /// BGRA 帧 → 可直接上传的图片（GPUI 的 `RenderImage` 内部就是 BGRA）。
@@ -150,11 +153,13 @@ impl Workspace {
         let this = cx.entity();
         let frame = div()
             .id("preview")
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| this.preview_hover(*hovered, cx)))
             .test_support()
             .flex_1()
             .relative()
             .overflow_hidden()
             .bg(palette::preview_bg())
+            .cursor(self.preview.cursor)
             .on_mouse_down(MouseButton::Left, cx.listener(Self::preview_mouse_down))
             .on_mouse_move(cx.listener(Self::preview_mouse_move))
             .on_mouse_up(

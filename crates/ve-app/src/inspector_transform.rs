@@ -1,4 +1,4 @@
-//! 属性面板的「画面」区：视频轨片段的位置、缩放、裁剪、不透明度。
+//! 属性面板的「画面」区：视频轨片段的位置、缩放、旋转、裁剪、不透明度。
 
 use crate::workspace::Workspace;
 use gpui_kit::base::TestSupportExt as _;
@@ -12,7 +12,7 @@ use gpui_kit::{
     SharedString, Styled as _, Subscription, Window, div,
 };
 use ve_core::edit::set_transform;
-use ve_core::{ClipId, Crop, TrackKind, Transform};
+use ve_core::{ClipId, Crop, TrackKind, Transform, wrap_degrees};
 
 /// 位置偏移的输入范围（±500%）。
 const OFFSET_RANGE: (f32, f32) = (-5.0, 5.0);
@@ -25,20 +25,31 @@ pub struct TransformFields {
     x: Entity<InputState>,
     y: Entity<InputState>,
     scale: Entity<InputState>,
+    /// 旋转（度）。
+    rotation: Entity<InputState>,
     /// 左、上、右、下。
     crop: [Entity<InputState>; 4],
     opacity: Entity<SliderState>,
     opacity_gesture: bool,
     /// 上次填进输入框的文字：没被改过的字段提交时沿用片段的精确值，
     /// 不会把四舍五入后的显示值写回去（预览上拖出来的值精度比显示的高）。
-    shown: [String; 7],
+    shown: [String; 8],
 }
 
 /// 比例 → 百分比文字（去掉多余的小数）。
 fn pct(v: f32) -> String {
-    let s = format!("{:.1}", f64::from(v) * 100.0);
-    s.strip_suffix(".0")
-        .map_or_else(|| s.clone(), str::to_owned)
+    one_decimal(f64::from(v) * 100.0)
+}
+
+/// 一位小数、去掉 `.0`；负零和四舍五入后是 0 的小负数写成 `0`。
+fn one_decimal(v: f64) -> String {
+    let s = format!("{v:.1}");
+    let s = s.strip_suffix(".0").unwrap_or(&s);
+    if s == "-0" {
+        "0".to_owned()
+    } else {
+        s.to_owned()
+    }
 }
 
 /// 百分比文字 → 比例；不是有限数时返回 `None`。
@@ -51,10 +62,24 @@ fn parse_pct(s: &str) -> Option<f32> {
         .map(|v| v / 100.0)
 }
 
+/// 角度 → 文字（一位小数，去掉 `.0`）。
+fn deg(v: f32) -> String {
+    one_decimal(f64::from(v))
+}
+
+/// 角度文字 → 度；不是有限数时返回 `None`。
+fn parse_deg(s: &str) -> Option<f32> {
+    s.trim()
+        .trim_end_matches('°')
+        .parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite())
+}
+
 /// 由各字段文字算出新的画面属性：解析不了的字段保持原值，越界的夹到范围内；
 /// 左右或上下裁剪加起来到 100% 以上时整次修改无效，返回 `None`。
 #[must_use]
-pub fn transform_from_text(current: &Transform, fields: &[String; 7]) -> Option<Transform> {
+pub fn transform_from_text(current: &Transform, fields: &[String; 8]) -> Option<Transform> {
     let get = |i: usize, old: f32| parse_pct(&fields[i]).unwrap_or(old);
     let crop = |i: usize, old: f32| get(i, old).clamp(0.0, CROP_MAX);
     let t = Transform {
@@ -68,6 +93,7 @@ pub fn transform_from_text(current: &Transform, fields: &[String; 7]) -> Option<
             bottom: crop(6, current.crop.bottom),
         },
         opacity: current.opacity,
+        rotation: wrap_degrees(parse_deg(&fields[7]).unwrap_or(current.rotation)),
     };
     t.is_valid().then_some(t)
 }
@@ -76,7 +102,7 @@ impl TransformFields {
     /// 创建控件并订阅事件。
     pub fn new(window: &mut Window, cx: &mut Context<'_, Workspace>) -> (Self, Vec<Subscription>) {
         let mut input = || cx.new(|cx| InputState::new(window, cx).placeholder("0"));
-        let (x, y, scale) = (input(), input(), input());
+        let (x, y, scale, rotation) = (input(), input(), input(), input());
         let crop = [input(), input(), input(), input()];
         let opacity = cx.new(|_| {
             SliderState::new()
@@ -85,7 +111,7 @@ impl TransformFields {
                 .step(1.0)
                 .default_value(100.0)
         });
-        let mut subs: Vec<Subscription> = [&x, &y, &scale]
+        let mut subs: Vec<Subscription> = [&x, &y, &scale, &rotation]
             .into_iter()
             .chain(&crop)
             .map(|field| {
@@ -110,6 +136,7 @@ impl TransformFields {
                 x,
                 y,
                 scale,
+                rotation,
                 crop,
                 opacity,
                 opacity_gesture: false,
@@ -120,7 +147,7 @@ impl TransformFields {
     }
 
     /// 各字段的文字；没被改过的字段返回空串（解析失败 → 沿用原值）。
-    fn edited_texts(&self, cx: &gpui_kit::App) -> [String; 7] {
+    fn edited_texts(&self, cx: &gpui_kit::App) -> [String; 8] {
         let mut texts = self.texts(cx);
         for (t, shown) in texts.iter_mut().zip(&self.shown) {
             if t == shown {
@@ -130,7 +157,7 @@ impl TransformFields {
         texts
     }
 
-    fn texts(&self, cx: &gpui_kit::App) -> [String; 7] {
+    fn texts(&self, cx: &gpui_kit::App) -> [String; 8] {
         let read = |e: &Entity<InputState>| e.read(cx).value().to_string();
         [
             read(&self.x),
@@ -140,6 +167,7 @@ impl TransformFields {
             read(&self.crop[1]),
             read(&self.crop[2]),
             read(&self.crop[3]),
+            read(&self.rotation),
         ]
     }
 }
@@ -160,31 +188,31 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.inspector.transform.shown = [
-            t.x,
-            t.y,
-            t.scale,
-            t.crop.left,
-            t.crop.top,
-            t.crop.right,
-            t.crop.bottom,
-        ]
-        .map(pct);
+        // 和 `texts` 同一个顺序：X、Y、缩放、裁剪左上右下、旋转
+        let shown = [
+            pct(t.x),
+            pct(t.y),
+            pct(t.scale),
+            pct(t.crop.left),
+            pct(t.crop.top),
+            pct(t.crop.right),
+            pct(t.crop.bottom),
+            deg(t.rotation),
+        ];
+        self.inspector.transform.shown.clone_from(&shown);
         let f = &self.inspector.transform;
-        let values = [
-            t.x,
-            t.y,
-            t.scale,
-            t.crop.left,
-            t.crop.top,
-            t.crop.right,
-            t.crop.bottom,
-        ];
         let fields = [
-            &f.x, &f.y, &f.scale, &f.crop[0], &f.crop[1], &f.crop[2], &f.crop[3],
+            &f.x,
+            &f.y,
+            &f.scale,
+            &f.crop[0],
+            &f.crop[1],
+            &f.crop[2],
+            &f.crop[3],
+            &f.rotation,
         ];
-        for (field, v) in fields.into_iter().zip(values) {
-            field.update(cx, |s, cx| s.set_value(pct(v), window, cx));
+        for (field, text) in fields.into_iter().zip(shown) {
+            field.update(cx, |s, cx| s.set_value(text, window, cx));
         }
         let opacity = t.opacity * 100.0;
         f.opacity
@@ -283,7 +311,7 @@ impl Workspace {
                                 .ghost()
                                 .compact()
                                 .label("重置")
-                                .tooltip("恢复铺满画面、居中、不裁剪")
+                                .tooltip("恢复铺满画面、居中、不旋转、不裁剪")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.reset_transform(window, cx);
                                 })),
@@ -294,7 +322,8 @@ impl Workspace {
                         .gap_2()
                         .child(field("tf-x", "X（%）", &f.x))
                         .child(field("tf-y", "Y（%）", &f.y))
-                        .child(field("tf-scale", "缩放（%）", &f.scale)),
+                        .child(field("tf-scale", "缩放（%）", &f.scale))
+                        .child(field("tf-rotation", "旋转（°）", &f.rotation)),
                 )
                 .child(div().text_xs().text_color(muted).child("裁剪（%）"))
                 .child(
@@ -326,7 +355,7 @@ impl Workspace {
 mod tests {
     use super::*;
 
-    fn fields(v: [&str; 7]) -> [String; 7] {
+    fn fields(v: [&str; 8]) -> [String; 8] {
         v.map(str::to_owned)
     }
 
@@ -334,6 +363,9 @@ mod tests {
     fn percent_text_round_trips() {
         assert_eq!(pct(0.25), "25");
         assert_eq!(pct(-0.125), "-12.5");
+        // 负零、四舍五入后是 0 的小负数都显示成 0
+        assert_eq!(pct(-0.0), "0");
+        assert_eq!(pct(-0.000_01), "0");
         assert_eq!(parse_pct(" 50% "), Some(0.5));
         assert_eq!(parse_pct("abc"), None);
         assert_eq!(parse_pct("inf"), None);
@@ -342,23 +374,43 @@ mod tests {
     #[test]
     fn fields_parse_clamp_and_reject() {
         let cur = Transform::default();
-        let t =
-            transform_from_text(&cur, &fields(["25", "-10", "50", "0", "0", "0", "0"])).unwrap();
+        let t = transform_from_text(&cur, &fields(["25", "-10", "50", "0", "0", "0", "0", ""]))
+            .unwrap();
         assert!(
             (t.x - 0.25).abs() < 1e-6 && (t.y + 0.1).abs() < 1e-6 && (t.scale - 0.5).abs() < 1e-6
         );
         // 解析不了的保持原值；越界的夹到范围
-        let t =
-            transform_from_text(&cur, &fields(["abc", "900", "0", "0", "0", "0", "0"])).unwrap();
+        let t = transform_from_text(&cur, &fields(["abc", "900", "0", "0", "0", "0", "0", ""]))
+            .unwrap();
         assert_eq!(t.x, 0.0);
         assert_eq!(t.y, OFFSET_RANGE.1);
         assert_eq!(t.scale, Transform::SCALE_RANGE.0);
         // 左右裁剪加起来 ≥ 100%：整次无效
         assert!(
-            transform_from_text(&cur, &fields(["0", "0", "100", "60", "0", "50", "0"])).is_none()
+            transform_from_text(&cur, &fields(["0", "0", "100", "60", "0", "50", "0", ""]))
+                .is_none()
         );
-        let t =
-            transform_from_text(&cur, &fields(["0", "0", "100", "150", "0", "0", "0"])).unwrap();
+        let t = transform_from_text(&cur, &fields(["0", "0", "100", "150", "0", "0", "0", ""]))
+            .unwrap();
         assert!((t.crop.left - CROP_MAX).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn rotation_field_in_degrees_wraps_to_half_turn() {
+        let cur = Transform::default();
+        let rot = |text: &str| {
+            transform_from_text(&cur, &fields(["", "", "", "", "", "", "", text]))
+                .unwrap()
+                .rotation
+        };
+        assert!((rot("45") - 45.0).abs() < 1e-4);
+        assert!((rot("450°") - 90.0).abs() < 1e-4);
+        assert!((rot("-190") - 170.0).abs() < 1e-4);
+        assert!((rot("180") - 180.0).abs() < 1e-4);
+        assert!((rot("-180") - 180.0).abs() < 1e-4);
+        assert_eq!(rot("abc"), 0.0);
+        assert_eq!(deg(-12.26), "-12.3");
+        assert_eq!(deg(90.0), "90");
+        assert_eq!(deg(-0.01), "0");
     }
 }
