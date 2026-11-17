@@ -61,6 +61,16 @@ impl History {
         }
     }
 
+    /// 放弃事务（拖到一半按 Esc）：工程还原成事务开始前的样子，不记撤销步骤。
+    /// 不在事务中返回 `false`。
+    pub fn abort_transaction(&mut self, current: &mut Project) -> bool {
+        let Some(before) = self.transaction.take() else {
+            return false;
+        };
+        *current = before;
+        true
+    }
+
     /// 撤销一步；没有可撤销的返回 `false`。
     pub fn undo(&mut self, current: &mut Project) -> bool {
         self.transaction = None;
@@ -131,6 +141,20 @@ mod tests {
         h.record(&p);
         set_gain(&mut p, ids.a1, -6.0).unwrap();
         assert!(!h.can_redo());
+    }
+
+    #[test]
+    fn abort_transaction_restores_without_undo_step() {
+        let (mut p, ids) = sample_project();
+        let original = p.clone();
+        let mut h = History::new(100);
+        assert!(!h.abort_transaction(&mut p), "不在事务中");
+        h.begin_transaction(&p);
+        move_clip(&mut p, ids.v1, ids.video_track, Time::from_secs(20)).unwrap();
+        assert!(h.abort_transaction(&mut p));
+        assert_eq!(p, original);
+        assert!(!h.in_transaction());
+        assert!(!h.can_undo());
     }
 
     #[test]

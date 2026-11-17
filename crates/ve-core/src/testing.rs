@@ -43,6 +43,7 @@ pub const fn media_clip(id: ClipId, asset: AssetId, start: Time, duration: Time)
         gain_db: 0.0,
         fade_in: Time::ZERO,
         fade_out: Time::ZERO,
+        transform: crate::Transform::DEFAULT,
     }
 }
 
@@ -103,6 +104,7 @@ pub fn sample_project() -> (Project, SampleIds) {
         gain_db: 0.0,
         fade_in: Time::ZERO,
         fade_out: Time::ZERO,
+        transform: crate::Transform::DEFAULT,
     };
     // Project::new() 的轨道顺序固定为 视频、音频、字幕
     let [video, audio, subs] = &mut p.timeline.tracks[..] else {

@@ -1,6 +1,6 @@
 //! 时间轴：轨道、片段，以及模型不变式检查。
 
-use crate::{Asset, AssetId, ClipId, IdGen, Time, TrackId};
+use crate::{Asset, AssetId, ClipId, IdGen, Time, TrackId, Transform};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -51,6 +51,9 @@ pub struct Clip {
     pub fade_in: Time,
     /// 淡出长度。
     pub fade_out: Time,
+    /// 画面属性（只对视频轨上的媒体片段起作用）。第 1 版工程文件里没有这个字段，取默认值。
+    #[serde(default)]
+    pub transform: Transform,
 }
 
 impl Clip {
@@ -203,6 +206,12 @@ pub enum InvariantError {
         /// 片段。
         clip: ClipId,
     },
+    /// 画面属性违反不变式。
+    #[error("片段 {clip:?} 画面属性无效")]
+    BadTransform {
+        /// 片段。
+        clip: ClipId,
+    },
     /// 增益不是有限数。
     #[error("片段 {clip:?} 增益无效")]
     BadGain {
@@ -222,6 +231,14 @@ impl Timeline {
                 Track::new(ids.track(), TrackKind::Subtitle),
             ],
         }
+    }
+
+    /// 视频轨，从最下层到最上层（合成顺序）。轨道列表的顺序就是界面上从上到下的顺序。
+    pub fn video_tracks_bottom_up(&self) -> impl Iterator<Item = &Track> {
+        self.tracks
+            .iter()
+            .rev()
+            .filter(|t| t.kind == TrackKind::Video)
     }
 
     /// 按 id 找轨道。
@@ -303,6 +320,9 @@ fn check_clip(
     }
     if !clip.gain_db.is_finite() {
         return Err(InvariantError::BadGain { clip: id });
+    }
+    if !clip.transform.is_valid() {
+        return Err(InvariantError::BadTransform { clip: id });
     }
     if clip.fade_in < Time::ZERO
         || clip.fade_out < Time::ZERO

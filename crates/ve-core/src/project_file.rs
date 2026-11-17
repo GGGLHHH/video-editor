@@ -1,6 +1,6 @@
 //! 工程文件（JSON）读写。
 //!
-//! 顶层 `{"format":"ve-project","version":1,...}`。素材路径同时存绝对路径和
+//! 顶层 `{"format":"ve-project","version":2,...}`（第 1 版也能读）。素材路径同时存绝对路径和
 //! 相对工程文件的路径：整个文件夹搬走后仍能找到素材。
 
 use crate::{Asset, AssetId, IdGen, InvariantError, Project, ProjectSettings, Timeline};
@@ -10,7 +10,10 @@ use std::{fs, io};
 use thiserror::Error;
 
 const FORMAT: &str = "ve-project";
-const VERSION: u32 = 1;
+/// 当前写出的版本。第 2 版加了片段的 `transform`。
+const VERSION: u32 = 2;
+/// 能读的最旧版本（缺的字段取默认值）。
+const OLDEST_READABLE: u32 = 1;
 
 /// 工程文件错误。
 #[derive(Debug, Error)]
@@ -125,7 +128,7 @@ pub fn load_project(path: &Path) -> Result<LoadedProject, ProjectFileError> {
     if header.format != FORMAT {
         return Err(ProjectFileError::WrongFormat);
     }
-    if header.version != VERSION {
+    if !(OLDEST_READABLE..=VERSION).contains(&header.version) {
         return Err(ProjectFileError::UnsupportedVersion(header.version));
     }
     let file: FileV1 = serde_json::from_slice(&bytes)?;
@@ -202,6 +205,44 @@ mod tests {
         let loaded = load_project(&file).unwrap();
         assert_eq!(loaded.missing_assets, []);
         assert_eq!(loaded.project, project);
+    }
+
+    #[test]
+    fn loads_v1_file_with_default_transform() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = project_in(dir.path());
+        let first = project.timeline.tracks[0].clips[0].id;
+        crate::edit::set_transform(
+            &mut project,
+            first,
+            crate::Transform {
+                scale: 0.5,
+                ..crate::Transform::default()
+            },
+        )
+        .unwrap();
+        let file = dir.path().join("a.vep");
+        save_project(&project, &file).unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        assert_eq!(json["version"], 2);
+        // 改成第 1 版文件的样子：版本 1、片段没有 transform 字段
+        json["version"] = 1.into();
+        for track in json["timeline"]["tracks"].as_array_mut().unwrap() {
+            for clip in track["clips"].as_array_mut().unwrap() {
+                clip.as_object_mut().unwrap().remove("transform");
+            }
+        }
+        fs::write(&file, serde_json::to_vec(&json).unwrap()).unwrap();
+        let loaded = load_project(&file).unwrap().project;
+        for track in &loaded.timeline.tracks {
+            for clip in &track.clips {
+                assert!(clip.transform.is_default());
+            }
+        }
+        save_project(&loaded, &file).unwrap();
+        let again: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        assert_eq!(again["version"], 2);
     }
 
     #[test]

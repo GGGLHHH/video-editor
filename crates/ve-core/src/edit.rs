@@ -2,7 +2,9 @@
 //!
 //! 实现方式：在时间轴副本上改（片段是 `Arc`，复制只是引用计数），成功才写回。
 
-use crate::{AssetId, Clip, ClipContent, ClipId, Project, Time, Timeline, TrackId, TrackKind};
+use crate::{
+    AssetId, Clip, ClipContent, ClipId, Project, Time, Timeline, TrackId, TrackKind, Transform,
+};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -30,6 +32,9 @@ pub enum EditError {
     /// 数值无效（如 NaN）。
     #[error("数值无效")]
     InvalidValue,
+    /// 这是该类型的最后一条轨道，不能删。
+    #[error("至少要留一条这种轨道")]
+    LastTrack,
 }
 
 /// 增益范围（dB）。
@@ -124,10 +129,11 @@ fn new_media_clip(
         gain_db: 0.0,
         fade_in: Time::ZERO,
         fade_out: Time::ZERO,
+        transform: Transform::default(),
     })
 }
 
-/// 把素材追加到对应轨道末尾：有视频进视频轨，纯音频进音频轨。
+/// 把素材追加到对应轨道末尾：有视频进最下层的视频轨（主画面），纯音频进第一条音频轨。
 ///
 /// # Errors
 /// 素材不存在，或素材既无视频也无音频。
@@ -143,10 +149,12 @@ pub fn append_asset(project: &mut Project, asset: AssetId) -> Result<ClipId, Edi
     } else {
         return Err(EditError::WrongTrackKind);
     };
-    let track = project
-        .timeline
-        .track_of_kind(kind)
-        .ok_or(EditError::WrongTrackKind)?;
+    // 上层视频轨是叠加用的（台标、画中画），追加的正片接在主画面后面
+    let track = match kind {
+        TrackKind::Video => project.timeline.video_tracks_bottom_up().next(),
+        _ => project.timeline.track_of_kind(kind),
+    }
+    .ok_or(EditError::WrongTrackKind)?;
     let (track_id, start) = (track.id, track.end());
     insert_asset_at(project, asset, track_id, start)
 }
@@ -203,6 +211,42 @@ pub fn move_clip(
         }
         tl.tracks[ti].clips.remove(ci);
         tl.tracks[to].insert_sorted(Arc::new(c));
+        Ok(())
+    })
+}
+
+/// 把一组片段在各自轨道上一起平移 `delta`（可为负）。往前挪过头时整组停在最早的片段到 0 为止，
+/// 相对位置不变；撞上组外的片段则整组不动。
+///
+/// # Errors
+/// 片段不存在、与组外片段重叠。
+pub fn move_clips(project: &mut Project, clips: &[ClipId], delta: Time) -> Result<(), EditError> {
+    let mut clips = clips.to_vec();
+    clips.sort_unstable();
+    clips.dedup();
+    with_timeline(project, |_, tl| {
+        let mut found = Vec::with_capacity(clips.len());
+        for &clip in &clips {
+            let (ti, ci) = locate(tl, clip)?;
+            found.push((ti, Arc::clone(&tl.tracks[ti].clips[ci])));
+        }
+        let earliest = found
+            .iter()
+            .map(|(_, c)| c.start)
+            .min()
+            .unwrap_or(Time::ZERO);
+        let delta = delta.max(Time::ZERO - earliest);
+        for (ti, _) in &found {
+            tl.tracks[*ti].clips.retain(|c| !clips.contains(&c.id));
+        }
+        for (ti, c) in found {
+            let mut moved = (*c).clone();
+            moved.start = c.start + delta;
+            if !tl.tracks[ti].is_free(moved.start, moved.end(), &[]) {
+                return Err(EditError::Overlap);
+            }
+            tl.tracks[ti].insert_sorted(Arc::new(moved));
+        }
         Ok(())
     })
 }
@@ -426,6 +470,72 @@ pub fn set_fades(
     })
 }
 
+/// 加一条轨道：视频轨放在所有视频轨最上面，音频轨放在最后一条音频轨下面。
+///
+/// # Errors
+/// 字幕轨（这一版只有一条）。
+pub fn add_track(project: &mut Project, kind: TrackKind) -> Result<TrackId, EditError> {
+    let tracks = &project.timeline.tracks;
+    let at = match kind {
+        TrackKind::Video => tracks.iter().position(|t| t.kind == TrackKind::Video),
+        TrackKind::Audio => tracks
+            .iter()
+            .rposition(|t| t.kind == TrackKind::Audio)
+            .map(|i| i + 1),
+        TrackKind::Subtitle => return Err(EditError::WrongTrackKind),
+    };
+    // 没有同类轨道时：视频轨放最前，音频轨放在字幕轨之前
+    let at = at.unwrap_or_else(|| match kind {
+        TrackKind::Video => 0,
+        _ => tracks
+            .iter()
+            .position(|t| t.kind == TrackKind::Subtitle)
+            .unwrap_or(tracks.len()),
+    });
+    let id = project.ids.track();
+    project
+        .timeline
+        .tracks
+        .insert(at, crate::Track::new(id, kind));
+    Ok(id)
+}
+
+/// 删除一条轨道和它上面的片段。
+///
+/// # Errors
+/// 轨道不存在，或它是该类型的最后一条。
+pub fn remove_track(project: &mut Project, track: TrackId) -> Result<(), EditError> {
+    let tl = &mut project.timeline;
+    let idx = track_index(tl, track)?;
+    let kind = tl.tracks[idx].kind;
+    if tl.tracks.iter().filter(|t| t.kind == kind).count() <= 1 {
+        return Err(EditError::LastTrack);
+    }
+    tl.tracks.remove(idx);
+    Ok(())
+}
+
+/// 设置画面属性（位置、缩放、裁剪、不透明度）。
+///
+/// # Errors
+/// 片段不存在、不是视频轨上的媒体片段、数值违反不变式。
+pub fn set_transform(project: &mut Project, clip: ClipId, t: Transform) -> Result<(), EditError> {
+    if !t.is_valid() {
+        return Err(EditError::InvalidValue);
+    }
+    let (track, _) = project
+        .timeline
+        .find_clip(clip)
+        .ok_or(EditError::ClipNotFound(clip))?;
+    if project.timeline.track(track).map(|tr| tr.kind) != Some(TrackKind::Video) {
+        return Err(EditError::WrongTrackKind);
+    }
+    update_clip(project, clip, |c| {
+        c.transform = t;
+        Ok(())
+    })
+}
+
 /// 在字幕轨加一条字幕。
 ///
 /// # Errors
@@ -458,6 +568,7 @@ pub fn add_subtitle(
         gain_db: 0.0,
         fade_in: Time::ZERO,
         fade_out: Time::ZERO,
+        transform: Transform::default(),
     };
     project.timeline.tracks[ti].insert_sorted(Arc::new(clip));
     Ok(id)
@@ -570,6 +681,51 @@ mod tests {
         let id = insert_asset_at(&mut p, ids.video_asset, ids.audio_track, secs(9)).unwrap();
         assert_eq!(clip(&p, id).start, secs(9));
         assert_valid(&p);
+    }
+
+    fn starts(p: &Project, ids: &[ClipId]) -> Vec<Time> {
+        ids.iter()
+            .map(|c| p.timeline.find_clip(*c).unwrap().1.start)
+            .collect()
+    }
+
+    #[test]
+    fn move_clips_shifts_group_on_their_tracks() {
+        let (mut p, ids) = sample_project();
+        // v1 0–5、v2 5–8（V1），a1 0–8（A1）一起往后 2 秒
+        // 同一个片段给了两次也只挪一次
+        move_clips(
+            &mut p,
+            &[ids.v1, ids.v2, ids.a1, ids.v1],
+            Time::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(
+            starts(&p, &[ids.v1, ids.v2, ids.a1]),
+            vec![Time::from_secs(2), Time::from_secs(7), Time::from_secs(2)]
+        );
+        assert_eq!(p.timeline.find_clip(ids.a1).unwrap().0, ids.audio_track);
+        assert!(p.timeline.check_invariants(&p.assets).is_ok());
+    }
+
+    #[test]
+    fn move_clips_stops_at_zero_and_refuses_overlap() {
+        let (mut p, ids) = sample_project();
+        move_clips(&mut p, &[ids.v2], Time::from_secs(10)).unwrap();
+        // 往前挪太多：最早的片段停在 0，整体相对位置不变
+        move_clips(&mut p, &[ids.v1, ids.a1], Time::from_secs(-3)).unwrap();
+        assert_eq!(starts(&p, &[ids.v1, ids.a1]), vec![Time::ZERO, Time::ZERO]);
+        // 撞上没选中的片段：整组不动
+        let before = p.clone();
+        assert_eq!(
+            move_clips(&mut p, &[ids.v1], Time::from_secs(12)),
+            Err(EditError::Overlap)
+        );
+        assert_eq!(p, before);
+        assert_eq!(
+            move_clips(&mut p, &[ClipId(999)], Time::from_secs(1)),
+            Err(EditError::ClipNotFound(ClipId(999)))
+        );
     }
 
     #[test]
@@ -744,6 +900,131 @@ mod tests {
             Err(EditError::ClipNotFound(ClipId(999)))
         );
         assert_valid(&p);
+    }
+
+    fn kinds(p: &Project) -> Vec<TrackKind> {
+        p.timeline.tracks.iter().map(|t| t.kind).collect()
+    }
+
+    #[test]
+    fn add_video_track_goes_on_top() {
+        let (mut p, ids) = sample_project();
+        let new = add_track(&mut p, TrackKind::Video).unwrap();
+        assert_eq!(
+            kinds(&p),
+            [
+                TrackKind::Video,
+                TrackKind::Video,
+                TrackKind::Audio,
+                TrackKind::Subtitle
+            ]
+        );
+        assert_eq!(p.timeline.tracks[0].id, new);
+        assert_eq!(p.timeline.tracks[1].id, ids.video_track);
+        assert_eq!(
+            add_track(&mut p, TrackKind::Subtitle),
+            Err(EditError::WrongTrackKind)
+        );
+        assert_valid(&p);
+    }
+
+    #[test]
+    fn append_goes_to_bottom_video_track_after_adding_tracks() {
+        // 加了上层视频轨（放台标用）之后，「添加到时间轴」仍然接在主画面（最下层）后面
+        let (mut p, ids) = sample_project();
+        let top = add_track(&mut p, TrackKind::Video).unwrap();
+        let clip = append_asset(&mut p, ids.video_asset).unwrap();
+        assert_eq!(p.timeline.find_clip(clip).unwrap().0, ids.video_track);
+        assert_eq!(p.timeline.track(top).unwrap().clips.len(), 0);
+    }
+
+    #[test]
+    fn add_audio_track_goes_below_audio() {
+        let (mut p, ids) = sample_project();
+        let new = add_track(&mut p, TrackKind::Audio).unwrap();
+        assert_eq!(
+            kinds(&p),
+            [
+                TrackKind::Video,
+                TrackKind::Audio,
+                TrackKind::Audio,
+                TrackKind::Subtitle
+            ]
+        );
+        assert_eq!(p.timeline.tracks[1].id, ids.audio_track);
+        assert_eq!(p.timeline.tracks[2].id, new);
+    }
+
+    #[test]
+    fn remove_track_drops_clips_and_refuses_last() {
+        let (mut p, ids) = sample_project();
+        assert_eq!(
+            remove_track(&mut p, ids.video_track),
+            Err(EditError::LastTrack)
+        );
+        let top = add_track(&mut p, TrackKind::Video).unwrap();
+        // 把 v2 挪到新轨，再删旧轨：旧轨上的 v1 一起没了
+        move_clip(&mut p, ids.v2, top, secs(5)).unwrap();
+        remove_track(&mut p, ids.video_track).unwrap();
+        assert!(p.timeline.find_clip(ids.v1).is_none());
+        assert_eq!(p.timeline.find_clip(ids.v2).unwrap().0, top);
+        assert_eq!(
+            remove_track(&mut p, ids.video_track),
+            Err(EditError::TrackNotFound(ids.video_track))
+        );
+        assert_eq!(
+            remove_track(&mut p, ids.subtitle_track),
+            Err(EditError::LastTrack)
+        );
+        assert_valid(&p);
+    }
+
+    #[test]
+    fn bottom_up_order() {
+        let (mut p, ids) = sample_project();
+        let top = add_track(&mut p, TrackKind::Video).unwrap();
+        let order: Vec<TrackId> = p.timeline.video_tracks_bottom_up().map(|t| t.id).collect();
+        assert_eq!(order, [ids.video_track, top]);
+    }
+
+    #[test]
+    fn set_transform_validates_and_targets_video_only() {
+        let (mut p, ids) = sample_project();
+        let t = Transform {
+            x: 0.25,
+            scale: 0.5,
+            opacity: 0.8,
+            ..Transform::default()
+        };
+        set_transform(&mut p, ids.v1, t).unwrap();
+        assert_eq!(clip(&p, ids.v1).transform, t);
+        assert_eq!(
+            set_transform(&mut p, ids.a1, t),
+            Err(EditError::WrongTrackKind)
+        );
+        assert_eq!(
+            set_transform(&mut p, ids.s1, t),
+            Err(EditError::WrongTrackKind)
+        );
+        let bad = Transform {
+            scale: 0.0,
+            ..Transform::default()
+        };
+        assert_eq!(
+            set_transform(&mut p, ids.v1, bad),
+            Err(EditError::InvalidValue)
+        );
+        assert_eq!(clip(&p, ids.v1).transform, t, "失败时不变");
+        assert_valid(&p);
+        // 不变式能拦住无效的画面属性
+        let tr = p.timeline.track_of_kind_mut(TrackKind::Video).unwrap();
+        let mut c = (*tr.clips[0]).clone();
+        c.transform = bad;
+        tr.clips[0] = Arc::new(c);
+        assert!(matches!(
+            p.timeline.check_invariants(&p.assets),
+            Err(crate::InvariantError::BadTransform { .. })
+        ));
     }
 
     #[test]
