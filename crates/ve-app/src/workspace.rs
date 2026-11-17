@@ -307,12 +307,7 @@ impl Workspace {
         if preview || timeline_drag {
             self.doc.cancel_gesture();
             // 预览拖动时属性面板的数字跟着变过，还原后也要填回原值
-            let restored = self
-                .inspector
-                .bound
-                .and_then(|c| self.doc.project.timeline.find_clip(c))
-                .map(|(_, c)| c.transform);
-            if let Some(t) = restored {
+            if let Some((_, t, _)) = self.bound_video_clip() {
                 self.fill_transform(&t, window, cx);
             }
         } else if !timeline_busy {
@@ -505,6 +500,7 @@ impl Render for Workspace {
         self.pull_frame(window, cx);
         self.measure_subtitle_font(window);
         self.playhead = self.engine.position();
+        self.follow_playhead_in_inspector(window, cx);
         if self.engine.is_playing() {
             window.request_animation_frame();
         }

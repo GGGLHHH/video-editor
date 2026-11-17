@@ -573,6 +573,39 @@ const SELECTION_BORDER: f32 = 2.0;
 /// 选中片段标题栏的高度（像素）。
 const LABEL_BAR: f32 = 14.0;
 
+/// 片段底部画出关键帧位置（小菱形）。
+fn paint_keyframes(
+    clip: &ve_core::Clip,
+    ox: f32,
+    geo: &TimelineGeometry,
+    r: Bounds<Pixels>,
+    window: &mut Window,
+) {
+    const HALF: f32 = 4.5;
+    let y = f32::from(r.origin.y + r.size.height) - HALF - 3.0;
+    // 片段两端的关键帧也整个画在片段里面，不被边缘切掉一半
+    let (left, right) = (
+        f32::from(r.origin.x) + HALF + 2.0,
+        f32::from(r.origin.x + r.size.width) - HALF - 2.0,
+    );
+    for t in clip.animation.times() {
+        let x = (ox + geo.time_to_x(clip.start + t)).clamp(left, right.max(left));
+        let diamond = |half: f32| {
+            let mut b = gpui_kit::PathBuilder::fill();
+            b.move_to(point(px(x), px(y - half)));
+            b.line_to(point(px(x + half), px(y)));
+            b.line_to(point(px(x), px(y + half)));
+            b.line_to(point(px(x - half), px(y)));
+            b.close();
+            b.build()
+        };
+        if let (Ok(back), Ok(front)) = (diamond(HALF + 1.5), diamond(HALF)) {
+            window.paint_path(back, palette::keyframe_edge());
+            window.paint_path(front, palette::keyframe());
+        }
+    }
+}
+
 /// 拖动中：被拖片段原来的位置留个影子。
 fn paint_ghosts(snap: &Snapshot, ox: f32, oy: f32, window: &mut Window) {
     let geo = snap.geo;
@@ -651,6 +684,7 @@ fn paint_clip(
             palette::text()
         };
         paint_text(window, cx, &label, x0 + 5.0, y0 + 1.0, 11.0, label_color);
+        paint_keyframes(clip, ox, &geo, r, window);
     });
     if !selected && snap.hover == Some(clip.id) {
         window.paint_quad(outline(r, palette::hover(), BorderStyle::Solid).corner_radii(px(3.0)));

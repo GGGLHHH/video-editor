@@ -15,8 +15,8 @@ use gpui_kit::{
     MouseMoveEvent, PathBuilder, Pixels, Styled as _, Window, canvas, fill, point, px, size,
 };
 use ve_core::compose::resolve_layers;
-use ve_core::edit::set_transform;
-use ve_core::{ClipId, LayerGeometry, Transform, layer_geometry};
+use ve_core::edit::apply_transform_at;
+use ve_core::{ClipId, LayerGeometry, Time, Transform, layer_geometry};
 
 /// 吸附和手柄判定的范围（屏幕像素）。
 const SNAP_PX: f32 = 8.0;
@@ -43,6 +43,8 @@ pub(crate) struct PreviewDrag {
     guides: Guides,
     /// 当前吸上的竖线、横线（画布像素），画参考线用。
     lines: (Option<f32>, Option<f32>),
+    /// 播放头相对片段起点的时间：有动画时在这里新建 / 更新关键帧。
+    at: Time,
 }
 
 /// 画布（工程像素）和屏幕之间的换算：屏幕 = 原点 + 画布 × 比例。
@@ -167,6 +169,12 @@ impl Workspace {
             self.sync_inspector(window, cx);
         }
         let layers = self.layers_here(m.canvas);
+        let at = self
+            .doc
+            .project
+            .timeline
+            .find_clip(clip)
+            .map_or(Time::ZERO, |(_, c)| self.playhead - c.start);
         let others: Vec<LayerGeometry> = layers
             .iter()
             .filter(|(c, ..)| *c != clip)
@@ -184,6 +192,7 @@ impl Workspace {
             origin: p,
             guides,
             lines: (None, None),
+            at,
         });
         cx.notify();
     }
@@ -237,10 +246,14 @@ impl Workspace {
                 moved.transform
             }
         };
-        let clip = drag.clip;
+        let (clip, at) = (drag.clip, drag.at);
         // 转的时候光标跟着鼠标绕中心转
         Self::rotate_cursor(rotating, p, window);
-        if self.doc.edit(|proj| set_transform(proj, clip, t)).is_ok() {
+        if self
+            .doc
+            .edit(|proj| apply_transform_at(proj, clip, at, t))
+            .is_ok()
+        {
             self.after_change(window, cx);
             let now = self.doc.selection().first().copied();
             if now == Some(clip) {

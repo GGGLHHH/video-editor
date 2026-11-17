@@ -1607,3 +1607,107 @@ fn dragging_just_outside_a_corner_rotates(cx: &mut TestAppContext) {
     assert!((t.rotation + 90.0).abs() < 1e-2, "{t:?}");
     assert!((t.scale - 0.5).abs() < 1e-6);
 }
+
+/// 视频轨第一个片段（完整的，含动画）。
+fn first_video_clip(cx: &TestAppContext, ui: &Ui) -> ve_core::Clip {
+    ui.view.read_with(cx, |w, _| {
+        (*w.document()
+            .project
+            .timeline
+            .track_of_kind(TrackKind::Video)
+            .unwrap()
+            .clips[0])
+            .clone()
+    })
+}
+
+fn seek_to(cx: &mut TestAppContext, ui: &Ui, t: Time) {
+    ui.view.read_with(cx, |w, _| w.engine().seek(t));
+    frame(cx, ui);
+}
+
+fn position(cx: &TestAppContext, ui: &Ui) -> Time {
+    ui.view.read_with(cx, |w, _| w.engine().position())
+}
+
+#[gpui_kit::test]
+fn keyframe_buttons_add_jump_ease_and_remove(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click_timeline(cx, &ui, 0.5, 0.0, gpui_kit::Modifiers::default());
+    seek_to(cx, &ui, Time::ZERO);
+    click(cx, &ui, "tf-key");
+    assert_eq!(
+        first_video_clip(cx, &ui).animation.times(),
+        vec![Time::ZERO]
+    );
+    // 1 秒处改缩放：有动画了，自动在 1 秒打关键帧
+    seek_to(cx, &ui, Time::from_secs(1));
+    type_into(cx, &ui, "tf-scale", "50");
+    let c = first_video_clip(cx, &ui);
+    assert_eq!(c.animation.times(), vec![Time::ZERO, Time::from_secs(1)]);
+    let mid = c.transform_at(Time::from_millis(500)).scale;
+    assert!(mid > 0.5 && mid < 1.0, "中间在两者之间：{mid}");
+    // 跳到上一个、下一个关键帧
+    click(cx, &ui, "tf-key-prev");
+    assert_eq!(position(cx, &ui), Time::ZERO);
+    // 在 0 秒的关键帧上改缓动
+    click(cx, &ui, "tf-ease-linear");
+    assert_eq!(
+        first_video_clip(cx, &ui).animation.easing_at(Time::ZERO),
+        Some(ve_core::Easing::Linear)
+    );
+    click(cx, &ui, "tf-key-next");
+    assert_eq!(position(cx, &ui), Time::from_secs(1));
+    // 在关键帧上再点 ◆：删掉它
+    click(cx, &ui, "tf-key");
+    assert_eq!(
+        first_video_clip(cx, &ui).animation.times(),
+        vec![Time::ZERO]
+    );
+    // 撤销回来
+    click(cx, &ui, "tb-undo");
+    assert_eq!(first_video_clip(cx, &ui).animation.times().len(), 2);
+}
+
+#[gpui_kit::test]
+fn dragging_an_animated_clip_keys_the_playhead(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click_timeline(cx, &ui, 0.5, 0.0, gpui_kit::Modifiers::default());
+    seek_to(cx, &ui, Time::ZERO);
+    click(cx, &ui, "tf-key");
+    seek_to(cx, &ui, Time::from_secs(1));
+    let from = preview_center(cx, &ui);
+    let to = from + point(px(40.0), px(0.0));
+    cx.update_window(ui.win, |_, window, cx| window.drag(from, to, cx))
+        .unwrap();
+    cx.run_until_parked();
+    let c = first_video_clip(cx, &ui);
+    assert_eq!(c.animation.times(), vec![Time::ZERO, Time::from_secs(1)]);
+    assert!(c.transform_at(Time::from_secs(1)).x > 0.01);
+    assert_eq!(c.transform_at(Time::ZERO).x, 0.0, "0 秒的关键帧不动");
+    // 一次拖动一步撤销：撤销后 1 秒的关键帧没了
+    click(cx, &ui, "tb-undo");
+    assert_eq!(
+        first_video_clip(cx, &ui).animation.times(),
+        vec![Time::ZERO]
+    );
+}
+
+#[gpui_kit::test]
+fn keyframe_button_does_nothing_off_the_clip(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click_timeline(cx, &ui, 0.5, 0.0, gpui_kit::Modifiers::default());
+    // 片段只有 2 秒，播放头放到 3 秒：按钮不可用
+    seek_to(cx, &ui, Time::from_secs(3));
+    click(cx, &ui, "tf-key");
+    assert!(first_video_clip(cx, &ui).animation.is_empty());
+    // 重置会清掉动画
+    seek_to(cx, &ui, Time::ZERO);
+    click(cx, &ui, "tf-key");
+    assert!(!first_video_clip(cx, &ui).animation.is_empty());
+    click(cx, &ui, "tf-reset");
+    assert!(first_video_clip(cx, &ui).animation.is_empty());
+}

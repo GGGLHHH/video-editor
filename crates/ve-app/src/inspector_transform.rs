@@ -11,8 +11,8 @@ use gpui_kit::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, Styled as _, Subscription, Window, div,
 };
-use ve_core::edit::set_transform;
-use ve_core::{ClipId, Crop, TrackKind, Transform, wrap_degrees};
+use ve_core::edit::{apply_transform_at, reset_transform};
+use ve_core::{ClipId, Crop, Time, TrackKind, Transform, wrap_degrees};
 
 /// 位置偏移的输入范围（±500%）。
 const OFFSET_RANGE: (f32, f32) = (-5.0, 5.0);
@@ -60,6 +60,20 @@ fn parse_pct(s: &str) -> Option<f32> {
         .ok()
         .filter(|v| v.is_finite())
         .map(|v| v / 100.0)
+}
+
+/// 面板各字段显示的文字，和 `texts` 同一个顺序：X、Y、缩放、裁剪左上右下、旋转。
+fn shown_texts(t: &Transform) -> [String; 8] {
+    [
+        pct(t.x),
+        pct(t.y),
+        pct(t.scale),
+        pct(t.crop.left),
+        pct(t.crop.top),
+        pct(t.crop.right),
+        pct(t.crop.bottom),
+        deg(t.rotation),
+    ]
 }
 
 /// 角度 → 文字（一位小数，去掉 `.0`）。
@@ -173,12 +187,38 @@ impl TransformFields {
 }
 
 impl Workspace {
-    /// 属性面板绑定的片段在视频轨上时，返回它和它的画面属性。
-    fn bound_video_clip(&self) -> Option<(ClipId, Transform)> {
+    /// 属性面板绑定的片段在视频轨上时，返回它、播放头那一刻的画面属性（有动画时已求值），
+    /// 以及那一刻相对片段起点的时间（播放头不在片段上时夹到片段两端）。
+    pub(crate) fn bound_video_clip(&self) -> Option<(ClipId, Transform, Time)> {
         let clip = self.inspector.bound?;
         let (track, c) = self.doc.project.timeline.find_clip(clip)?;
         let kind = self.doc.project.timeline.track(track)?.kind;
-        (kind == TrackKind::Video && c.asset().is_some()).then_some((clip, c.transform))
+        if kind != TrackKind::Video || c.asset().is_none() {
+            return None;
+        }
+        let offset = (self.playhead - c.start).clamp(Time::ZERO, c.duration);
+        Some((clip, c.transform_at(offset), offset))
+    }
+
+    /// 播放头动了：绑定的片段有动画时，面板里的数字跟着换成这一刻的值。
+    /// 只在算出来的文字和上次填的不一样时才填，用户正在输入的内容不会被每帧覆盖。
+    pub(crate) fn follow_playhead_in_inspector(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((clip, t, _)) = self.bound_video_clip() else {
+            return;
+        };
+        let animated = self
+            .doc
+            .project
+            .timeline
+            .find_clip(clip)
+            .is_some_and(|(_, c)| !c.animation.is_empty());
+        if animated && shown_texts(&t) != self.inspector.transform.shown {
+            self.fill_transform(&t, window, cx);
+        }
     }
 
     /// 把片段的画面属性填进控件。
@@ -188,17 +228,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        // 和 `texts` 同一个顺序：X、Y、缩放、裁剪左上右下、旋转
-        let shown = [
-            pct(t.x),
-            pct(t.y),
-            pct(t.scale),
-            pct(t.crop.left),
-            pct(t.crop.top),
-            pct(t.crop.right),
-            pct(t.crop.bottom),
-            deg(t.rotation),
-        ];
+        let shown = shown_texts(t);
         self.inspector.transform.shown.clone_from(&shown);
         let f = &self.inspector.transform;
         let fields = [
@@ -221,33 +251,36 @@ impl Workspace {
 
     /// 输入框改完（回车 / 失焦）：按各字段写回；无效时恢复显示原值。
     fn commit_transform(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let Some((clip, current)) = self.bound_video_clip() else {
+        let Some((clip, current, at)) = self.bound_video_clip() else {
             return;
         };
         if let Some(t) = transform_from_text(&current, &self.inspector.transform.edited_texts(cx))
             && t != current
         {
-            self.apply(window, cx, |p| set_transform(p, clip, t));
+            self.apply(window, cx, |p| apply_transform_at(p, clip, at, t));
         }
         // 夹过范围或被拒绝时，显示实际生效的值
-        if let Some((_, now)) = self.bound_video_clip() {
+        if let Some((_, now, _)) = self.bound_video_clip() {
             self.fill_transform(&now, window, cx);
         }
     }
 
     /// 换绑前把输入框里还没提交的画面属性写回原片段，返回是否改了。
     pub(crate) fn commit_pending_transform(&mut self, cx: &Context<'_, Self>) -> bool {
-        let Some((clip, current)) = self.bound_video_clip() else {
+        let Some((clip, current, at)) = self.bound_video_clip() else {
             return false;
         };
         match transform_from_text(&current, &self.inspector.transform.edited_texts(cx)) {
-            Some(t) if t != current => self.doc.edit(|p| set_transform(p, clip, t)).is_ok(),
+            Some(t) if t != current => self
+                .doc
+                .edit(|p| apply_transform_at(p, clip, at, t))
+                .is_ok(),
             _ => false,
         }
     }
 
     fn on_opacity(&mut self, e: &SliderEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let Some((clip, current)) = self.bound_video_clip() else {
+        let Some((clip, current, at)) = self.bound_video_clip() else {
             return;
         };
         match e {
@@ -260,7 +293,7 @@ impl Workspace {
                     opacity: (v.start() / 100.0).clamp(0.0, 1.0),
                     ..current
                 };
-                let _ = self.doc.edit(|p| set_transform(p, clip, t));
+                let _ = self.doc.edit(|p| apply_transform_at(p, clip, at, t));
                 self.after_change(window, cx);
             }
             SliderEvent::Release(_) => {
@@ -273,10 +306,10 @@ impl Workspace {
     }
 
     fn reset_transform(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let Some((clip, _)) = self.bound_video_clip() else {
+        let Some((clip, ..)) = self.bound_video_clip() else {
             return;
         };
-        self.apply(window, cx, |p| set_transform(p, clip, Transform::default()));
+        self.apply(window, cx, |p| reset_transform(p, clip));
         self.fill_transform(&Transform::default(), window, cx);
     }
 
@@ -285,7 +318,7 @@ impl Workspace {
         &self,
         cx: &Context<'_, Self>,
     ) -> Option<impl IntoElement> {
-        let (_, t) = self.bound_video_clip()?;
+        let (_, t, _) = self.bound_video_clip()?;
         let muted = cx.theme().muted_foreground;
         let f = &self.inspector.transform;
         let field = |id: &'static str, label: &'static str, state: &Entity<InputState>| {
@@ -311,12 +344,13 @@ impl Workspace {
                                 .ghost()
                                 .compact()
                                 .label("重置")
-                                .tooltip("恢复铺满画面、居中、不旋转、不裁剪")
+                                .tooltip("恢复铺满画面、居中、不旋转、不裁剪，并清掉关键帧")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.reset_transform(window, cx);
                                 })),
                         ),
                 )
+                .children(self.render_keyframe_bar(cx))
                 .child(
                     h_flex()
                         .gap_2()

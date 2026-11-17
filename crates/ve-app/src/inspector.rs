@@ -227,7 +227,9 @@ impl Workspace {
                 self.inspector.fade_out.update(cx, |s, cx| {
                     s.set_value(secs_text(clip.fade_out), window, cx);
                 });
-                self.fill_transform(&clip.transform, window, cx);
+                if let Some((_, t, _)) = self.bound_video_clip() {
+                    self.fill_transform(&t, window, cx);
+                }
             }
             ClipContent::Subtitle { text } => {
                 let text = text.clone();

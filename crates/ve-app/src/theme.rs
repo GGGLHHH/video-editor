@@ -66,6 +66,16 @@ pub mod palette {
     pub fn selection() -> Hsla {
         rgb(0xff_c94a).into()
     }
+    /// 时间轴上关键帧的小菱形。
+    #[must_use]
+    pub fn keyframe() -> Hsla {
+        rgb(0xff_ffff).into()
+    }
+    /// 关键帧小菱形的描边（压在花哨的缩略图上也看得清）。
+    #[must_use]
+    pub fn keyframe_edge() -> Hsla {
+        rgb(0x11_1318).into()
+    }
     /// 鼠标悬停的片段描边（比选中弱得多）。
     #[must_use]
     pub fn hover() -> Hsla {

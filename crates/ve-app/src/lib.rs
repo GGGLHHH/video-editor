@@ -16,6 +16,7 @@ pub mod export_ui;
 mod file_actions;
 pub mod import;
 pub mod inspector;
+mod inspector_keyframes;
 pub mod inspector_transform;
 pub mod media_bin;
 mod platform_cursor;
