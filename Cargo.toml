@@ -19,6 +19,7 @@ ve-core = { path = "crates/ve-core" }
 ve-media = { path = "crates/ve-media" }
 ve-engine = { path = "crates/ve-engine" }
 ve-export = { path = "crates/ve-export" }
+ve-render = { path = "crates/ve-render" }
 
 gpui-kit = "0.10.0"
 ffmpeg-next = "9.1.0"
@@ -33,6 +34,9 @@ env_logger = "0.11"
 pathdiff = "0.2"
 lru = "0.19"
 image = { version = "0.25", default-features = false }
+wgpu = "30.0.1"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "1"
 
 proptest = "1"
 tempfile = "3"

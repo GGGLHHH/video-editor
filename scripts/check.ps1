@@ -17,6 +17,7 @@ $CrateThresholds = @{
     've-media'  = 90
     've-engine' = 90
     've-export' = 90
+    've-render' = 90
 }
 $WorkspaceThreshold = 80
 
