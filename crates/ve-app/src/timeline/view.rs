@@ -1,5 +1,6 @@
 //! 时间轴视图：画布绘制（标尺、轨道、片段缩略图条 / 波形 / 字幕、播放头、吸附线）与鼠标交互。
 
+use super::geometry::SCROLLBAR_HEIGHT;
 use super::{Drag, Hit, TimelineGeometry};
 use crate::import::PEAKS_PER_SECOND;
 use crate::media_bin::AssetDrag;
@@ -43,6 +44,8 @@ pub struct TimelineUi {
     pub cursor: gpui_kit::CursorStyle,
     /// 鼠标最后的位置（时间轴本地坐标），松开后据此恢复悬停样式。
     pub pointer: (f32, f32),
+    /// 正在拖横向滚动条：（按下时的横坐标，按下时的横向滚动）。
+    pub thumb_drag: Option<(f32, f32)>,
 }
 
 /// 框选。
@@ -74,11 +77,79 @@ struct Snapshot {
 }
 
 impl Workspace {
-    /// 按当前轨道数和时间轴高度把纵向滚动夹回范围（删轨、撤销、改面板大小以后）。
+    /// 按当前轨道数、时长和时间轴大小把滚动夹回范围（删轨、撤销、缩放、改面板大小以后）。
     pub(crate) fn clamp_timeline_scroll(&mut self) {
         let tracks = self.doc.project.timeline.tracks.len();
-        let viewport = f32::from(self.timeline.bounds.size.height);
-        self.timeline.geometry.clamp_scroll_y(tracks, viewport);
+        let viewport = self.track_viewport();
+        let geo = &mut self.timeline.geometry;
+        geo.clamp_scroll_y(tracks, viewport);
+        geo.clamp_scroll_x(self.doc.project.timeline.duration());
+    }
+
+    /// 轨道行可用的高度（底边留给横向滚动条）。
+    fn track_viewport(&self) -> f32 {
+        f32::from(self.timeline.bounds.size.height) - SCROLLBAR_HEIGHT
+    }
+
+    /// 在横向滚动条上按下：按在滑块上就开始拖；按在空槽里先把滑块中心跳到那里，再接着拖。
+    fn scrollbar_mouse_down(
+        &mut self,
+        e: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        cx.stop_propagation();
+        let (x, _) = self.local(e.position);
+        let duration = self.doc.project.timeline.duration();
+        let width = f32::from(self.timeline.bounds.size.width);
+        let geo = &mut self.timeline.geometry;
+        if let Some(thumb) = geo.h_scrollbar(duration, width)
+            && !(thumb.x..thumb.x + thumb.width).contains(&x)
+        {
+            let per = geo.scroll_per_thumb_px(duration, width);
+            geo.scroll_by((x - (thumb.x + thumb.width / 2.0)) * per);
+            geo.clamp_scroll_x(duration);
+        }
+        self.timeline.thumb_drag = Some((x, self.timeline.geometry.scroll_x));
+        cx.notify();
+    }
+
+    /// 横向滚动条（能滚时才有）。
+    fn scrollbar(&self, cx: &Context<'_, Self>) -> Option<impl IntoElement> {
+        let geo = self.timeline.geometry;
+        let thumb = geo.h_scrollbar(
+            self.doc.project.timeline.duration(),
+            f32::from(self.timeline.bounds.size.width),
+        )?;
+        let active = self.timeline.thumb_drag.is_some();
+        Some(
+            div()
+                .id("timeline-hscroll")
+                .test_support()
+                .absolute()
+                .bottom_0()
+                .left(px(geo.header_width))
+                .right_0()
+                .h(px(SCROLLBAR_HEIGHT))
+                .cursor(gpui_kit::CursorStyle::Arrow)
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::scrollbar_mouse_down))
+                .child(
+                    div()
+                        .id("timeline-hscroll-thumb")
+                        .test_support()
+                        .absolute()
+                        .top(px(2.0))
+                        .bottom(px(2.0))
+                        .left(px(thumb.x - geo.header_width))
+                        .w(px(thumb.width))
+                        .rounded(px(3.0))
+                        .bg(if active {
+                            palette::text()
+                        } else {
+                            palette::tick()
+                        }),
+                ),
+        )
     }
 
     fn local(&self, p: Point<Pixels>) -> (f32, f32) {
@@ -185,6 +256,19 @@ impl Workspace {
         let geo = self.timeline.geometry;
         self.timeline.pointer = (x, y);
         let pressed = e.pressed_button == Some(MouseButton::Left);
+        if let Some((x0, scroll0)) = self.timeline.thumb_drag {
+            if pressed {
+                let duration = self.doc.project.timeline.duration();
+                let width = f32::from(self.timeline.bounds.size.width);
+                let geo = &mut self.timeline.geometry;
+                geo.scroll_x = scroll0 + (x - x0) * geo.scroll_per_thumb_px(duration, width);
+                geo.clamp_scroll_x(duration);
+            } else {
+                self.timeline.thumb_drag = None;
+            }
+            cx.notify();
+            return;
+        }
         if self.timeline.marquee.is_some() || self.timeline.drag.is_some() {
             if !pressed {
                 // 在窗口外松开时收不到 mouse up：移动时发现左键已松开，就当作松开处理
@@ -235,6 +319,7 @@ impl Workspace {
     }
 
     fn timeline_mouse_up(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.timeline.thumb_drag = None;
         self.timeline.marquee = None;
         let insert = self.timeline.insert_line.take();
         if let Some(drag) = self.timeline.drag.take()
@@ -298,13 +383,10 @@ impl Workspace {
     ) {
         let d = e.delta.pixel_delta(window.line_height());
         let m = e.modifiers;
-        match super::interaction::wheel_action(
-            f32::from(d.x),
-            f32::from(d.y),
-            m.control,
-            m.alt,
-            m.shift,
-        ) {
+        let tracks = self.doc.project.timeline.tracks.len();
+        let viewport = self.track_viewport();
+        let overflow = self.timeline.geometry.content_height(tracks) > viewport;
+        match super::interaction::wheel_action(f32::from(d.x), f32::from(d.y), m, overflow) {
             super::interaction::Wheel::Zoom(zoom_in) => {
                 let (x, _) = self.local(e.position);
                 self.timeline
@@ -312,14 +394,13 @@ impl Workspace {
                     .zoom_around(x, if zoom_in { 1.15 } else { 1.0 / 1.15 });
             }
             super::interaction::Wheel::Scroll { dx, dy } => {
-                let tracks = self.doc.project.timeline.tracks.len();
-                let viewport = f32::from(self.timeline.bounds.size.height);
                 self.timeline.geometry.scroll_by(dx);
                 self.timeline
                     .geometry
                     .scroll_tracks_by(dy, tracks, viewport);
             }
         }
+        self.clamp_timeline_scroll();
         cx.notify();
     }
 
@@ -423,6 +504,7 @@ impl Workspace {
                     .bottom_0(),
             )
             .children(self.track_buttons(cx))
+            .children(self.scrollbar(cx))
     }
 }
 

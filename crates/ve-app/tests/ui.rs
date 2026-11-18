@@ -2473,3 +2473,119 @@ fn speed_tab_changes_clip_length(cx: &mut TestAppContext) {
     click(cx, &ui, "speed-pitch");
     assert!(first_video_clip(cx, &ui).keep_pitch);
 }
+
+#[gpui_kit::test]
+fn wheel_and_scrollbar_scroll_the_timeline_sideways(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    frame(cx, &ui);
+    // 空时间轴：不能横着滚，也没有滚动条
+    cx.update_window(ui.win, |_, window, _| {
+        assert!(window.try_find("timeline-hscroll").is_none());
+    })
+    .unwrap();
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    frame(cx, &ui);
+    // 标尺上同一个位置点一下，看对应的时间，就知道滚了多少
+    let ruler_time = |test: &mut TestAppContext| {
+        test.update_window(ui.win, |_, window, app| {
+            window.click_at("timeline", point(px(400.0), px(10.0)), app);
+        })
+        .unwrap();
+        test.run_until_parked();
+        ui.view.read_with(test, |w, _| w.engine().position())
+    };
+    for _ in 0..20 {
+        press(cx, &ui, "ctrl-=");
+    }
+    // 放大会以视图中间为准，先往左滚到头
+    cx.update_window(ui.win, |_, window, cx| {
+        window.scroll(
+            "timeline",
+            ScrollDelta::Pixels(point(px(0.), px(100_000.))),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    frame(cx, &ui);
+    let before = ruler_time(cx);
+    // 只有 3 条轨、上下没得滚：普通滚轮往下滚就往右滚
+    cx.update_window(ui.win, |_, window, cx| {
+        window.scroll(
+            "timeline",
+            ScrollDelta::Pixels(point(px(0.), px(-600.))),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    frame(cx, &ui);
+    let wheeled = ruler_time(cx);
+    assert!(wheeled > before, "{before:?} → {wheeled:?}");
+    // 拖滚动条的滑块往右
+    let thumb = cx
+        .update_window(ui.win, |_, window, _| {
+            window.find("timeline-hscroll-thumb").bounds()
+        })
+        .unwrap();
+    let from = point(
+        thumb.origin.x + thumb.size.width / 2.0,
+        thumb.origin.y + thumb.size.height / 2.0,
+    );
+    cx.update_window(ui.win, |_, window, cx| {
+        window.drag(from, from + point(px(200.0), px(0.0)), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    frame(cx, &ui);
+    let dragged = ruler_time(cx);
+    assert!(dragged > wheeled, "{wheeled:?} → {dragged:?}");
+    // 一直往右滚，最多滚到结尾贴着轨道头：再往回滚一点，轨道头旁边就是结尾前的内容
+    for delta in [-100_000.0, 200.0] {
+        cx.update_window(ui.win, |_, window, cx| {
+            window.scroll(
+                "timeline",
+                ScrollDelta::Pixels(point(px(0.), px(delta))),
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+    frame(cx, &ui);
+    cx.update_window(ui.win, |_, window, cx| {
+        window.click_at("timeline", point(px(73.0), px(10.0)), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let near_end = ui.view.read_with(cx, |w, _| w.engine().position());
+    assert!(
+        near_end < Time::from_millis(1990) && near_end > Time::from_secs(1),
+        "滚过头了：{near_end:?}"
+    );
+}
+
+#[gpui_kit::test]
+fn zoom_buttons_keep_the_playhead_in_place(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    // 20 秒的内容（放大后能左右滚，播放头才能留在原处）
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30); 10], true);
+    // 播放头放到 10 秒（50 像素 / 秒：标尺 72 + 500 处）
+    let at = point(px(72.0 + 500.0), px(10.0));
+    cx.update_window(ui.win, |_, window, cx| window.click_at("timeline", at, cx))
+        .unwrap();
+    cx.run_until_parked();
+    for _ in 0..6 {
+        press(cx, &ui, "ctrl-=");
+    }
+    frame(cx, &ui);
+    // 剪映：以播放头为中心放大，播放头还在原来的位置
+    cx.update_window(ui.win, |_, window, cx| window.click_at("timeline", at, cx))
+        .unwrap();
+    cx.run_until_parked();
+    let t = ui.view.read_with(cx, |w, _| w.engine().position());
+    assert!(
+        (t - Time::from_secs(10)).0.abs() <= Time::from_millis(40).0,
+        "{t:?}"
+    );
+}

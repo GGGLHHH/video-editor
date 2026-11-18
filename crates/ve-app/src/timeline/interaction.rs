@@ -305,11 +305,12 @@ pub enum Wheel {
 
 /// 剪映的滚轮习惯：滚轮上下滚轨道，Alt / Shift + 滚轮左右滚，Ctrl + 滚轮缩放；
 /// 触控板的横向滑动始终左右滚。`dx` / `dy` 是滚轮事件的像素增量（往上滚为正）。
+/// 轨道都放得下（`tracks_overflow` 为假，没得上下滚）时，滚轮也左右滚，免得滚了没反应。
 #[must_use]
-pub fn wheel_action(dx: f32, dy: f32, ctrl: bool, alt: bool, shift: bool) -> Wheel {
-    if ctrl {
+pub fn wheel_action(dx: f32, dy: f32, mods: gpui_kit::Modifiers, tracks_overflow: bool) -> Wheel {
+    if mods.control {
         Wheel::Zoom(dy > 0.0)
-    } else if alt || shift {
+    } else if mods.alt || mods.shift || !tracks_overflow {
         Wheel::Scroll {
             dx: -(dx + dy),
             dy: 0.0,
@@ -526,31 +527,47 @@ mod tests {
         assert_eq!(Drag::Scrub.clip(), None);
     }
 
+    /// 滚轮时按着的键。
+    const fn m(control: bool, alt: bool, shift: bool) -> gpui_kit::Modifiers {
+        gpui_kit::Modifiers {
+            control,
+            alt,
+            shift,
+            platform: false,
+            function: false,
+        }
+    }
+
     #[test]
     fn wheel_follows_jianying_habits() {
-        // 往下滚（dy 为负）：轨道往下滚
+        // 往下滚（dy 为负）：轨道放不下时轨道往下滚
         assert_eq!(
-            wheel_action(0.0, -120.0, false, false, false),
+            wheel_action(0.0, -120.0, m(false, false, false), true),
             Wheel::Scroll { dx: 0.0, dy: 120.0 }
+        );
+        // 轨道都放得下（没得上下滚）：滚轮改成左右滚，免得滚了没反应
+        assert_eq!(
+            wheel_action(0.0, -120.0, m(false, false, false), false),
+            Wheel::Scroll { dx: 120.0, dy: 0.0 }
         );
         // Alt / Shift：左右滚
         for (alt, shift) in [(true, false), (false, true)] {
             assert_eq!(
-                wheel_action(0.0, -120.0, false, alt, shift),
+                wheel_action(0.0, -120.0, m(false, alt, shift), true),
                 Wheel::Scroll { dx: 120.0, dy: 0.0 }
             );
         }
         // 触控板横向滑动
         assert_eq!(
-            wheel_action(-30.0, 0.0, false, false, false),
+            wheel_action(-30.0, 0.0, m(false, false, false), true),
             Wheel::Scroll { dx: 30.0, dy: 0.0 }
         );
         assert_eq!(
-            wheel_action(0.0, 120.0, true, false, false),
+            wheel_action(0.0, 120.0, m(true, false, false), true),
             Wheel::Zoom(true)
         );
         assert_eq!(
-            wheel_action(0.0, -120.0, true, true, false),
+            wheel_action(0.0, -120.0, m(true, true, false), true),
             Wheel::Zoom(false)
         );
     }

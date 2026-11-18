@@ -45,6 +45,20 @@ pub enum Hit {
 /// 轨道分界上下多少像素内算「缝」（拖进去新建轨道）。
 pub const INSERT_BAND: f32 = 6.0;
 
+/// 横向滚动条的高度（贴在时间轴底边）。
+pub const SCROLLBAR_HEIGHT: f32 = 10.0;
+/// 滚动条滑块最短多少像素（内容很长时也抓得住）。
+const MIN_THUMB: f32 = 24.0;
+
+/// 横向滚动条的滑块（时间轴本地坐标）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollThumb {
+    /// 左边。
+    pub x: f32,
+    /// 宽度。
+    pub width: f32,
+}
+
 /// 时间轴视图的几何参数。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TimelineGeometry {
@@ -221,9 +235,55 @@ impl TimelineGeometry {
         self.scroll_tracks_by(0.0, track_count, viewport_height);
     }
 
-    /// 横向滚动（不小于 0）。
+    /// 横向滚动（不小于 0；右边由 [`Self::clamp_scroll_x`] 夹）。
     pub fn scroll_by(&mut self, dx: f32) {
         self.scroll_x = (self.scroll_x + dx).max(0.0);
+    }
+
+    /// 片段区（去掉轨道头）的宽度。
+    fn lane_width(&self, view_width: f32) -> f32 {
+        (view_width - self.header_width).max(1.0)
+    }
+
+    /// 横向最多滚多远：时长为 `duration` 的内容最多滚到结尾贴着轨道头（后面留出一整屏，
+    /// 方便往后接片段；内容短时也能滚，放大时播放头才能留在原处）；空时间轴不能滚。
+    #[must_use]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "屏幕坐标范围远小于 f32 上限"
+    )]
+    pub fn max_scroll_x(&self, duration: Time) -> f32 {
+        ((duration.as_secs_f64() * f64::from(self.px_per_second)) as f32).max(0.0)
+    }
+
+    /// 把横向滚动夹回 `[0, max_scroll_x]`（缩放、删片段、改面板大小以后）。
+    pub fn clamp_scroll_x(&mut self, duration: Time) {
+        self.scroll_x = self.scroll_x.clamp(0.0, self.max_scroll_x(duration));
+    }
+
+    /// 横向滚动条的滑块；不能滚时没有。
+    #[must_use]
+    pub fn h_scrollbar(&self, duration: Time, view_width: f32) -> Option<ScrollThumb> {
+        let max = self.max_scroll_x(duration);
+        if max <= 0.0 {
+            return None;
+        }
+        let lane = self.lane_width(view_width);
+        // 滑块占槽的比例 = 看得见的 / 能看的总长
+        let width = (lane * (lane / (max + lane))).max(MIN_THUMB).min(lane);
+        Some(ScrollThumb {
+            x: self.header_width + (lane - width) * (self.scroll_x / max).clamp(0.0, 1.0),
+            width,
+        })
+    }
+
+    /// 滑块每拖 1 像素，内容滚多少像素。
+    #[must_use]
+    pub fn scroll_per_thumb_px(&self, duration: Time, view_width: f32) -> f32 {
+        let max = self.max_scroll_x(duration);
+        let lane = self.lane_width(view_width);
+        self.h_scrollbar(duration, view_width)
+            .map_or(0.0, |thumb| max / (lane - thumb.width).max(1.0))
     }
 
     /// 标尺大刻度间隔：保证刻度之间至少 80 像素。
@@ -383,6 +443,41 @@ mod tests {
         );
         assert_eq!(g.track_index_at(1.0, 3), None);
         assert!((g.content_height(3) - (g.ruler_height + 3.0 * g.track_height)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn horizontal_scroll_stops_when_the_end_reaches_the_left_edge() {
+        let mut g = geo(); // 100 像素 / 秒
+        // 20 秒内容 2000 像素：最多滚到结尾贴着轨道头
+        let secs = Time::from_secs;
+        assert!((g.max_scroll_x(secs(20)) - 2000.0).abs() < 1e-3);
+        g.scroll_by(9999.0);
+        g.clamp_scroll_x(secs(20));
+        assert!((g.scroll_x - 2000.0).abs() < 1e-3);
+        // 内容短也能滚（放大时播放头才能留在原处）；空时间轴不能滚
+        assert!((g.max_scroll_x(secs(3)) - 300.0).abs() < 1e-3);
+        g.clamp_scroll_x(secs(3));
+        assert!((g.scroll_x - 300.0).abs() < 1e-3);
+        assert!(g.max_scroll_x(Time::ZERO).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn scrollbar_thumb_tracks_the_visible_part() {
+        let mut g = geo();
+        let (secs, width) = (Time::from_secs, 1072.0);
+        // 能滚 2000：总长 3000，滑块占 1000 / 3000
+        let thumb = g.h_scrollbar(secs(20), width).unwrap();
+        assert!((thumb.x - 72.0).abs() < 1e-3 && (thumb.width - 1000.0 / 3.0).abs() < 1e-2);
+        g.scroll_x = 2000.0;
+        let thumb = g.h_scrollbar(secs(20), width).unwrap();
+        assert!(
+            (thumb.x + thumb.width - 1072.0).abs() < 1e-2,
+            "滚到头滑块贴右边：{thumb:?}"
+        );
+        // 滑块拖 1 像素 = 内容滚 2000 / (1000 − 333.3) = 3 像素
+        assert!((g.scroll_per_thumb_px(secs(20), width) - 3.0).abs() < 1e-2);
+        // 空时间轴不显示
+        assert!(g.h_scrollbar(Time::ZERO, width).is_none());
     }
 
     #[test]

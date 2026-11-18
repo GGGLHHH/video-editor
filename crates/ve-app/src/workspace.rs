@@ -521,9 +521,18 @@ impl Workspace {
         }
     }
 
+    /// 工具栏 / Ctrl+= 缩放：以播放头为中心（剪映）；播放头不在视图里时以视图中间为中心。
     fn zoom(&mut self, factor: f32, cx: &mut Context<'_, Self>) {
-        let center = f32::from(self.timeline.bounds.size.width) / 2.0;
-        self.timeline.geometry.zoom_around(center, factor);
+        let width = f32::from(self.timeline.bounds.size.width);
+        let geo = &self.timeline.geometry;
+        let playhead = geo.time_to_x(self.engine.position());
+        let anchor = if (geo.header_width..=width).contains(&playhead) {
+            playhead
+        } else {
+            width / 2.0
+        };
+        self.timeline.geometry.zoom_around(anchor, factor);
+        self.clamp_timeline_scroll();
         cx.notify();
     }
 
