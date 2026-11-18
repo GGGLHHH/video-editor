@@ -45,6 +45,11 @@ pub const fn media_clip(id: ClipId, asset: AssetId, start: Time, duration: Time)
         fade_out: Time::ZERO,
         transform: crate::Transform::DEFAULT,
         animation: crate::Animation::new(),
+        adjust: crate::ColorAdjust::NONE,
+        disabled: false,
+        transition_in: None,
+        speed: 1.0,
+        keep_pitch: true,
     }
 }
 
@@ -107,9 +112,14 @@ pub fn sample_project() -> (Project, SampleIds) {
         fade_out: Time::ZERO,
         transform: crate::Transform::DEFAULT,
         animation: crate::Animation::new(),
+        adjust: crate::ColorAdjust::NONE,
+        disabled: false,
+        transition_in: None,
+        speed: 1.0,
+        keep_pitch: true,
     };
-    // Project::new() 的轨道顺序固定为 视频、音频、字幕
-    let [video, audio, subs] = &mut p.timeline.tracks[..] else {
+    // Project::new() 的轨道顺序固定为 字幕、视频、音频
+    let [subs, video, audio] = &mut p.timeline.tracks[..] else {
         return (p, SampleIds::empty());
     };
     debug_assert_eq!(

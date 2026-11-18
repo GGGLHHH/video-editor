@@ -27,6 +27,10 @@ pub struct TimelineUi {
     pub drag: Option<Drag>,
     /// 吸附提示线。
     pub snap_line: Option<Time>,
+    /// 右键菜单弹出的位置（窗口坐标）。
+    pub context_menu: Option<(f32, f32)>,
+    /// 松手会在这条缝新建轨道（画白色横线）、片段放在这个起点。
+    pub insert_line: Option<(usize, Time)>,
     /// 进行中的框选。
     pub marquee: Option<Marquee>,
     /// 按在多选里的某个片段上：（片段，按下时的修改计数）；松开时没拖动就改成只选它。
@@ -62,6 +66,7 @@ struct Snapshot {
     selection: Vec<ClipId>,
     media: HashMap<AssetId, MediaThumbs>,
     snap: Option<Time>,
+    insert: Option<usize>,
     hover: Option<ClipId>,
     /// 框选矩形的两个角（时间轴本地坐标）。
     marquee: Option<((f32, f32), (f32, f32))>,
@@ -219,6 +224,7 @@ impl Workspace {
         let out = drag.update(&mut self.doc, &geo, x, y, self.playhead, snapping);
         self.timeline.drag = Some(drag);
         self.timeline.snap_line = out.snap;
+        self.timeline.insert_line = out.insert;
         if let Some(t) = out.seek {
             self.seek(t, cx);
         }
@@ -230,9 +236,16 @@ impl Workspace {
 
     fn timeline_mouse_up(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.timeline.marquee = None;
+        let insert = self.timeline.insert_line.take();
         if let Some(drag) = self.timeline.drag.take()
-            && drag.clip().is_some()
+            && let Some(clip) = drag.clip()
         {
+            // 松手在缝上：在那里新建一条同类轨道，把片段放进去（和拖动算同一步撤销）
+            if let (Drag::Move { .. }, Some((slot, start))) = (drag, insert) {
+                let _ = self
+                    .doc
+                    .edit(|p| ve_core::edit::move_clip_to_new_track(p, clip, slot, start));
+            }
             self.doc.end_gesture();
         }
         // 点在多选里的一个片段上、没拖动就松开：只选它
@@ -264,6 +277,7 @@ impl Workspace {
         self.restore_timeline_cursor();
         self.timeline.ghosts.clear();
         self.timeline.snap_line = None;
+        self.timeline.insert_line = None;
         if let Some(m) = self.timeline.marquee.take() {
             self.doc.set_selection(m.before);
             return (true, false);
@@ -283,23 +297,28 @@ impl Workspace {
         cx: &mut Context<'_, Self>,
     ) {
         let d = e.delta.pixel_delta(window.line_height());
-        let (dx, dy) = (f32::from(d.x), f32::from(d.y));
-        if e.modifiers.control {
-            let (x, _) = self.local(e.position);
-            self.timeline
-                .geometry
-                .zoom_around(x, if dy > 0.0 { 1.15 } else { 1.0 / 1.15 });
-        } else if e.modifiers.shift
-            || self.local(e.position).0 < self.timeline.geometry.header_width
-        {
-            // 轨道头上滚轮 / Shift+滚轮：上下滚轨道
-            let tracks = self.doc.project.timeline.tracks.len();
-            let viewport = f32::from(self.timeline.bounds.size.height);
-            self.timeline
-                .geometry
-                .scroll_tracks_by(-(dy + dx), tracks, viewport);
-        } else {
-            self.timeline.geometry.scroll_by(-(dx + dy));
+        let m = e.modifiers;
+        match super::interaction::wheel_action(
+            f32::from(d.x),
+            f32::from(d.y),
+            m.control,
+            m.alt,
+            m.shift,
+        ) {
+            super::interaction::Wheel::Zoom(zoom_in) => {
+                let (x, _) = self.local(e.position);
+                self.timeline
+                    .geometry
+                    .zoom_around(x, if zoom_in { 1.15 } else { 1.0 / 1.15 });
+            }
+            super::interaction::Wheel::Scroll { dx, dy } => {
+                let tracks = self.doc.project.timeline.tracks.len();
+                let viewport = f32::from(self.timeline.bounds.size.height);
+                self.timeline.geometry.scroll_by(dx);
+                self.timeline
+                    .geometry
+                    .scroll_tracks_by(dy, tracks, viewport);
+            }
         }
         cx.notify();
     }
@@ -338,6 +357,7 @@ impl Workspace {
             selection: self.doc.selection().to_vec(),
             media: self.media.clone(),
             snap: self.timeline.snap_line,
+            insert: self.timeline.insert_line.map(|(slot, _)| slot),
             hover: self.timeline.hover,
             marquee: self.timeline.marquee.as_ref().map(|m| {
                 let g = &self.timeline.geometry;
@@ -352,12 +372,15 @@ impl Workspace {
         div()
             .id("timeline")
             .test_support()
-            .size_full()
+            .flex_1()
+            .min_h_0()
+            .w_full()
             .relative()
             .overflow_hidden()
             .bg(palette::timeline_bg())
             .cursor(self.timeline.cursor)
             .on_mouse_down(MouseButton::Left, cx.listener(Self::timeline_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::timeline_right_down))
             .on_mouse_move(cx.listener(Self::timeline_mouse_move))
             .on_mouse_up(
                 MouseButton::Left,
@@ -371,12 +394,18 @@ impl Workspace {
             .on_drop(cx.listener(Self::timeline_drop))
             .child(
                 canvas(
-                    move |bounds, _, cx| {
-                        this.update(cx, |w, _| {
-                            w.timeline.bounds = bounds;
+                    move |bounds, window, cx| {
+                        let changed = this.update(cx, |w, _| {
+                            let changed =
+                                std::mem::replace(&mut w.timeline.bounds, bounds) != bounds;
                             // 面板拉高了也要重新夹一次
                             w.clamp_timeline_scroll();
+                            changed
                         });
+                        // 轨道头按钮等按旧尺寸摆的：尺寸变了再画一帧
+                        if changed {
+                            window.request_animation_frame();
+                        }
                     },
                     move |bounds, (), window, cx| paint(&snapshot, bounds, window, cx),
                 )
@@ -457,13 +486,23 @@ fn paint_text(
     );
 }
 
+/// 播放头颜色：平时白色，有东西吸到它上面时变成吸附青。
+fn playhead_color(snapped: bool) -> Hsla {
+    if snapped {
+        palette::snap()
+    } else {
+        palette::playhead()
+    }
+}
+
 fn ruler_label(t: Time, step: Time) -> String {
     let ms = t.as_millis().max(0);
     let (m, s) = (ms / 60_000, ms / 1000 % 60);
+    // 剪映式：分:秒都补两位（00:01），细刻度再带十分之一秒
     if step < Time::from_secs(1) {
-        format!("{m}:{s:02}.{}", ms / 100 % 10)
+        format!("{m:02}:{s:02}.{}", ms / 100 % 10)
     } else {
-        format!("{m}:{s:02}")
+        format!("{m:02}:{s:02}")
     }
 }
 
@@ -490,15 +529,9 @@ fn paint(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut 
             TrackKind::Audio => "音频",
             TrackKind::Subtitle => "字幕",
         };
-        paint_text(
-            window,
-            cx,
-            &format!("{label} {kind}"),
-            ox + 12.0,
-            y + geo.track_height / 2.0 - 8.0,
-            12.0,
-            palette::text(),
-        );
+        let ty = y + geo.track_height / 2.0 - 8.0;
+        paint_text(window, cx, label, ox + 10.0, ty, 12.0, palette::text());
+        paint_text(window, cx, kind, ox + 34.0, ty, 11.0, palette::tick());
     }
 
     // 片段（裁掉轨道头区域）
@@ -522,11 +555,18 @@ fn paint(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut 
             let x = ox + geo.time_to_x(t);
             window.paint_quad(fill(rect(x - width / 2.0, oy, width, h), color));
         };
-        if let Some(t) = snap.snap {
+        // 剪映：吸到播放头时播放头本身变青；吸到别处时在那里画一条青线
+        let on_playhead = snap.snap == Some(snap.playhead);
+        if let Some(t) = snap.snap.filter(|_| !on_playhead) {
             line(window, t, 1.0, palette::snap());
         }
-        line(window, snap.playhead, 2.0, palette::playhead());
+        line(window, snap.playhead, 2.0, playhead_color(on_playhead));
         paint_marquee(snap, ox, oy, window);
+        // 拖到缝上：一条贯穿的白色横线，标出松手后新轨道的位置（剪映）
+        if let Some(slot) = snap.insert {
+            let y = oy + geo.track_top(slot);
+            window.paint_quad(fill(rect(ox, y - 1.0, w, 2.0), palette::selection()));
+        }
     });
 
     // 标尺
@@ -559,19 +599,62 @@ fn paint(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut 
             }
         }
     }
+    paint_markers(snap, ox, oy, w, window);
+    paint_transitions(snap, ox, oy, window);
     let px_head = ox + geo.time_to_x(snap.playhead);
     if px_head >= ox + geo.header_width {
         window.paint_quad(fill(
             rect(px_head - 5.0, oy + geo.ruler_height - 10.0, 10.0, 10.0),
-            palette::playhead(),
+            playhead_color(snap.snap == Some(snap.playhead)),
         ));
+    }
+}
+
+/// 转场：切点上一个青色小方块（压在前后两段之间），宽度按转场时长。
+fn paint_transitions(snap: &Snapshot, ox: f32, oy: f32, window: &mut Window) {
+    let geo = snap.geo;
+    for (i, track) in snap.project.timeline.tracks.iter().enumerate() {
+        let y = oy + geo.track_top(i) + geo.track_height / 2.0 - 7.0;
+        // 滚到标尺下面去的轨道不画（这里画在标尺之后，否则会压在标尺上）
+        if y < oy + geo.ruler_height {
+            continue;
+        }
+        for pair in track.clips.windows(2) {
+            let (prev, next) = (&pair[0], &pair[1]);
+            let Some(tr) = next.transition_in.filter(|_| prev.end() == next.start) else {
+                continue;
+            };
+            let half = Time(tr.duration.0 / 2);
+            let x0 = (ox + geo.time_to_x(next.start - half)).max(ox + geo.header_width);
+            let x1 = ox + geo.time_to_x(next.start + half);
+            let r = rect(x0, y, (x1 - x0).max(10.0), 14.0);
+            window.paint_quad(fill(r, palette::transition()).corner_radii(px(3.0)));
+            window.paint_quad(
+                outline(r, palette::accent(), BorderStyle::Solid).corner_radii(px(3.0)),
+            );
+        }
+    }
+}
+
+/// 标记：标尺顶上的青色小旗（剪映）。
+fn paint_markers(snap: &Snapshot, ox: f32, oy: f32, w: f32, window: &mut Window) {
+    let geo = snap.geo;
+    for &m in &snap.project.timeline.markers {
+        let x = ox + geo.time_to_x(m);
+        if x >= ox + geo.header_width && x <= ox + w {
+            window.paint_quad(
+                fill(rect(x - 4.0, oy + 1.0, 8.0, 7.0), palette::accent()).corner_radii(px(2.0)),
+            );
+            window.paint_quad(fill(
+                rect(x - 0.5, oy + 1.0, 1.0, geo.ruler_height - 1.0),
+                palette::accent(),
+            ));
+        }
     }
 }
 
 /// 选中片段的描边粗细（像素）。
 const SELECTION_BORDER: f32 = 2.0;
-/// 选中片段标题栏的高度（像素）。
-const LABEL_BAR: f32 = 14.0;
 
 /// 片段底部画出关键帧位置（小菱形）。
 fn paint_keyframes(
@@ -668,22 +751,47 @@ fn paint_clip(
             }
             _ => {}
         }
+        // 剪映式标题：字幕显示全文；媒体片段显示「名字  精确到帧的时长」
         let label = clip.subtitle_text().map_or_else(
-            || asset.map(|a| a.name.clone()).unwrap_or_default(),
+            || {
+                let name = asset.map(|a| a.name.clone()).unwrap_or_default();
+                let rate = snap.project.settings.frame_rate;
+                let time = ve_core::format_timecode(clip.duration, rate);
+                // 变过速的片段标出倍数（剪映在片段上显示「2.0x」）
+                if (clip.speed - 1.0).abs() > 1e-4 {
+                    format!("{name}  {time}  {}x", clip.speed)
+                } else {
+                    format!("{name}  {time}")
+                }
+            },
             str::to_owned,
         );
-        // 选中的片段：整体蒙一层亮色、标题栏换成亮底深字，压在花哨的缩略图上也一眼能看出来
-        let label_color = if selected {
+        // 选中的片段：白色描边（剪映式）再蒙一层很淡的白，压在花哨的缩略图上也看得出来
+        if selected {
             window.paint_quad(fill(r, palette::selection_tint()));
-            window.paint_quad(fill(
-                rect(x0, y0, f32::from(r.size.width), LABEL_BAR),
-                palette::selection(),
-            ));
-            palette::selection_text()
-        } else {
-            palette::text()
-        };
-        paint_text(window, cx, &label, x0 + 5.0, y0 + 1.0, 11.0, label_color);
+        }
+        // 停用的片段：先压一层深色（标题画在上面，仍看得清），标题下面注明（剪映的「停用片段」）
+        if clip.disabled {
+            window.paint_quad(fill(r, palette::disabled_veil()));
+            paint_text(
+                window,
+                cx,
+                "已停用",
+                x0 + 5.0,
+                y0 + 16.0,
+                11.0,
+                palette::text(),
+            );
+        }
+        paint_text(
+            window,
+            cx,
+            &label,
+            x0 + 5.0,
+            y0 + 1.0,
+            11.0,
+            palette::text(),
+        );
         paint_keyframes(clip, ox, &geo, r, window);
     });
     if !selected && snap.hover == Some(clip.id) {
@@ -724,7 +832,7 @@ fn paint_thumbnails(
         #[expect(clippy::cast_precision_loss, reason = "格数很少")]
         let x = x0 + tw * k as f32;
         let t = geo.x_to_time(x + tw / 2.0 - ox).max(clip.start);
-        let source = source_in + (t - clip.start);
+        let source = source_in + (t - clip.start).scaled(f64::from(clip.speed));
         let ratio =
             (source.as_secs_f64() / asset_duration.as_secs_f64().max(1e-6)).clamp(0.0, 0.999);
         #[expect(
@@ -764,7 +872,7 @@ fn paint_waveform(
     for k in visible_cells(x0, cw, 2.0, left, right) {
         #[expect(clippy::cast_precision_loss, reason = "列数很少")]
         let x = x0 + 2.0 * k as f32;
-        let source = source_in + (geo.x_to_time(x - ox) - clip.start);
+        let source = source_in + (geo.x_to_time(x - ox) - clip.start).scaled(f64::from(clip.speed));
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -797,5 +905,25 @@ mod tests {
         // 部分可见：从片段开头算起
         assert_eq!(visible_cells(990.0, 100.0, 10.0, 0.0, 1000.0), 0..1);
         assert_eq!(visible_cells(0.0, 25.0, 10.0, 0.0, 1000.0), 0..3);
+    }
+
+    #[test]
+    fn ruler_labels_pad_minutes_like_jianying() {
+        assert_eq!(ruler_label(Time::from_secs(1), Time::from_secs(1)), "00:01");
+        assert_eq!(
+            ruler_label(Time::from_secs(75), Time::from_secs(5)),
+            "01:15"
+        );
+        assert_eq!(
+            ruler_label(Time::from_secs_f64(2.5), Time::from_secs_f64(0.5)),
+            "00:02.5"
+        );
+    }
+
+    #[test]
+    fn playhead_turns_snap_color_when_snapped() {
+        assert_eq!(playhead_color(true), palette::snap());
+        assert_eq!(playhead_color(false), palette::playhead());
+        assert_ne!(palette::snap(), palette::playhead());
     }
 }

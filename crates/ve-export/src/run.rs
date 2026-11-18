@@ -1,8 +1,6 @@
 //! 执行导出：写临时文件、启动 ffmpeg、逐帧渲染画面写进它的标准输入、取消、NVENC 失败退回 x264。
 
-use crate::{
-    Encoder, ExportError, ExportSettings, SubtitleStyle, build_job, has_subtitles, write_ass,
-};
+use crate::{Encoder, ExportError, ExportSettings, build_job, has_subtitles, write_ass};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -144,10 +142,7 @@ fn run_once(
     let job = build_job(project, settings, with_subs)?;
     let dir = tempfile::tempdir()?;
     if with_subs {
-        std::fs::write(
-            dir.path().join("subs.ass"),
-            write_ass(project, &SubtitleStyle::default()),
-        )?;
+        std::fs::write(dir.path().join("subs.ass"), write_ass(project))?;
     }
     std::fs::write(dir.path().join("filter.txt"), &job.filter_graph)?;
     if cancel.load(Ordering::Acquire) {
@@ -232,6 +227,7 @@ pub const fn default_settings(project: &Project, path: std::path::PathBuf) -> Ex
         frame_rate: project.settings.frame_rate,
         video_bitrate_kbps: 12_000,
         encoder: Encoder::Nvenc,
+        codec: crate::Codec::H264,
         render: ve_render::RenderConfig { software: false },
     }
 }
@@ -273,6 +269,7 @@ mod tests {
             frame_rate: FrameRate::new(30, 1),
             video_bitrate_kbps: 500,
             encoder,
+            codec: crate::Codec::H264,
             render: ve_render::RenderConfig { software: true },
         }
     }
@@ -300,6 +297,43 @@ mod tests {
         assert!(r.audio.is_some());
         assert_eq!(progress.last().copied(), Some(1.0));
         assert!(progress.windows(2).all(|w| w[0] <= w[1]), "{progress:?}");
+    }
+
+    #[test]
+    fn double_speed_export_is_half_as_long() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = settings(dir.path(), Encoder::X264);
+        let mut p = project();
+        // 视频 2 秒、音频 2 秒，都 2 倍速：成片 1 秒
+        let clips: Vec<_> = p
+            .timeline
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter().filter(|c| c.asset().is_some()).map(|c| c.id))
+            .collect();
+        for c in clips {
+            ve_core::edit::set_speed(&mut p, c, 2.0).unwrap();
+        }
+        export(&p, &s, |_| {}, &AtomicBool::new(false)).unwrap();
+        let r = ve_media::probe(&s.path).unwrap();
+        assert!(
+            (r.duration - Time::from_secs(1)).0.abs()
+                <= FrameRate::new(30, 1).frame_duration().0 * 2,
+            "{:?}",
+            r.duration
+        );
+    }
+
+    #[test]
+    fn hevc_export_plays_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = settings(dir.path(), Encoder::X264);
+        s.codec = crate::Codec::Hevc;
+        export(&project(), &s, |_| {}, &AtomicBool::new(false)).unwrap();
+        let r = ve_media::probe(&s.path).unwrap();
+        let v = r.video.unwrap();
+        assert_eq!((v.width, v.height), (64, 36));
+        assert!(r.audio.is_some());
     }
 
     #[test]

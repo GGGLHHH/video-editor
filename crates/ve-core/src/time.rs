@@ -18,6 +18,17 @@ pub const FLICKS_PER_SECOND: i64 = 705_600_000;
 pub struct Time(pub i64);
 
 impl Time {
+    /// 乘一个倍数（四舍五入到 flick）：变速时素材时间和时间轴时间互相换算用。
+    #[must_use]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        reason = "时长远小于 2^53 flick，倍数在 0.1–10 之间"
+    )]
+    pub fn scaled(self, factor: f64) -> Self {
+        Self((self.0 as f64 * factor).round() as i64)
+    }
+
     /// 零。
     pub const ZERO: Self = Self(0);
 

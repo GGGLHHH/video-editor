@@ -11,9 +11,9 @@ use thiserror::Error;
 
 const FORMAT: &str = "ve-project";
 /// 当前写出的版本。第 2 版加了片段的 `transform`，第 3 版加了 `transform.rotation`，
-/// 第 4 版加了片段的关键帧动画 `animation`。
+/// 第 4 版加了片段的关键帧动画 `animation`，第 5 版加了调色 `adjust`、停用 `disabled`、时间轴标记 `markers` 和字幕样式 `subtitle_style`。
 /// 升版本是为了让旧版程序拒绝读新文件，而不是悄悄丢掉它不认识的字段。
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 /// 能读的最旧版本（缺的字段取默认值）。
 const OLDEST_READABLE: u32 = 1;
 
@@ -75,6 +75,9 @@ struct FileV1 {
     ids: IdGen,
     assets: Vec<FileAsset>,
     timeline: Timeline,
+    /// 第 5 版加的；默认样式不写。
+    #[serde(default, skip_serializing_if = "crate::SubtitleStyle::is_default")]
+    subtitle_style: crate::SubtitleStyle,
 }
 
 fn io_err(path: &Path) -> impl FnOnce(io::Error) -> ProjectFileError + '_ {
@@ -113,6 +116,7 @@ pub fn save_project(project: &Project, path: &Path) -> Result<(), ProjectFileErr
             })
             .collect(),
         timeline: project.timeline.clone(),
+        subtitle_style: project.subtitle_style.clone(),
     };
     let json = serde_json::to_vec_pretty(&file)?;
     let tmp = path.with_extension("vep.tmp");
@@ -159,11 +163,18 @@ pub fn load_project(path: &Path) -> Result<LoadedProject, ProjectFileError> {
         }
         assets.insert(asset.id, asset);
     }
+    let mut timeline = file.timeline;
+    timeline.normalize_order();
     let project = Project {
         settings: file.settings,
         assets,
-        timeline: file.timeline,
+        timeline,
         ids: file.ids,
+        subtitle_style: if file.subtitle_style.is_valid() {
+            file.subtitle_style
+        } else {
+            crate::SubtitleStyle::default()
+        },
     };
     project
         .timeline
@@ -210,10 +221,49 @@ mod tests {
     }
 
     #[test]
+    fn subtitle_style_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = project_in(dir.path());
+        project.subtitle_style.color = 0xFF_D700;
+        project.subtitle_style.bold = true;
+        let file = dir.path().join("style.vep");
+        save_project(&project, &file).unwrap();
+        let loaded = load_project(&file).unwrap().project;
+        assert_eq!(loaded.subtitle_style, project.subtitle_style);
+        // 默认样式不写进文件
+        let plain = project_in(dir.path());
+        save_project(&plain, &file).unwrap();
+        let json = fs::read_to_string(&file).unwrap();
+        assert!(!json.contains("subtitle_style"));
+    }
+
+    #[test]
+    fn old_files_load_with_text_track_on_top() {
+        // 第 4 版以前的文件里字幕轨在最后；读进来统一放到最上面（剪映的排法）
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = project_in(dir.path());
+        project.timeline.tracks.rotate_left(1);
+        assert_eq!(
+            project.timeline.tracks.last().map(|t| t.kind),
+            Some(crate::TrackKind::Subtitle)
+        );
+        let file = dir.path().join("old.vep");
+        save_project(&project, &file).unwrap();
+        let loaded = load_project(&file).unwrap().project;
+        assert_eq!(loaded.timeline.tracks[0].kind, crate::TrackKind::Subtitle);
+        assert_eq!(loaded.timeline.tracks.len(), project.timeline.tracks.len());
+    }
+
+    #[test]
     fn loads_v1_file_with_default_transform() {
         let dir = tempfile::tempdir().unwrap();
         let mut project = project_in(dir.path());
-        let first = project.timeline.tracks[0].clips[0].id;
+        let first = project
+            .timeline
+            .track_of_kind(crate::TrackKind::Video)
+            .unwrap()
+            .clips[0]
+            .id;
         crate::edit::set_transform(
             &mut project,
             first,
@@ -227,7 +277,7 @@ mod tests {
         save_project(&project, &file).unwrap();
         let mut json: serde_json::Value =
             serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
-        assert_eq!(json["version"], 4);
+        assert_eq!(json["version"], 5);
         // 第 2 版文件：transform 里没有 rotation，读进来是 0
         let mut v2 = json.clone();
         v2["version"] = 2.into();
@@ -259,7 +309,7 @@ mod tests {
         }
         save_project(&loaded, &file).unwrap();
         let again: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
-        assert_eq!(again["version"], 4);
+        assert_eq!(again["version"], 5);
     }
 
     #[test]

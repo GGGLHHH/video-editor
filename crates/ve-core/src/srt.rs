@@ -169,6 +169,7 @@ pub fn export_srt(project: &Project) -> Vec<Cue> {
         .iter()
         .filter(|t| t.kind == TrackKind::Subtitle)
         .flat_map(|t| t.clips.iter())
+        .filter(|c| c.enabled())
         .filter_map(|c| {
             c.subtitle_text().map(|text| Cue {
                 start: c.start,

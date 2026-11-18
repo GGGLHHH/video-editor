@@ -42,6 +42,9 @@ pub enum Hit {
     Empty,
 }
 
+/// 轨道分界上下多少像素内算「缝」（拖进去新建轨道）。
+pub const INSERT_BAND: f32 = 6.0;
+
 /// 时间轴视图的几何参数。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TimelineGeometry {
@@ -106,6 +109,28 @@ impl TimelineGeometry {
         }
         let i = ((y - self.ruler_height + self.scroll_y) / self.track_height).floor() as usize;
         (i < track_count).then_some(i)
+    }
+
+    /// 纵坐标落在哪条「缝」上：第 `i` 条缝是第 `i - 1` 和第 `i` 条轨道的分界（0 是第一条轨道的上沿，
+    /// `track_count` 是最后一条的下沿）。分界上下 [`INSERT_BAND`] 像素内、或最后一条轨道下面的空白，
+    /// 都算在缝上；拖片段到缝上松手会在那里新建轨道。
+    #[must_use]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "已排除负数，轨道数很少"
+    )]
+    pub fn insert_slot(&self, y: f32, track_count: usize) -> Option<usize> {
+        if y < self.ruler_height {
+            return None;
+        }
+        let rows = (y - self.ruler_height + self.scroll_y) / self.track_height;
+        if rows >= track_count as f32 {
+            return Some(track_count);
+        }
+        let nearest = rows.round();
+        ((rows - nearest).abs() * self.track_height <= INSERT_BAND).then_some(nearest as usize)
     }
 
     /// 内容总高（标尺 + 轨道）。
@@ -247,15 +272,15 @@ mod tests {
         let mut g = geo();
         let x = |s: f32| g.header_width + s * 100.0;
         let row = |g: &TimelineGeometry, i: f32| g.ruler_height + g.track_height * i;
-        // 视频、音频两行中间，6–7 秒：v2（5–8）、a1（0–8）
-        let mut got = g.clips_in_rect(&p.timeline, (x(6.0), row(&g, 0.5)), (x(7.0), row(&g, 1.5)));
+        // 行：字幕 0、视频 1、音频 2。视频、音频两行中间，6–7 秒：v2（5–8）、a1（0–8）
+        let mut got = g.clips_in_rect(&p.timeline, (x(6.0), row(&g, 1.5)), (x(7.0), row(&g, 2.5)));
         got.sort_unstable();
         assert_eq!(got, vec![ids.v2, ids.a1]);
         // 反着拖一样；只扫到字幕行 3.5–4 秒：s1 是 1–3，扫不到
-        let none = g.clips_in_rect(&p.timeline, (x(4.0), row(&g, 2.9)), (x(3.5), row(&g, 2.1)));
+        let none = g.clips_in_rect(&p.timeline, (x(4.0), row(&g, 0.9)), (x(3.5), row(&g, 0.1)));
         assert_eq!(none, Vec::<ClipId>::new());
-        // 纵向滚动后按屏幕位置算：滚掉一行，屏幕第 0 行是音频轨
-        g.scroll_y = g.track_height;
+        // 纵向滚动后按屏幕位置算：滚掉两行，屏幕第 0 行是音频轨
+        g.scroll_y = g.track_height * 2.0;
         assert_eq!(
             g.clips_in_rect(&p.timeline, (x(1.0), row(&g, 0.2)), (x(2.0), row(&g, 0.8))),
             vec![ids.a1]
@@ -266,7 +291,7 @@ mod tests {
     fn hit_test_finds_clip_body_and_edges() {
         let (p, ids) = sample_project();
         let g = geo();
-        let y_video = g.ruler_height + g.track_height * 0.5;
+        let y_video = g.ruler_height + g.track_height * 1.5;
         let x = |s: f32| g.header_width + s * 100.0;
         assert_eq!(
             g.hit_test(x(2.0), y_video, &p.timeline),
@@ -298,7 +323,7 @@ mod tests {
             g.hit_test(5.0, y_video, &p.timeline),
             Hit::Header(ids.video_track)
         );
-        let y_subs = g.ruler_height + g.track_height * 2.5;
+        let y_subs = g.ruler_height + g.track_height * 0.5;
         assert_eq!(
             g.hit_test(x(2.0), y_subs, &p.timeline),
             Hit::Clip {
@@ -317,7 +342,7 @@ mod tests {
         let (p, ids) = sample_project();
         let mut g = geo();
         g.px_per_second = 4.0; // 2 秒字幕只有 8px 宽
-        let y = g.ruler_height + g.track_height * 2.5;
+        let y = g.ruler_height + g.track_height * 0.5;
         let mid = g.time_to_x(Time::from_secs(2));
         assert_eq!(
             g.hit_test(mid, y, &p.timeline),
@@ -392,5 +417,20 @@ mod tests {
         // 放得下时不滚
         g.scroll_tracks_by(50.0, 2, 500.0);
         assert_eq!(g.scroll_y, 0.0);
+    }
+
+    #[test]
+    fn insert_slots_are_thin_bands_on_row_boundaries() {
+        let g = TimelineGeometry::default();
+        let boundary = |i: f32| g.ruler_height + g.track_height * i;
+        // 第 1 条缝：上下各几像素都算
+        assert_eq!(g.insert_slot(boundary(1.0) - 3.0, 3), Some(1));
+        assert_eq!(g.insert_slot(boundary(1.0) + 3.0, 3), Some(1));
+        // 行中间不是缝
+        assert_eq!(g.insert_slot(boundary(1.5), 3), None);
+        // 最下面一条轨下方的空白：插在最后
+        assert_eq!(g.insert_slot(boundary(3.0) + 40.0, 3), Some(3));
+        // 标尺上不算
+        assert_eq!(g.insert_slot(g.ruler_height - 1.0, 3), None);
     }
 }

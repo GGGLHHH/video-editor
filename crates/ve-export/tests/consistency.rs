@@ -66,6 +66,16 @@ fn three_layers(width: u32, height: u32) -> Project {
         let track = add_track(&mut p, TrackKind::Video).unwrap();
         let clip = insert_asset_at(&mut p, asset, track, Time::ZERO).unwrap();
         set_transform(&mut p, clip, t).unwrap();
+        if asset == bars {
+            // 调过色的图层：导出和预览也得一致
+            let adjust = ve_core::ColorAdjust {
+                saturation: -0.6,
+                temperature: 0.4,
+                contrast: 0.2,
+                ..ve_core::ColorAdjust::NONE
+            };
+            ve_core::edit::set_adjust(&mut p, clip, adjust).unwrap();
+        }
     }
     p
 }
@@ -100,6 +110,7 @@ fn exported_frame(p: &Project, width: u32, height: u32, t: Time) -> VideoFrame {
         frame_rate: RATE,
         video_bitrate_kbps: 20_000,
         encoder: Encoder::X264,
+        codec: ve_export::Codec::H264,
         render: RenderConfig { software: true },
     };
     export(p, &settings, |_| {}, &AtomicBool::new(false)).unwrap();
@@ -192,7 +203,16 @@ fn export_size_differs_from_project() {
 fn export_matches_preview_mid_animation() {
     // 红色画中画：片段内 0 秒在 (0.3, 0.3)、缩放 0.33，2 秒移到 (0.1, 0.3)、缩放 0.2
     let mut p = three_layers(640, 360);
-    let red = p.timeline.tracks[1].clips[0].id;
+    // 红色画中画是第二个导入的素材（静态图）
+    let red_asset = *p.assets.keys().nth(1).unwrap();
+    let red = p
+        .timeline
+        .tracks
+        .iter()
+        .flat_map(|t| t.clips.iter())
+        .find(|c| c.asset() == Some(red_asset))
+        .unwrap()
+        .id;
     add_keyframe(&mut p, red, Time::ZERO).unwrap();
     let later = Transform {
         x: 0.1,
@@ -214,4 +234,33 @@ fn export_matches_preview_mid_animation() {
         moving.0 + 10 < start.0,
         "画中画应往左移：{start:?} → {moving:?}"
     );
+}
+
+#[test]
+fn export_matches_preview_mid_transition() {
+    // 两段紧挨着的片段（灰帧号视频 2 秒 + 彩条 2 秒），后一段挂 1 秒推近（缩放 + 渐显）
+    let mut p = Project::new();
+    p.settings.width = 640;
+    p.settings.height = 360;
+    p.settings.frame_rate = RATE;
+    let gray = add(&mut p, Fixture::FrameIndexed30);
+    let bars = add(&mut p, Fixture::VideoWithAudio);
+    append_asset(&mut p, gray).unwrap();
+    let second = append_asset(&mut p, bars).unwrap();
+    ve_core::edit::set_transition(
+        &mut p,
+        second,
+        Some(ve_core::Transition {
+            kind: ve_core::TransitionKind::ZoomIn,
+            duration: Time::from_secs(1),
+        }),
+    )
+    .unwrap();
+    // 切点后 0.2 秒：两段都在画面里
+    let t = RATE.time_of_frame(66);
+    assert_eq!(ve_core::compose::resolve_layers(&p, t).len(), 2);
+    let preview = preview_frame(&p, t);
+    let exported = exported_frame(&p, 640, 360, t);
+    let score = psnr(&preview, &exported);
+    assert!(score >= 35.0, "PSNR {score:.1} dB");
 }

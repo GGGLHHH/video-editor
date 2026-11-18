@@ -171,13 +171,13 @@ mod tests {
         let mut p = Project::new();
         add_track(&mut p, TrackKind::Video).unwrap();
         add_track(&mut p, TrackKind::Audio).unwrap();
-        // [V新, V, A, A新, S]
-        assert_eq!(track_names(&p.timeline), ["V2", "V1", "A1", "A2", "S1"]);
-        assert!(deletable(&p.timeline, 0));
-        assert!(deletable(&p.timeline, 3));
-        assert!(!deletable(&p.timeline, 4), "字幕轨不能删");
+        // [S, V新, V, A, A新]
+        assert_eq!(track_names(&p.timeline), ["S1", "V2", "V1", "A1", "A2"]);
+        assert!(deletable(&p.timeline, 1));
+        assert!(deletable(&p.timeline, 4));
+        assert!(!deletable(&p.timeline, 0), "字幕轨不能删");
         assert!(!deletable(&p.timeline, 9));
         let single = Project::new();
-        assert!(!deletable(&single.timeline, 0), "最后一条视频轨不能删");
+        assert!(!deletable(&single.timeline, 1), "最后一条视频轨不能删");
     }
 }

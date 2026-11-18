@@ -1,5 +1,6 @@
 //! 属性面板的「画面」区：视频轨片段的位置、缩放、旋转、裁剪、不透明度。
 
+use crate::preview_handles::{Align, align};
 use crate::workspace::Workspace;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::ActiveTheme as _;
@@ -9,10 +10,10 @@ use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, Styled as _, Subscription, Window, div,
+    SharedString, Styled as _, Subscription, Window, div, px,
 };
 use ve_core::edit::{apply_transform_at, reset_transform};
-use ve_core::{ClipId, Crop, Time, TrackKind, Transform, wrap_degrees};
+use ve_core::{ClipId, Crop, KeyGroup, Time, TrackKind, Transform, wrap_degrees};
 
 /// 位置偏移的输入范围（±500%）。
 const OFFSET_RANGE: (f32, f32) = (-5.0, 5.0);
@@ -314,6 +315,81 @@ impl Workspace {
     }
 
     /// 「画面」区（只在选中视频轨上的片段时有）。
+    /// 对齐：把选中的画面贴到画布的边或中线（有关键帧时在播放头处打帧）。
+    fn align_layer(&mut self, how: Align, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some((clip, t, offset)) = self.bound_video_clip() else {
+            return;
+        };
+        let project = &self.doc.project;
+        let Some(info) = project
+            .timeline
+            .find_clip(clip)
+            .and_then(|(_, c)| c.asset())
+            .and_then(|a| project.assets.get(&a))
+            .and_then(|a| a.video)
+        else {
+            return;
+        };
+        let s = project.settings;
+        let geom = ve_core::layer_geometry((s.width, s.height), (info.width, info.height), &t);
+        #[expect(clippy::cast_precision_loss, reason = "画布尺寸远小于 2^23")]
+        let canvas = (s.width as f32, s.height as f32);
+        let next = align(&t, &geom, canvas, how);
+        self.apply(window, cx, |p| apply_transform_at(p, clip, offset, next));
+        self.fill_transform(&next, window, cx);
+    }
+
+    /// 六个对齐按钮一行（剪映「位置大小」组里的那一排）。
+    fn render_align_row(cx: &Context<'_, Self>) -> impl IntoElement {
+        use gpui_kit::assets::IconName as Lucide;
+        let buttons = Align::ALL.map(|how| {
+            let (id, icon, tip) = match how {
+                Align::Left => ("tf-align-left", Lucide::AlignStartVertical, "左对齐"),
+                Align::CenterX => ("tf-align-cx", Lucide::AlignCenterVertical, "水平居中"),
+                Align::Right => ("tf-align-right", Lucide::AlignEndVertical, "右对齐"),
+                Align::Top => ("tf-align-top", Lucide::AlignStartHorizontal, "顶对齐"),
+                Align::CenterY => ("tf-align-cy", Lucide::AlignCenterHorizontal, "垂直居中"),
+                Align::Bottom => ("tf-align-bottom", Lucide::AlignEndHorizontal, "底对齐"),
+            };
+            Button::new(id)
+                .ghost()
+                .compact()
+                .icon(gpui_kit::component::Icon::new(icon))
+                .tooltip(tip)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.align_layer(how, window, cx);
+                }))
+        });
+        h_flex()
+            .gap_2()
+            .child(
+                div()
+                    .w(px(64.))
+                    .flex_none()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("对齐"),
+            )
+            .child(h_flex().gap_0p5().children(buttons))
+    }
+
+    /// 「位置大小」组标题：名字和整组「重置」。
+    fn render_transform_header(cx: &Context<'_, Self>) -> impl IntoElement {
+        h_flex()
+            .justify_between()
+            .child(div().text_sm().child("位置大小"))
+            .child(
+                Button::new("tf-reset")
+                    .ghost()
+                    .compact()
+                    .label("重置")
+                    .tooltip("恢复铺满画面、居中、不旋转、不裁剪，并清掉关键帧")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.reset_transform(window, cx);
+                    })),
+            )
+    }
+
     pub(crate) fn render_transform_section(
         &self,
         cx: &Context<'_, Self>,
@@ -321,66 +397,95 @@ impl Workspace {
         let (_, t, _) = self.bound_video_clip()?;
         let muted = cx.theme().muted_foreground;
         let f = &self.inspector.transform;
-        let field = |id: &'static str, label: &'static str, state: &Entity<InputState>| {
-            v_flex()
+        let field = |id: &'static str, state: &Entity<InputState>| {
+            div()
                 .flex_1()
                 .min_w_0()
-                .gap_0p5()
-                .child(div().text_xs().text_color(muted).child(label))
-                .child(div().id(id).test_support().child(Input::new(state)))
+                .id(id)
+                .test_support()
+                .child(Input::new(state))
+        };
+        let tag = |label: &'static str| div().text_xs().text_color(muted).child(label);
+        // 剪映式：一行一个属性，左边名字、中间数值、右边这一行的关键帧 ‹ ◇ ›
+        let line = |label: &'static str, body: gpui_kit::AnyElement, group: KeyGroup| {
+            h_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(64.))
+                        .flex_none()
+                        .text_sm()
+                        .text_color(muted)
+                        .child(label),
+                )
+                .child(h_flex().flex_1().min_w_0().gap_1().child(body))
+                .child(self.render_group_keys(group, cx))
         };
         Some(
             v_flex()
                 .gap_2()
-                .pt_2()
-                .border_t_1()
-                .border_color(cx.theme().border)
-                .child(
-                    h_flex()
-                        .justify_between()
-                        .child(div().text_sm().child("画面"))
-                        .child(
-                            Button::new("tf-reset")
-                                .ghost()
-                                .compact()
-                                .label("重置")
-                                .tooltip("恢复铺满画面、居中、不旋转、不裁剪，并清掉关键帧")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.reset_transform(window, cx);
-                                })),
-                        ),
-                )
+                .child(Self::render_transform_header(cx))
                 .children(self.render_keyframe_bar(cx))
-                .child(
+                .child(line(
+                    "缩放 %",
+                    field("tf-scale", &f.scale).into_any_element(),
+                    KeyGroup::Scale,
+                ))
+                .child(line(
+                    "位置 %",
                     h_flex()
+                        .flex_1()
+                        .gap_1()
+                        .child(tag("X"))
+                        .child(field("tf-x", &f.x))
+                        .child(tag("Y"))
+                        .child(field("tf-y", &f.y))
+                        .into_any_element(),
+                    KeyGroup::Position,
+                ))
+                .child(Self::render_align_row(cx))
+                .child(line(
+                    "旋转 °",
+                    field("tf-rotation", &f.rotation).into_any_element(),
+                    KeyGroup::Rotation,
+                ))
+                .child(line(
+                    "裁剪 %",
+                    h_flex()
+                        .flex_1()
+                        .gap_1()
+                        .child(tag("左"))
+                        .child(field("tf-crop-l", &f.crop[0]))
+                        .child(tag("上"))
+                        .child(field("tf-crop-t", &f.crop[1]))
+                        .child(tag("右"))
+                        .child(field("tf-crop-r", &f.crop[2]))
+                        .child(tag("下"))
+                        .child(field("tf-crop-b", &f.crop[3]))
+                        .into_any_element(),
+                    KeyGroup::Crop,
+                ))
+                .child(line(
+                    "不透明度",
+                    h_flex()
+                        .flex_1()
                         .gap_2()
-                        .child(field("tf-x", "X（%）", &f.x))
-                        .child(field("tf-y", "Y（%）", &f.y))
-                        .child(field("tf-scale", "缩放（%）", &f.scale))
-                        .child(field("tf-rotation", "旋转（°）", &f.rotation)),
-                )
-                .child(div().text_xs().text_color(muted).child("裁剪（%）"))
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(field("tf-crop-l", "左", &f.crop[0]))
-                        .child(field("tf-crop-t", "上", &f.crop[1]))
-                        .child(field("tf-crop-r", "右", &f.crop[2]))
-                        .child(field("tf-crop-b", "下", &f.crop[3])),
-                )
-                .child(
-                    h_flex()
-                        .justify_between()
-                        .text_sm()
-                        .child(div().text_color(muted).child("不透明度"))
-                        .child(SharedString::from(format!("{}%", pct(t.opacity)))),
-                )
-                .child(
-                    div()
-                        .id("tf-opacity")
-                        .test_support()
-                        .child(Slider::new(&f.opacity)),
-                ),
+                        .child(
+                            div()
+                                .flex_1()
+                                .id("tf-opacity")
+                                .test_support()
+                                .child(Slider::new(&f.opacity)),
+                        )
+                        .child(
+                            div()
+                                .w(px(48.))
+                                .text_sm()
+                                .child(SharedString::from(format!("{}%", pct(t.opacity)))),
+                        )
+                        .into_any_element(),
+                    KeyGroup::Opacity,
+                )),
         )
     }
 }

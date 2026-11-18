@@ -15,6 +15,13 @@ pub struct ProjectSettings {
     pub frame_rate: FrameRate,
     /// 音频采样率。
     pub sample_rate: u32,
+    /// 主轨磁吸（见 [`crate::magnet`]）。新工程默认开（和剪映一样）；旧工程文件里没有这一项，按关读，
+    /// 免得打开后第一次编辑就把原来留的空隙全合上。
+    #[serde(default)]
+    pub main_magnet: bool,
+    /// 联动：字幕跟着主轨片段走。新工程默认开，旧文件按关读。
+    #[serde(default)]
+    pub linkage: bool,
 }
 
 impl Default for ProjectSettings {
@@ -24,6 +31,8 @@ impl Default for ProjectSettings {
             height: 1080,
             frame_rate: FrameRate::new(30, 1),
             sample_rate: 48_000,
+            main_magnet: true,
+            linkage: true,
         }
     }
 }
@@ -39,6 +48,9 @@ pub struct Project {
     pub timeline: Timeline,
     /// 发号器。
     pub ids: IdGen,
+    /// 字幕样式（所有字幕共用）。
+    #[serde(default)]
+    pub subtitle_style: crate::SubtitleStyle,
 }
 
 impl Default for Project {
@@ -58,6 +70,7 @@ impl Project {
             assets: BTreeMap::new(),
             timeline,
             ids,
+            subtitle_style: crate::SubtitleStyle::default(),
         }
     }
 

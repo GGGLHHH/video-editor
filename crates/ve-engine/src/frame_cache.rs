@@ -42,6 +42,12 @@ impl FrameCache {
         self.lru.get(&key).cloned()
     }
 
+    /// 有没有（不改变使用顺序）。
+    #[must_use]
+    pub fn contains(&self, key: FrameKey) -> bool {
+        self.lru.contains(&key)
+    }
+
     /// 放入；单帧超过容量则不缓存。
     pub fn insert(&mut self, key: FrameKey, frame: Arc<VideoFrame>) {
         if let Some(old) = self.lru.pop(&key) {

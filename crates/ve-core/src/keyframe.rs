@@ -76,6 +76,50 @@ pub enum Prop {
     CropBottom,
 }
 
+/// 属性面板里一行一个关键帧按钮（剪映电脑版按属性打帧）：位置（X、Y 一起）、缩放、旋转、
+/// 不透明度、裁剪（四边一起）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyGroup {
+    /// 位置。
+    Position,
+    /// 缩放。
+    Scale,
+    /// 旋转。
+    Rotation,
+    /// 不透明度。
+    Opacity,
+    /// 裁剪。
+    Crop,
+}
+
+impl KeyGroup {
+    /// 全部分组（属性面板里从上到下的顺序）。
+    pub const ALL: [Self; 5] = [
+        Self::Scale,
+        Self::Position,
+        Self::Rotation,
+        Self::Opacity,
+        Self::Crop,
+    ];
+
+    /// 这一组包含的属性。
+    #[must_use]
+    pub const fn props(self) -> &'static [Prop] {
+        match self {
+            Self::Position => &[Prop::X, Prop::Y],
+            Self::Scale => &[Prop::Scale],
+            Self::Rotation => &[Prop::Rotation],
+            Self::Opacity => &[Prop::Opacity],
+            Self::Crop => &[
+                Prop::CropLeft,
+                Prop::CropTop,
+                Prop::CropRight,
+                Prop::CropBottom,
+            ],
+        }
+    }
+}
+
 impl Prop {
     /// 画面属性的全部字段。
     pub const TRANSFORM: [Self; 9] = [
@@ -238,6 +282,50 @@ impl Animation {
                 },
             ),
         }
+    }
+
+    /// 若干属性的关键帧时间（去重、排好）。
+    #[must_use]
+    pub fn times_of(&self, props: &[Prop]) -> Vec<Time> {
+        let mut all: Vec<Time> = props
+            .iter()
+            .flat_map(|p| self.keys(*p))
+            .map(|k| k.at)
+            .collect();
+        all.sort_unstable();
+        all.dedup();
+        all
+    }
+
+    /// 删掉这些属性在 `at` 处的关键帧，返回是否删了；删光了的属性不再算有动画。
+    pub fn remove_props_at(&mut self, props: &[Prop], at: Time) -> bool {
+        let mut removed = false;
+        for prop in props {
+            if let Some(keys) = self.tracks.get_mut(prop) {
+                let before = keys.len();
+                keys.retain(|k| k.at != at);
+                removed |= keys.len() != before;
+            }
+        }
+        self.tracks.retain(|_, keys| !keys.is_empty());
+        removed
+    }
+
+    /// 所有关键帧的时间乘 `factor`（变速时动画跟着内容伸缩）。
+    pub fn scale_times(&mut self, factor: f64) {
+        for keys in self.tracks.values_mut() {
+            for k in keys.iter_mut() {
+                k.at = k.at.scaled(factor);
+            }
+        }
+    }
+
+    /// 删掉一个属性在 `[from, to]` 之间的关键帧（含两端）。
+    pub fn remove_between(&mut self, prop: Prop, from: Time, to: Time) {
+        if let Some(keys) = self.tracks.get_mut(&prop) {
+            keys.retain(|k| k.at < from || k.at > to);
+        }
+        self.tracks.retain(|_, keys| !keys.is_empty());
     }
 
     /// 删掉所有属性在 `at` 处的关键帧，返回是否删了；属性的关键帧删光了就不再算有动画。

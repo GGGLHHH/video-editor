@@ -64,6 +64,8 @@ pub struct Layer<'a> {
     pub geometry: LayerGeometry,
     /// 不透明度（0–1）。
     pub opacity: f32,
+    /// 调色（全 0 时着色器跳过）。
+    pub adjust: ve_core::ColorAdjust,
 }
 
 /// 每层的参数，作为实例顶点数据传给着色器。
@@ -76,10 +78,14 @@ struct LayerInstance {
     bottom: [f32; 4],
     uv: [f32; 4],
     opacity: f32,
+    /// 调色：亮度、对比度、饱和度、色温。
+    adjust: [f32; 4],
+    /// 调色：色调。
+    tint: f32,
 }
 
-const INSTANCE_ATTRS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
-    0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32
+const INSTANCE_ATTRS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+    0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32, 4 => Float32x4, 5 => Float32
 ];
 
 /// 一个图层槽位：纹理按尺寸复用。
@@ -510,6 +516,7 @@ impl Compositor {
                 extent(pix),
             );
             let uv = layer.geometry.uv;
+            let a = layer.adjust;
             // 四个角已经按旋转算好（左上、右上、右下、左下），这里只换成 NDC
             let ndc = |(x, y): (f32, f32)| {
                 (
@@ -523,6 +530,8 @@ impl Compositor {
                 bottom: [bl.0, bl.1, br.0, br.1],
                 uv: [uv.x, uv.y, uv.x + uv.w, uv.y + uv.h],
                 opacity: layer.opacity.clamp(0.0, 1.0),
+                adjust: [a.brightness, a.contrast, a.saturation, a.temperature],
+                tint: a.tint,
             });
         }
         self.write_instances(&instances);
@@ -1035,6 +1044,7 @@ mod tests {
             },
             geometry,
             opacity,
+            adjust: ve_core::ColorAdjust::NONE,
         }
     }
 
@@ -1142,6 +1152,36 @@ mod tests {
             "{:?}",
             px(&out, 32, 18)
         );
+    }
+
+    #[test]
+    fn color_adjust_matches_the_cpu_formula() {
+        let mut comp = compositor();
+        // 纯红（BGRA），饱和度拉到 -1、亮度 +0.4、色温 +0.5
+        let red = solid(2, 2, [0, 0, 255, 255]);
+        let adjust = ve_core::ColorAdjust {
+            brightness: 0.4,
+            saturation: -1.0,
+            temperature: 0.5,
+            ..ve_core::ColorAdjust::NONE
+        };
+        let mut tinted = layer(&red, 2, 2, FULL, 1.0);
+        tinted.adjust = adjust;
+        let mut out = Vec::new();
+        comp.compose_bgra(SIZE, &[tinted], &mut out).unwrap();
+        let [red_v, green_v, blue_v] = adjust.apply([1.0, 0.0, 0.0]);
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "0–255"
+        )]
+        let want = [blue_v, green_v, red_v].map(|v| (v * 255.0).round() as u8);
+        let got = px(&out, 32, 18);
+        assert!(near(got, want, 2), "{got:?} vs {want:?}");
+        // 不调色的图层原样（不经过反预乘，边缘半透明像素不变色）
+        let plain = layer(&red, 2, 2, FULL, 1.0);
+        comp.compose_bgra(SIZE, &[plain], &mut out).unwrap();
+        assert_eq!(px(&out, 32, 18), [0, 0, 255, 255]);
     }
 
     #[test]

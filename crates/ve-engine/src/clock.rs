@@ -1,6 +1,7 @@
 //! 播放时钟：以声卡实际取走的样本数为准，两次回调之间按系统时间插值。
 //!
 //! 声卡欠载时样本数不涨，时钟随之停住，画面就会等声音，不会音画漂移。
+//! 倍速播放（J / K / L）时位置 = 起点 + 走过的时间 × 倍数，倍数为负就是倒放。
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,8 +19,10 @@ struct Anchor {
     playing: bool,
     /// 本次开始时样本计数器的值。
     base_played: u64,
-    /// 本次开始后报出过的最大位置（保证单调）。
+    /// 本次开始后报出过的最远位置（保证单调：正放不减、倒放不增）。
     reported: Time,
+    /// 倍数（1 原速，负数倒放）。
+    rate: f64,
 }
 
 /// 播放时钟。
@@ -45,6 +48,7 @@ impl PlayClock {
                 playing: false,
                 base_played: 0,
                 reported: Time::ZERO,
+                rate: 1.0,
             }),
             played: AtomicU64::new(0),
             last_update_ns: AtomicU64::new(0),
@@ -89,17 +93,28 @@ impl PlayClock {
             .saturating_sub(self.last_update_ns.load(Ordering::Acquire));
         let interp =
             Time::from_secs_f64(Duration::from_nanos(since).as_secs_f64()).min(MAX_INTERPOLATION);
-        let p = a.at
-            + Time::from_samples(i64::try_from(played).unwrap_or(i64::MAX), self.sample_rate)
-            + interp;
-        a.reported = a.reported.max(p);
+        let walked =
+            Time::from_samples(i64::try_from(played).unwrap_or(i64::MAX), self.sample_rate)
+                + interp;
+        let p = (a.at + walked.scaled(a.rate)).max(Time::ZERO);
+        a.reported = if a.rate >= 0.0 {
+            a.reported.max(p)
+        } else {
+            a.reported.min(p)
+        };
         let out = a.reported;
         drop(a);
         out
     }
 
-    /// 从 `at` 开始走。
+    /// 从 `at` 开始走（倍数不变）。
     pub fn start(&self, at: Time) {
+        let rate = self.lock().rate;
+        self.start_at_rate(at, rate);
+    }
+
+    /// 从 `at` 开始按 `rate` 倍走（负数倒放）。
+    pub fn start_at_rate(&self, at: Time, rate: f64) {
         let base_played = self.played.load(Ordering::Acquire);
         self.last_update_ns.store(self.now_ns(), Ordering::Release);
         *self.lock() = Anchor {
@@ -107,7 +122,14 @@ impl PlayClock {
             playing: true,
             base_played,
             reported: at,
+            rate,
         };
+    }
+
+    /// 倍数。
+    #[must_use]
+    pub fn rate(&self) -> f64 {
+        self.lock().rate
     }
 
     /// 停住，返回停住的位置。
@@ -234,5 +256,23 @@ mod tests {
         c.set_position(ms(7000));
         assert!(near(c.position(), ms(7000), 5));
         assert_eq!(c.sample_rate(), 48_000);
+    }
+
+    #[test]
+    fn rate_scales_and_reverses_the_clock() {
+        let c = PlayClock::new(48_000);
+        c.start_at_rate(ms(1000), 4.0);
+        c.advance(12_000);
+        assert!(near(c.position(), ms(2000), 160), "{:?}", c.position());
+        c.start_at_rate(ms(1000), -2.0);
+        assert!((c.rate() + 2.0).abs() < 1e-9);
+        c.advance(12_000);
+        assert!(near(c.position(), ms(500), 80), "{:?}", c.position());
+        // 倒到 0 就停在 0，不会是负的
+        c.advance(48_000);
+        assert_eq!(c.position(), Time::ZERO);
+        // start 沿用当前倍数
+        c.start(ms(3000));
+        assert!((c.rate() + 2.0).abs() < 1e-9);
     }
 }

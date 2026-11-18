@@ -94,7 +94,7 @@ fn source_end_limit(project: &Project, clip: &Clip) -> Time {
     match &clip.content {
         ClipContent::Media { asset, source_in } => project.assets.get(asset).map_or_else(
             || clip.end(),
-            |a| clip.start + (a.source_limit() - *source_in),
+            |a| clip.start + (a.source_limit() - *source_in).scaled(1.0 / f64::from(clip.speed)),
         ),
         ClipContent::Subtitle { .. } => Time(i64::MAX / 4),
     }
@@ -134,6 +134,11 @@ fn new_media_clip(
         fade_out: Time::ZERO,
         transform: Transform::default(),
         animation: crate::Animation::default(),
+        adjust: crate::ColorAdjust::NONE,
+        disabled: false,
+        transition_in: None,
+        speed: 1.0,
+        keep_pitch: true,
     })
 }
 
@@ -269,7 +274,9 @@ pub fn trim_start(project: &mut Project, clip: ClipId, new_start: Time) -> Resul
             .checked_sub(1)
             .map_or(Time::ZERO, |i| track.clips[i].end());
         let source_floor = match &c.content {
-            ClipContent::Media { source_in, .. } => c.start - *source_in,
+            ClipContent::Media { source_in, .. } => {
+                c.start - source_in.scaled(1.0 / f64::from(c.speed))
+            }
             ClipContent::Subtitle { .. } => Time::ZERO,
         };
         let end = c.end();
@@ -281,8 +288,9 @@ pub fn trim_start(project: &mut Project, clip: ClipId, new_start: Time) -> Resul
             c.start
         };
         let start = new_start.clamp(lower, upper);
+        let speed = f64::from(c.speed);
         if let ClipContent::Media { source_in, .. } = &mut c.content {
-            *source_in += start - c.start;
+            *source_in += (start - c.start).scaled(speed);
         }
         // 关键帧时间相对片段起点：起点后移多少，关键帧就前移多少，仍对着原来的内容
         c.animation.shift(c.start - start);
@@ -322,6 +330,49 @@ pub fn trim_end(project: &mut Project, clip: ClipId, new_end: Time) -> Result<()
     })
 }
 
+/// `clips` 里跨过 `at`（起点 < at < 终点）的片段；任一片段不存在就报错。
+fn crossing(project: &Project, clips: &[ClipId], at: Time) -> Result<Vec<ClipId>, EditError> {
+    let mut out = Vec::new();
+    for &id in clips {
+        let (_, c) = project
+            .timeline
+            .find_clip(id)
+            .ok_or(EditError::ClipNotFound(id))?;
+        if c.start < at && at < c.end() {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// 向左裁剪（剪映 / FCP X 的 Q）：`clips` 里跨过 `at` 的片段，剪掉 `at` 左边的部分，返回剪了几个。
+///
+/// # Errors
+/// 任一片段不存在（这时什么都不改）。
+pub fn trim_left_at(project: &mut Project, clips: &[ClipId], at: Time) -> Result<usize, EditError> {
+    let targets = crossing(project, clips, at)?;
+    for &c in &targets {
+        trim_start(project, c, at)?;
+    }
+    Ok(targets.len())
+}
+
+/// 向右裁剪（W）：`clips` 里跨过 `at` 的片段，剪掉 `at` 右边的部分，返回剪了几个。
+///
+/// # Errors
+/// 任一片段不存在（这时什么都不改）。
+pub fn trim_right_at(
+    project: &mut Project,
+    clips: &[ClipId],
+    at: Time,
+) -> Result<usize, EditError> {
+    let targets = crossing(project, clips, at)?;
+    for &c in &targets {
+        trim_end(project, c, at)?;
+    }
+    Ok(targets.len())
+}
+
 /// 在 `at` 处把片段切成两段，返回右半段的 id。
 ///
 /// # Errors
@@ -354,11 +405,14 @@ fn split_in(
     left.fade_out = Time::ZERO;
     clamp_fades(&mut left);
     right.id = right_id;
+    // 切开的地方是硬切：右半段不带原来的入场转场
+    right.transition_in = None;
     right.start = at;
     right.duration = original.end() - at;
     right.fade_in = Time::ZERO;
+    let speed = f64::from(right.speed);
     if let ClipContent::Media { source_in, .. } = &mut right.content {
-        *source_in += left.duration;
+        *source_in += left.duration.scaled(speed);
     }
     clamp_fades(&mut right);
     let clips = &mut tl.tracks[ti].clips;
@@ -433,6 +487,14 @@ pub fn ripple_delete(project: &mut Project, clips: &[ClipId]) -> Result<(), Edit
 }
 
 /// 修改单个片段。
+/// 用改好的片段（同一个 id）替换原来的，经过不变式检查。
+pub(crate) fn replace_clip(project: &mut Project, clip: Clip) -> Result<(), EditError> {
+    update_clip(project, clip.id, |slot| {
+        *slot = clip;
+        Ok(())
+    })
+}
+
 fn update_clip(
     project: &mut Project,
     clip: ClipId,
@@ -493,13 +555,13 @@ pub fn add_track(project: &mut Project, kind: TrackKind) -> Result<TrackId, Edit
             .map(|i| i + 1),
         TrackKind::Subtitle => return Err(EditError::WrongTrackKind),
     };
-    // 没有同类轨道时：视频轨放最前，音频轨放在字幕轨之前
+    // 没有同类轨道时：视频轨放在字幕轨后面，音频轨放最后
     let at = at.unwrap_or_else(|| match kind {
-        TrackKind::Video => 0,
-        _ => tracks
+        TrackKind::Video => tracks
             .iter()
-            .position(|t| t.kind == TrackKind::Subtitle)
+            .position(|t| t.kind != TrackKind::Subtitle)
             .unwrap_or(tracks.len()),
+        _ => tracks.len(),
     });
     let id = project.ids.track();
     project
@@ -507,6 +569,131 @@ pub fn add_track(project: &mut Project, kind: TrackKind) -> Result<TrackId, Edit
         .tracks
         .insert(at, crate::Track::new(id, kind));
     Ok(id)
+}
+
+/// 某类轨道可以新插入的位置（轨道列表下标，含两端）：同类轨道要挨在一起。
+/// 字幕轨只有一条，返回 `None`；还没有这类轨道时也返回 `None`。
+#[must_use]
+pub fn insert_slots(
+    timeline: &Timeline,
+    kind: TrackKind,
+) -> Option<std::ops::RangeInclusive<usize>> {
+    if kind == TrackKind::Subtitle {
+        return None;
+    }
+    let first = timeline.tracks.iter().position(|t| t.kind == kind)?;
+    let last = timeline.tracks.iter().rposition(|t| t.kind == kind)?;
+    Some(first..=last + 1)
+}
+
+/// 把片段拖进两条轨道之间的缝（剪映：拖到轨道之间自动新建轨道）：在 `slot` 处新建一条
+/// 和片段所在轨道同类型的轨道，把片段放进去、起点 `start`。返回新轨道。
+///
+/// # Errors
+/// 片段不存在；`slot` 不在这类轨道能插入的范围内（或片段在字幕轨上）时返回
+/// [`EditError::WrongTrackKind`]。失败时工程不变。
+pub fn move_clip_to_new_track(
+    project: &mut Project,
+    clip: ClipId,
+    slot: usize,
+    start: Time,
+) -> Result<TrackId, EditError> {
+    let (track, _) = project
+        .timeline
+        .find_clip(clip)
+        .ok_or(EditError::ClipNotFound(clip))?;
+    let kind = project
+        .timeline
+        .track(track)
+        .ok_or(EditError::TrackNotFound(track))?
+        .kind;
+    if !insert_slots(&project.timeline, kind).is_some_and(|r| r.contains(&slot)) {
+        return Err(EditError::WrongTrackKind);
+    }
+    let mut next = project.clone();
+    let id = next.ids.track();
+    next.timeline
+        .tracks
+        .insert(slot, crate::Track::new(id, kind));
+    move_clip(&mut next, clip, id, start)?;
+    *project = next;
+    Ok(id)
+}
+
+/// 切换画面比例（剪映播放器上的「比例」）：保持短边不变，按比例算长边，宽高取偶数；
+/// `None` 是「原始」，回到第一个视频素材的尺寸（没有视频素材时不变）。
+/// 画面按「完整放进画布」摆放，所以换比例后各图层自动适配（留黑边）。
+///
+/// # Errors
+/// 比例里有 0。
+pub fn set_aspect(project: &mut Project, ratio: Option<(u32, u32)>) -> Result<(), EditError> {
+    let s = &mut project.settings;
+    let Some((rw, rh)) = ratio else {
+        let first = project
+            .assets
+            .values()
+            .find_map(|a| a.video.filter(|v| !v.still));
+        if let Some(v) = first {
+            s.width = (v.width & !1).max(2);
+            s.height = (v.height & !1).max(2);
+        }
+        return Ok(());
+    };
+    if rw == 0 || rh == 0 {
+        return Err(EditError::InvalidValue);
+    }
+    let short = f64::from(s.width.min(s.height));
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "画面边长为正且远小于 u32 上限"
+    )]
+    let even = |v: f64| ((v / 2.0).round() as u32 * 2).max(2);
+    let (w, h) = if rw >= rh {
+        (even(short * f64::from(rw) / f64::from(rh)), even(short))
+    } else {
+        (even(short), even(short * f64::from(rh) / f64::from(rw)))
+    };
+    s.width = w;
+    s.height = h;
+    Ok(())
+}
+
+/// 改分辨率（剪映草稿参数）：保持比例，短边设成 `short`，宽高取偶数。
+///
+/// # Errors
+/// `short` 为 0。
+pub fn set_resolution(project: &mut Project, short: u32) -> Result<(), EditError> {
+    if short == 0 {
+        return Err(EditError::InvalidValue);
+    }
+    let s = &mut project.settings;
+    let (w, h) = (f64::from(s.width), f64::from(s.height));
+    let k = f64::from(short) / w.min(h);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "画面边长为正且远小于 u32 上限"
+    )]
+    let even = |v: f64| ((v / 2.0).round() as u32 * 2).max(2);
+    s.width = even(w * k);
+    s.height = even(h * k);
+    Ok(())
+}
+
+/// 改工程帧率。片段时间用 flicks 存，不受影响；导出、逐帧按新帧率。
+///
+/// # Errors
+/// 帧率分子或分母为 0。
+pub const fn set_frame_rate(
+    project: &mut Project,
+    rate: crate::FrameRate,
+) -> Result<(), EditError> {
+    if rate.num == 0 || rate.den == 0 {
+        return Err(EditError::InvalidValue);
+    }
+    project.settings.frame_rate = rate;
+    Ok(())
 }
 
 /// 删除一条轨道和它上面的片段。
@@ -552,6 +739,292 @@ fn ensure_video(project: &Project, clip: ClipId) -> Result<(), EditError> {
     }
 }
 
+/// 设置片段的调色（剪映「调整」）。
+///
+/// # Errors
+/// 片段不存在、不是视频轨上的片段、有超出 -1–1 或不是有限数的项。
+pub fn set_adjust(
+    project: &mut Project,
+    clip: ClipId,
+    adjust: crate::ColorAdjust,
+) -> Result<(), EditError> {
+    if !adjust.is_valid() {
+        return Err(EditError::InvalidValue);
+    }
+    ensure_video(project, clip)?;
+    update_clip(project, clip, |c| {
+        c.adjust = adjust;
+        Ok(())
+    })
+}
+
+/// 复制下来的片段：（原来的轨道，片段）；片段起点是相对最早那段的偏移。
+pub type Copied = Vec<(TrackId, Clip)>;
+
+/// 复制片段（Ctrl+C）。
+///
+/// # Errors
+/// 任一片段不存在。
+pub fn copy_clips(project: &Project, clips: &[ClipId]) -> Result<Copied, EditError> {
+    let mut out: Copied = Vec::with_capacity(clips.len());
+    for &id in clips {
+        let (track, c) = project
+            .timeline
+            .find_clip(id)
+            .ok_or(EditError::ClipNotFound(id))?;
+        out.push((track, (**c).clone()));
+    }
+    let first = out.iter().map(|(_, c)| c.start).min().unwrap_or(Time::ZERO);
+    for (_, c) in &mut out {
+        c.start -= first;
+    }
+    Ok(out)
+}
+
+/// 粘贴（Ctrl+V）：按复制时的相对位置放到 `at` 开始，各回原来的轨道（轨道没了就放到同类的第一条）。
+/// 主轨磁吸开着时，进主轨的片段按位置插队。返回新片段。
+///
+/// # Errors
+/// 位置被占了（这时什么都不改）、没有能放的轨道、素材已经不在了。
+pub fn paste_clips(
+    project: &mut Project,
+    copied: &[(TrackId, Clip)],
+    at: Time,
+) -> Result<Vec<ClipId>, EditError> {
+    let mut next = project.clone();
+    let main = crate::magnet::main_track(&next.timeline);
+    let mut ids = Vec::with_capacity(copied.len());
+    for (track, clip) in copied {
+        if let Some(asset) = clip.asset()
+            && !next.assets.contains_key(&asset)
+        {
+            return Err(EditError::AssetNotFound(asset));
+        }
+        let kind_of = |tl: &Timeline, id: TrackId| tl.track(id).map(|t| t.kind);
+        let wanted = project.timeline.track(*track).map(|t| t.kind).or_else(|| {
+            // 轨道删掉了：按内容猜类型
+            Some(if clip.subtitle_text().is_some() {
+                TrackKind::Subtitle
+            } else {
+                TrackKind::Video
+            })
+        });
+        let target = if kind_of(&next.timeline, *track).is_some() {
+            *track
+        } else {
+            next.timeline
+                .tracks
+                .iter()
+                .find(|t| Some(t.kind) == wanted)
+                .map(|t| t.id)
+                .ok_or(EditError::WrongTrackKind)?
+        };
+        let id = next.ids.clip();
+        let mut c = clip.clone();
+        c.id = id;
+        c.start = at + clip.start;
+        let magnet = next.settings.main_magnet && Some(target) == main;
+        let tl = &mut next.timeline;
+        let t = tl
+            .track_mut(target)
+            .ok_or(EditError::TrackNotFound(target))?;
+        if magnet {
+            // 先放到主轨末尾，再按位置插队
+            let end = t.end();
+            let wanted_start = c.start;
+            c.start = end;
+            t.insert_sorted(Arc::new(c));
+            crate::magnet::insert_into_main(&mut next, id, wanted_start)?;
+        } else {
+            if !t.is_free(c.start, c.end(), &[]) {
+                return Err(EditError::Overlap);
+            }
+            t.insert_sorted(Arc::new(c));
+        }
+        ids.push(id);
+    }
+    next.timeline
+        .check_invariants(&next.assets)
+        .map_err(|_| EditError::WrongTrackKind)?;
+    *project = next;
+    Ok(ids)
+}
+
+/// 复制下来的属性（剪映「复制属性」）：画面属性、关键帧动画、调色。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attributes {
+    /// 画面属性。
+    pub transform: Transform,
+    /// 关键帧动画。
+    pub animation: crate::Animation,
+    /// 调色。
+    pub adjust: crate::ColorAdjust,
+}
+
+/// 复制属性（Ctrl+Shift+C）。
+///
+/// # Errors
+/// 片段不存在、不在视频轨上。
+pub fn copy_attributes(project: &Project, clip: ClipId) -> Result<Attributes, EditError> {
+    ensure_video(project, clip)?;
+    let (_, c) = project
+        .timeline
+        .find_clip(clip)
+        .ok_or(EditError::ClipNotFound(clip))?;
+    Ok(Attributes {
+        transform: c.transform,
+        animation: c.animation.clone(),
+        adjust: c.adjust,
+    })
+}
+
+/// 粘贴属性（Ctrl+Shift+V）：套到这些视频片段上（不在视频轨上的跳过），返回套了几个。
+///
+/// # Errors
+/// 任一片段不存在。
+pub fn paste_attributes(
+    project: &mut Project,
+    clips: &[ClipId],
+    attrs: &Attributes,
+) -> Result<usize, EditError> {
+    let mut n = 0;
+    let mut next = project.clone();
+    for &id in clips {
+        match ensure_video(&next, id) {
+            Ok(()) => {}
+            Err(EditError::WrongTrackKind) => continue,
+            Err(e) => return Err(e),
+        }
+        update_clip(&mut next, id, |c| {
+            c.transform = attrs.transform;
+            c.animation = attrs.animation.clone();
+            c.adjust = attrs.adjust;
+            Ok(())
+        })?;
+        n += 1;
+    }
+    *project = next;
+    Ok(n)
+}
+
+/// 改字幕样式（应用到全部字幕）。
+///
+/// # Errors
+/// 样式里有超出范围的值。
+pub fn set_subtitle_style(
+    project: &mut Project,
+    style: crate::SubtitleStyle,
+) -> Result<(), EditError> {
+    if !style.is_valid() {
+        return Err(EditError::InvalidValue);
+    }
+    project.subtitle_style = style;
+    Ok(())
+}
+
+/// 变速（剪映「变速 › 常规变速」）：素材用的那一段不变，时间轴上的长度 = 原来素材长度 / 倍数。
+/// 关键帧跟着内容一起伸缩。片段变长撞到后一段时：主轨磁吸开着就把后面的整体往后推，否则报错。
+///
+/// # Errors
+/// 片段不存在、是字幕、倍数超出 0.1–10、变长后和后面的片段重叠（不在磁吸的主轨上时）。
+pub fn set_speed(project: &mut Project, clip: ClipId, speed: f32) -> Result<(), EditError> {
+    if !(crate::timeline::SPEED_RANGE.0..=crate::timeline::SPEED_RANGE.1).contains(&speed) {
+        return Err(EditError::InvalidValue);
+    }
+    let shortest = min_len(project);
+    let main_track = crate::magnet::main_track(&project.timeline);
+    let magnet = project.settings.main_magnet;
+    with_timeline(project, |_, tl| {
+        let (ti, ci) = locate(tl, clip)?;
+        let mut c = (*tl.tracks[ti].clips[ci]).clone();
+        if c.subtitle_text().is_some() {
+            return Err(EditError::WrongTrackKind);
+        }
+        let span = c.source_span();
+        let old = (c.duration, c.speed);
+        // 往下取整：新的素材长度不会超过原来的（不越过素材结尾）
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_precision_loss,
+            reason = "时长远小于 2^53"
+        )]
+        let duration = Time((span.0 as f64 / f64::from(speed)).floor() as i64).max(shortest);
+        let ratio = f64::from(old.1) / f64::from(speed);
+        c.speed = speed;
+        c.duration = duration;
+        c.animation.scale_times(ratio);
+        clamp_fades(&mut c);
+        let delta = duration - old.0;
+        let track = &mut tl.tracks[ti];
+        let next_start = track.clips.get(ci + 1).map(|n| n.start);
+        if next_start.is_some_and(|s| c.end() > s) {
+            if magnet && Some(track.id) == main_track {
+                // 磁吸的主轨：后面的整体往后推
+                for later in &mut track.clips[ci + 1..] {
+                    Arc::make_mut(later).start += delta;
+                }
+            } else {
+                return Err(EditError::Overlap);
+            }
+        }
+        track.clips[ci] = Arc::new(c);
+        Ok(())
+    })
+}
+
+/// 变速时保持音调（剪映「声音变调」关着）还是让音调跟着快慢变。
+///
+/// # Errors
+/// 片段不存在、是字幕。
+pub fn set_keep_pitch(project: &mut Project, clip: ClipId, keep: bool) -> Result<(), EditError> {
+    update_clip(project, clip, |c| {
+        if c.subtitle_text().is_some() {
+            return Err(EditError::WrongTrackKind);
+        }
+        c.keep_pitch = keep;
+        Ok(())
+    })
+}
+
+/// 设置进入这一段时的转场（`None` 去掉）。转场只在它和前一段紧挨着时起作用。
+///
+/// # Errors
+/// 片段不存在、不在视频轨上、时长不是正数。
+pub fn set_transition(
+    project: &mut Project,
+    clip: ClipId,
+    transition: Option<crate::Transition>,
+) -> Result<(), EditError> {
+    if transition.is_some_and(|t| t.duration <= Time::ZERO) {
+        return Err(EditError::ZeroLength);
+    }
+    ensure_video(project, clip)?;
+    update_clip(project, clip, |c| {
+        c.transition_in = transition;
+        Ok(())
+    })
+}
+
+/// 停用 / 启用片段（剪映「停用片段」V）。
+///
+/// # Errors
+/// 任一片段不存在（这时什么都不改）。
+pub fn set_disabled(
+    project: &mut Project,
+    clips: &[ClipId],
+    disabled: bool,
+) -> Result<(), EditError> {
+    with_timeline(project, |_, tl| {
+        for &id in clips {
+            let (ti, ci) = locate(tl, id)?;
+            let mut c = (*tl.tracks[ti].clips[ci]).clone();
+            c.disabled = disabled;
+            tl.tracks[ti].clips[ci] = Arc::new(c);
+        }
+        Ok(())
+    })
+}
+
 /// 重置画面属性：回到默认值，清掉关键帧动画。
 ///
 /// # Errors
@@ -575,6 +1048,50 @@ pub fn add_keyframe(project: &mut Project, clip: ClipId, at: Time) -> Result<(),
         let now = c.transform_at(at);
         for prop in crate::Prop::TRANSFORM {
             c.animation.upsert(prop, at, prop.get(&now));
+        }
+        Ok(())
+    })
+}
+
+/// 只给几个属性在 `at`（相对片段起点）打关键帧（剪映属性面板每一行的 ◇），值取那一刻的值。
+///
+/// # Errors
+/// 片段不存在、不是视频轨上的片段。
+pub fn add_keyframe_props(
+    project: &mut Project,
+    clip: ClipId,
+    at: Time,
+    props: &[crate::Prop],
+) -> Result<(), EditError> {
+    ensure_video(project, clip)?;
+    update_clip(project, clip, |c| {
+        let now = c.transform_at(at);
+        for prop in props {
+            c.animation.upsert(*prop, at, prop.get(&now));
+        }
+        Ok(())
+    })
+}
+
+/// 删掉几个属性在 `at` 处的关键帧。某个属性的关键帧删光了，它的固定值取删之前那一刻的值，画面不跳。
+///
+/// # Errors
+/// 片段不存在、这些属性在那一刻都没有关键帧。
+pub fn remove_keyframe_props(
+    project: &mut Project,
+    clip: ClipId,
+    at: Time,
+    props: &[crate::Prop],
+) -> Result<(), EditError> {
+    update_clip(project, clip, |c| {
+        let now = c.transform_at(at);
+        if !c.animation.remove_props_at(props, at) {
+            return Err(EditError::NoKeyframe);
+        }
+        for prop in props {
+            if c.animation.keys(*prop).is_empty() {
+                prop.set(&mut c.transform, prop.get(&now));
+            }
         }
         Ok(())
     })
@@ -678,6 +1195,11 @@ pub fn add_subtitle(
         fade_out: Time::ZERO,
         transform: Transform::default(),
         animation: crate::Animation::default(),
+        adjust: crate::ColorAdjust::NONE,
+        disabled: false,
+        transition_in: None,
+        speed: 1.0,
+        keep_pitch: true,
     };
     project.timeline.tracks[ti].insert_sorted(Arc::new(clip));
     Ok(id)
@@ -1022,14 +1544,15 @@ mod tests {
         assert_eq!(
             kinds(&p),
             [
+                TrackKind::Subtitle,
                 TrackKind::Video,
                 TrackKind::Video,
-                TrackKind::Audio,
-                TrackKind::Subtitle
+                TrackKind::Audio
             ]
         );
-        assert_eq!(p.timeline.tracks[0].id, new);
-        assert_eq!(p.timeline.tracks[1].id, ids.video_track);
+        // 剪映：新视频轨在已有视频轨上面（主轨在最下），文字轨始终在最上
+        assert_eq!(p.timeline.tracks[1].id, new);
+        assert_eq!(p.timeline.tracks[2].id, ids.video_track);
         assert_eq!(
             add_track(&mut p, TrackKind::Subtitle),
             Err(EditError::WrongTrackKind)
@@ -1054,14 +1577,14 @@ mod tests {
         assert_eq!(
             kinds(&p),
             [
+                TrackKind::Subtitle,
                 TrackKind::Video,
                 TrackKind::Audio,
-                TrackKind::Audio,
-                TrackKind::Subtitle
+                TrackKind::Audio
             ]
         );
-        assert_eq!(p.timeline.tracks[1].id, ids.audio_track);
-        assert_eq!(p.timeline.tracks[2].id, new);
+        assert_eq!(p.timeline.tracks[2].id, ids.audio_track);
+        assert_eq!(p.timeline.tracks[3].id, new);
     }
 
     #[test]
@@ -1433,5 +1956,333 @@ mod tests {
                 prop_assert!(p.timeline.check_invariants(&p.assets).is_ok(), "{:?}", op);
             }
         }
+    }
+
+    #[test]
+    fn trim_left_cuts_what_is_before_the_playhead() {
+        let (mut p, ids) = sample_project();
+        let all = [ids.v1, ids.v2, ids.a1, ids.s1];
+        // 2 秒：v1（0–5）、a1（0–8）、s1（1–3）跨过它；v2（5–8）不跨，不动
+        assert_eq!(trim_left_at(&mut p, &all, secs(2)), Ok(3));
+        let v1 = clip(&p, ids.v1);
+        assert_eq!((v1.start, v1.duration), (secs(2), secs(3)));
+        assert!(matches!(v1.content, ClipContent::Media { source_in, .. } if source_in == secs(2)));
+        assert_eq!(clip(&p, ids.s1).start, secs(2));
+        assert_eq!(clip(&p, ids.v2).start, secs(5));
+        assert_valid(&p);
+    }
+
+    #[test]
+    fn trim_right_cuts_what_is_after_the_playhead() {
+        let (mut p, ids) = sample_project();
+        assert_eq!(trim_right_at(&mut p, &[ids.v2, ids.s1], secs(6)), Ok(1));
+        let v2 = clip(&p, ids.v2);
+        assert_eq!((v2.start, v2.end()), (secs(5), secs(6)));
+        assert_eq!(clip(&p, ids.s1).end(), secs(3), "不跨过播放头的不动");
+        // 一个都不跨：什么也不改
+        let before = p.clone();
+        assert_eq!(trim_right_at(&mut p, &[ids.s1], secs(6)), Ok(0));
+        assert_eq!(p, before);
+        assert_eq!(
+            trim_right_at(&mut p, &[ClipId(999)], secs(6)),
+            Err(EditError::ClipNotFound(ClipId(999)))
+        );
+    }
+
+    #[test]
+    fn insert_slots_keep_each_kind_together() {
+        let (mut p, _) = sample_project();
+        add_track(&mut p, TrackKind::Video).unwrap();
+        // [S, V, V, A]：视频轨能插在 1、2、3（视频块的上沿、中间、下沿），音频轨能插在 3、4
+        assert_eq!(insert_slots(&p.timeline, TrackKind::Video), Some(1..=3));
+        assert_eq!(insert_slots(&p.timeline, TrackKind::Audio), Some(3..=4));
+        assert_eq!(insert_slots(&p.timeline, TrackKind::Subtitle), None);
+    }
+
+    #[test]
+    fn dragging_into_a_slot_creates_a_track_there() {
+        let (mut p, ids) = sample_project();
+        // 把 v2（5–8）拖到字幕轨和视频轨之间（第 1 个缝）、放在 2 秒：新视频轨在视频轨最上面
+        let track = move_clip_to_new_track(&mut p, ids.v2, 1, secs(2)).unwrap();
+        assert_eq!(p.timeline.tracks[1].id, track);
+        assert_eq!(p.timeline.tracks[1].kind, TrackKind::Video);
+        let (on, c) = p.timeline.find_clip(ids.v2).unwrap();
+        assert_eq!((on, c.start), (track, secs(2)));
+        assert_valid(&p);
+        // 音频片段拖到最下面：新音频轨在最后
+        let n = p.timeline.tracks.len();
+        let audio = move_clip_to_new_track(&mut p, ids.a1, n, secs(0)).unwrap();
+        assert_eq!(p.timeline.tracks.last().unwrap().id, audio);
+        // 插到别的类型中间：拒绝，工程不变
+        let before = p.clone();
+        assert_eq!(
+            move_clip_to_new_track(&mut p, ids.v1, 0, secs(0)),
+            Err(EditError::WrongTrackKind)
+        );
+        assert_eq!(
+            move_clip_to_new_track(&mut p, ids.s1, 0, secs(0)),
+            Err(EditError::WrongTrackKind),
+            "字幕轨只有一条"
+        );
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn aspect_keeps_the_short_side() {
+        let (mut p, _) = sample_project();
+        let size = |proj: &Project| (proj.settings.width, proj.settings.height);
+        assert_eq!(size(&p), (1920, 1080));
+        set_aspect(&mut p, Some((9, 16))).unwrap();
+        assert_eq!(size(&p), (1080, 1920), "竖屏");
+        set_aspect(&mut p, Some((1, 1))).unwrap();
+        assert_eq!(size(&p), (1080, 1080));
+        set_aspect(&mut p, Some((4, 3))).unwrap();
+        assert_eq!(size(&p), (1440, 1080));
+        // 宽高都取偶数（yuv420p 的要求）
+        set_aspect(&mut p, Some((235, 100))).unwrap();
+        assert_eq!(size(&p), (2538, 1080));
+        // 原始：回到第一个视频素材的比例（示例素材是 1920×1080）
+        set_aspect(&mut p, None).unwrap();
+        assert_eq!(size(&p), (1920, 1080));
+        assert_eq!(
+            set_aspect(&mut p, Some((0, 9))),
+            Err(EditError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn keyframes_per_property_group() {
+        use crate::{KeyGroup, Prop};
+        let (mut p, ids) = sample_project();
+        // 只给「缩放」打关键帧：别的属性仍是固定值
+        add_keyframe_props(&mut p, ids.v1, secs(0), KeyGroup::Scale.props()).unwrap();
+        let anim = &clip(&p, ids.v1).animation;
+        assert_eq!(anim.props().collect::<Vec<_>>(), [Prop::Scale]);
+        // 2 秒处改位置和缩放：缩放有关键帧 → 打新帧；位置没有 → 改固定值
+        let moved = Transform {
+            x: 0.2,
+            scale: 0.5,
+            ..Transform::default()
+        };
+        apply_transform_at(&mut p, ids.v1, secs(2), moved).unwrap();
+        let c1 = clip(&p, ids.v1);
+        assert_eq!(c1.animation.keys(Prop::Scale).len(), 2);
+        assert_eq!(c1.animation.keys(Prop::X), []);
+        assert!((c1.transform.x - 0.2).abs() < 1e-6);
+        // 位置一行打帧：X、Y 一起
+        add_keyframe_props(&mut p, ids.v1, secs(1), KeyGroup::Position.props()).unwrap();
+        let c2 = clip(&p, ids.v1);
+        assert_eq!(c2.animation.times_of(KeyGroup::Position.props()), [secs(1)]);
+        assert_eq!(c2.animation.keys(Prop::Y).len(), 1);
+        // 删掉缩放在 2 秒的帧：位置的帧不受影响
+        remove_keyframe_props(&mut p, ids.v1, secs(2), KeyGroup::Scale.props()).unwrap();
+        let c3 = clip(&p, ids.v1);
+        assert_eq!(c3.animation.times_of(KeyGroup::Scale.props()), [secs(0)]);
+        assert_eq!(c3.animation.times_of(KeyGroup::Position.props()), [secs(1)]);
+        // 删光缩放的帧：固定值取删之前那一刻的值（1.0），画面不跳
+        remove_keyframe_props(&mut p, ids.v1, secs(0), KeyGroup::Scale.props()).unwrap();
+        let c4 = clip(&p, ids.v1);
+        assert_eq!(c4.animation.keys(Prop::Scale), []);
+        assert!((c4.transform.scale - 1.0).abs() < 1e-6);
+        assert_eq!(
+            remove_keyframe_props(&mut p, ids.v1, secs(0), KeyGroup::Scale.props()),
+            Err(EditError::NoKeyframe)
+        );
+        assert_valid(&p);
+    }
+
+    #[test]
+    fn resolution_keeps_ratio_and_frame_rate_is_free() {
+        let (mut p, _) = sample_project();
+        let size = |proj: &Project| (proj.settings.width, proj.settings.height);
+        set_resolution(&mut p, 720).unwrap();
+        assert_eq!(size(&p), (1280, 720));
+        set_aspect(&mut p, Some((9, 16))).unwrap();
+        set_resolution(&mut p, 2160).unwrap();
+        assert_eq!(size(&p), (2160, 3840), "竖屏：短边是宽");
+        assert_eq!(set_resolution(&mut p, 0), Err(EditError::InvalidValue));
+        set_frame_rate(&mut p, crate::FrameRate::new(60, 1)).unwrap();
+        assert_eq!(p.settings.frame_rate, crate::FrameRate::new(60, 1));
+        assert_eq!(
+            set_frame_rate(&mut p, crate::FrameRate::new(0, 1)),
+            Err(EditError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn adjust_only_on_video_clips_and_validated() {
+        let (mut p, ids) = sample_project();
+        let warm = crate::ColorAdjust {
+            temperature: 0.5,
+            ..crate::ColorAdjust::NONE
+        };
+        set_adjust(&mut p, ids.v1, warm).unwrap();
+        assert_eq!(clip(&p, ids.v1).adjust, warm);
+        assert_eq!(
+            set_adjust(&mut p, ids.a1, warm),
+            Err(EditError::WrongTrackKind)
+        );
+        let bad = crate::ColorAdjust {
+            contrast: 2.0,
+            ..crate::ColorAdjust::NONE
+        };
+        assert_eq!(
+            set_adjust(&mut p, ids.v1, bad),
+            Err(EditError::InvalidValue)
+        );
+        assert_valid(&p);
+    }
+
+    #[test]
+    fn disabled_clips_stay_but_do_not_render() {
+        let (mut p, ids) = sample_project();
+        set_disabled(&mut p, &[ids.v1, ids.s1], true).unwrap();
+        assert!(clip(&p, ids.v1).disabled && clip(&p, ids.s1).disabled);
+        assert!(
+            crate::compose::resolve_layers(&p, secs(1)).is_empty(),
+            "停用的画面不合成"
+        );
+        assert_eq!(
+            crate::compose::resolve_layers(&p, secs(6)).len(),
+            1,
+            "别的片段照常"
+        );
+        assert!(crate::srt::export_srt(&p).is_empty(), "停用的字幕不导出");
+        set_disabled(&mut p, &[ids.v1], false).unwrap();
+        assert!(!clip(&p, ids.v1).disabled);
+        assert_eq!(
+            set_disabled(&mut p, &[ClipId(999)], true),
+            Err(EditError::ClipNotFound(ClipId(999)))
+        );
+        assert_valid(&p);
+    }
+
+    #[test]
+    fn copy_paste_keeps_relative_layout_and_tracks() {
+        let (mut p, ids) = sample_project();
+        p.settings.main_magnet = false;
+        // v2（视频 5–8）和 s1（字幕 1–3）：相对最早的 s1 是 4 秒和 0 秒
+        let copied = copy_clips(&p, &[ids.v2, ids.s1]).unwrap();
+        let pasted = paste_clips(&mut p, &copied, secs(10)).unwrap();
+        assert_eq!(pasted.len(), 2);
+        let (vt, v) = p.timeline.find_clip(pasted[0]).unwrap();
+        assert_eq!(
+            (vt, v.start, v.end()),
+            (ids.video_track, secs(14), secs(17))
+        );
+        let (st, s) = p.timeline.find_clip(pasted[1]).unwrap();
+        assert_eq!(
+            (st, s.start, s.subtitle_text()),
+            (ids.subtitle_track, secs(10), Some("你好"))
+        );
+        // 放不下：整次失败，什么都不改
+        let before = p.clone();
+        assert_eq!(
+            paste_clips(&mut p, &copied, secs(0)),
+            Err(EditError::Overlap)
+        );
+        assert_eq!(p, before);
+        assert_valid(&p);
+    }
+
+    #[test]
+    fn paste_into_main_track_with_magnet_inserts_by_position() {
+        let (mut p, ids) = sample_project();
+        assert!(p.settings.main_magnet);
+        let copied = copy_clips(&p, &[ids.v2]).unwrap();
+        // 播放头在 1 秒（v1 中点 2.5 之前）：插到最前面，主轨仍首尾相接
+        let pasted = paste_clips(&mut p, &copied, secs(1)).unwrap();
+        let main = p.timeline.track(ids.video_track).unwrap();
+        let order: Vec<_> = main.clips.iter().map(|c| (c.id, c.start)).collect();
+        assert_eq!(
+            order,
+            [(pasted[0], secs(0)), (ids.v1, secs(3)), (ids.v2, secs(8))]
+        );
+    }
+
+    #[test]
+    fn attributes_copy_to_other_video_clips_only() {
+        let (mut p, ids) = sample_project();
+        let look = Transform {
+            scale: 0.5,
+            x: 0.2,
+            ..Transform::default()
+        };
+        set_transform(&mut p, ids.v1, look).unwrap();
+        let warm = crate::ColorAdjust {
+            temperature: 0.3,
+            ..crate::ColorAdjust::NONE
+        };
+        set_adjust(&mut p, ids.v1, warm).unwrap();
+        let attrs = copy_attributes(&p, ids.v1).unwrap();
+        // 字幕不是视频片段：跳过
+        assert_eq!(paste_attributes(&mut p, &[ids.v2, ids.s1], &attrs), Ok(1));
+        let v2 = clip(&p, ids.v2);
+        assert_eq!((v2.transform, v2.adjust), (look, warm));
+        assert_eq!(copy_attributes(&p, ids.s1), Err(EditError::WrongTrackKind));
+    }
+
+    #[test]
+    fn speed_keeps_the_content_and_changes_the_length() {
+        let (mut p, ids) = sample_project();
+        p.settings.main_magnet = false;
+        // v2：时间轴 5–8，素材 5–8。2 倍速后只占 1.5 秒，素材还是 5–8
+        set_speed(&mut p, ids.v2, 2.0).unwrap();
+        let v2 = clip(&p, ids.v2);
+        assert_eq!((v2.start, v2.duration), (secs(5), Time::from_secs_f64(1.5)));
+        assert_eq!(
+            v2.source_at(Time::from_secs_f64(0.75)),
+            Time::from_secs_f64(6.5)
+        );
+        assert_eq!(v2.source_span(), secs(3));
+        assert_valid(&p);
+        // 变慢：v1（0–5）0.5 倍要 10 秒，撞上 v2：磁吸关着就报错
+        assert_eq!(set_speed(&mut p, ids.v1, 0.5), Err(EditError::Overlap));
+        assert_eq!(
+            set_speed(&mut p, ids.v1, 20.0),
+            Err(EditError::InvalidValue)
+        );
+        assert_eq!(
+            set_speed(&mut p, ids.s1, 2.0),
+            Err(EditError::WrongTrackKind)
+        );
+        // 切开变速后的片段：右半段的素材起点按倍数算
+        let right = split_at(&mut p, ids.v2, Time::from_secs_f64(5.5)).unwrap();
+        assert_eq!(clip(&p, right).source_in(), secs(6));
+        assert_valid(&p);
+    }
+
+    #[test]
+    fn slowing_down_on_the_magnet_main_track_pushes_later_clips() {
+        let (mut p, ids) = sample_project();
+        assert!(p.settings.main_magnet);
+        set_speed(&mut p, ids.v1, 0.5).unwrap();
+        assert_eq!(clip(&p, ids.v1).duration, secs(10));
+        assert_eq!(clip(&p, ids.v2).start, secs(10), "后面的整体往后推");
+        // 修剪按倍数换算素材：剪掉前 2 秒时间轴 = 1 秒素材
+        trim_start(&mut p, ids.v1, secs(2)).unwrap();
+        assert_eq!(clip(&p, ids.v1).source_in(), secs(1));
+        assert_valid(&p);
+    }
+
+    #[test]
+    fn keyframes_stretch_with_speed() {
+        let (mut p, ids) = sample_project();
+        p.settings.main_magnet = false;
+        add_keyframe(&mut p, ids.v2, secs(2)).unwrap();
+        set_speed(&mut p, ids.v2, 2.0).unwrap();
+        assert_eq!(clip(&p, ids.v2).animation.times(), [secs(1)]);
+    }
+
+    #[test]
+    fn pitch_switch_is_per_clip() {
+        let (mut p, ids) = sample_project();
+        assert!(clip(&p, ids.v1).keep_pitch, "默认保持音调");
+        set_keep_pitch(&mut p, ids.v1, false).unwrap();
+        assert!(!clip(&p, ids.v1).keep_pitch);
+        assert_eq!(
+            set_keep_pitch(&mut p, ids.s1, false),
+            Err(EditError::WrongTrackKind)
+        );
     }
 }

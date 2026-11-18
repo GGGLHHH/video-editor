@@ -47,7 +47,7 @@ fn main() {
         &mut p,
         Time::ZERO,
         Time::from_secs(3),
-        "第一句：反诈宣传 {测试}".into(),
+        "第一句：示例字幕 {测试}".into(),
     )
     .unwrap();
     add_subtitle(

@@ -21,12 +21,17 @@ mod generated {
             PlayPause,
             Pause,
             PlayForward,
-            JumpBack,
+            PlayBackward,
             StepForward,
             StepBack,
             GoStart,
             GoEnd,
             Split,
+            SplitAll,
+            TrimLeft,
+            TrimRight,
+            SelectLeft,
+            SelectRight,
             Delete,
             RippleDelete,
             ZoomIn,
@@ -36,6 +41,17 @@ mod generated {
             SelectAll,
             DeselectAll,
             ToggleSnapping,
+            ToggleMagnet,
+            ToggleLinkage,
+            Copy,
+            Cut,
+            Paste,
+            CopyAttributes,
+            PasteAttributes,
+            ToggleDisabled,
+            ToggleMarker,
+            NextMarker,
+            PrevMarker,
         ]
     );
 }
@@ -63,12 +79,20 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("space", PlayPause, Some(NO_INPUT)),
         KeyBinding::new("k", Pause, Some(NO_INPUT)),
         KeyBinding::new("l", PlayForward, Some(NO_INPUT)),
-        KeyBinding::new("j", JumpBack, Some(NO_INPUT)),
+        KeyBinding::new("j", PlayBackward, Some(NO_INPUT)),
         KeyBinding::new("right", StepForward, Some(NO_INPUT)),
         KeyBinding::new("left", StepBack, Some(NO_INPUT)),
         KeyBinding::new("home", GoStart, Some(NO_INPUT)),
         KeyBinding::new("end", GoEnd, Some(NO_INPUT)),
+        // 剪映（FCP X 键位）：Ctrl+B 分割、Ctrl+Shift+B 批量分割、Q / W 向左 / 右裁剪、[ / ] 向左 / 右全选；
+        // S 是我们原来的分割键，先保留
+        KeyBinding::new("ctrl-b", Split, Some(NO_INPUT)),
         KeyBinding::new("s", Split, Some(NO_INPUT)),
+        KeyBinding::new("ctrl-shift-b", SplitAll, Some(NO_INPUT)),
+        KeyBinding::new("q", TrimLeft, Some(NO_INPUT)),
+        KeyBinding::new("w", TrimRight, Some(NO_INPUT)),
+        KeyBinding::new("[", SelectLeft, Some(NO_INPUT)),
+        KeyBinding::new("]", SelectRight, Some(NO_INPUT)),
         KeyBinding::new("delete", Delete, Some(NO_INPUT)),
         KeyBinding::new("backspace", Delete, Some(NO_INPUT)),
         KeyBinding::new("shift-delete", RippleDelete, Some(NO_INPUT)),
@@ -81,5 +105,19 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-a", DeselectAll, Some(NO_INPUT)),
         // 吸附开关（S 已经是分割；Resolve 也用 N）
         KeyBinding::new("n", ToggleSnapping, Some(NO_INPUT)),
+        // 剪映：P 主轨磁吸、~ 联动（~ 和 ` 是同一个键）
+        KeyBinding::new("p", ToggleMagnet, Some(NO_INPUT)),
+        // 片段的复制粘贴只在没聚焦输入框时生效（输入框里 Ctrl+C / V 照常复制文字）
+        KeyBinding::new("ctrl-c", Copy, Some(NO_INPUT)),
+        KeyBinding::new("ctrl-x", Cut, Some(NO_INPUT)),
+        KeyBinding::new("ctrl-v", Paste, Some(NO_INPUT)),
+        KeyBinding::new("ctrl-shift-c", CopyAttributes, Some(NO_INPUT)),
+        KeyBinding::new("ctrl-shift-v", PasteAttributes, Some(NO_INPUT)),
+        KeyBinding::new("v", ToggleDisabled, Some(NO_INPUT)),
+        // 剪映：M 添加标记，Shift+M / Alt+Shift+M 下一个 / 上一个标记
+        KeyBinding::new("m", ToggleMarker, Some(NO_INPUT)),
+        KeyBinding::new("shift-m", NextMarker, Some(NO_INPUT)),
+        KeyBinding::new("alt-shift-m", PrevMarker, Some(NO_INPUT)),
+        KeyBinding::new("`", ToggleLinkage, Some(NO_INPUT)),
     ]);
 }

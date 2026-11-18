@@ -92,6 +92,8 @@ pub struct VideoDecoder {
     sent_eof: bool,
     /// 文件起始时间戳（对外时间 = 时间戳 − 它）。
     offset: Time,
+    /// 真正定位过几次（统计用）。
+    seeks: u64,
 }
 
 impl fmt::Debug for VideoDecoder {
@@ -147,7 +149,14 @@ impl VideoDecoder {
             last: None,
             sent_eof: false,
             offset,
+            seeks: 0,
         })
+    }
+
+    /// 真正定位过几次（往回跳、往前跳远都要从关键帧解起，[`Self::seek_to`] 往后一点点时接着解，不算）。
+    #[must_use]
+    pub const fn seeks(&self) -> u64 {
+        self.seeks
     }
 
     /// 源尺寸。
@@ -327,6 +336,7 @@ impl VideoDecoder {
                 t.max(Time::ZERO) + self.offset,
                 ff::Rational::new(1, ff::ffi::AV_TIME_BASE),
             );
+            self.seeks += 1;
             self.input.seek(us, ..us)?;
             self.decoder.flush();
             self.pending = None;
@@ -622,11 +632,15 @@ mod tests {
     #[test]
     fn small_forward_seek_continues_decoding() {
         let mut d = open(FULL);
+        assert_eq!(d.seeks(), 0);
         assert_frame(&d.seek_to(RATE.time_of_frame(10)).unwrap(), 10);
+        assert_eq!(d.seeks(), 1, "从头跳到第 10 帧要定位");
         assert_frame(&d.seek_to(RATE.time_of_frame(12)).unwrap(), 12);
         assert_frame(&d.seek_to(RATE.time_of_frame(12)).unwrap(), 12);
         assert_frame(&d.seek_to(RATE.time_of_frame(13)).unwrap(), 13);
+        assert_eq!(d.seeks(), 1, "往后一点点：接着解，不定位");
         assert_frame(&d.seek_to(RATE.time_of_frame(3)).unwrap(), 3);
+        assert_eq!(d.seeks(), 2, "往回跳要定位");
     }
 
     #[test]

@@ -57,6 +57,49 @@ pub struct Clip {
     /// 画面属性的关键帧动画（时间相对片段起点）；为空时不写进文件。第 4 版工程文件加的。
     #[serde(default, skip_serializing_if = "crate::Animation::is_empty")]
     pub animation: crate::Animation,
+    /// 调色（只对视频轨上的媒体片段起作用）；没调时不写进文件。第 5 版工程文件加的。
+    #[serde(default, skip_serializing_if = "crate::ColorAdjust::is_identity")]
+    pub adjust: crate::ColorAdjust,
+    /// 停用（剪映的 V）：片段留在时间轴上，但不播放、不导出。第 5 版工程文件加的。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
+    /// 进入这一段时的转场（和同一条轨上紧挨着的前一段之间）。第 5 版工程文件加的。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_in: Option<crate::Transition>,
+    /// 变速倍数（剪映「变速」）：素材用掉的长度 = 时间轴上的长度 × 倍数。第 5 版工程文件加的。
+    #[serde(default = "normal_speed", skip_serializing_if = "is_normal_speed")]
+    pub speed: f32,
+    /// 变速时保持音调（剪映「声音变调」关着）；`false` 时音调跟着快慢变。第 5 版工程文件加的。
+    #[serde(default = "keep", skip_serializing_if = "is_kept")]
+    pub keep_pitch: bool,
+}
+
+const fn keep() -> bool {
+    true
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde 的 skip_serializing_if 要引用"
+)]
+const fn is_kept(b: &bool) -> bool {
+    *b
+}
+
+/// 变速倍数的范围。
+pub const SPEED_RANGE: (f32, f32) = (0.1, 10.0);
+
+const fn normal_speed() -> f32 {
+    1.0
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde 的 skip_serializing_if 要引用"
+)]
+#[expect(clippy::float_cmp, reason = "和默认值 1.0 精确比较")]
+fn is_normal_speed(s: &f32) -> bool {
+    *s == 1.0
 }
 
 impl Clip {
@@ -64,6 +107,24 @@ impl Clip {
     #[must_use]
     pub fn transform_at(&self, offset: Time) -> Transform {
         self.animation.apply(&self.transform, offset)
+    }
+
+    /// 片段内 `offset`（时间轴时间）对应的素材时间（算上变速）。
+    #[must_use]
+    pub fn source_at(&self, offset: Time) -> Time {
+        self.source_in() + offset.scaled(f64::from(self.speed))
+    }
+
+    /// 片段用掉的素材长度（算上变速）。
+    #[must_use]
+    pub fn source_span(&self) -> Time {
+        self.duration.scaled(f64::from(self.speed))
+    }
+
+    /// 会不会播放、导出（没停用）。
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        !self.disabled
     }
 
     /// 时间轴上的终点（不含）。
@@ -164,6 +225,9 @@ impl Track {
 pub struct Timeline {
     /// 轨道，从上到下。
     pub tracks: Vec<Track>,
+    /// 标记（剪映的 M），按时间排好、不重复；没有时不写进文件。第 5 版工程文件加的。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<Time>,
 }
 
 /// 模型不变式被破坏。
@@ -230,16 +294,53 @@ pub enum InvariantError {
 }
 
 impl Timeline {
-    /// MVP 布局：视频、音频、字幕各一条。
+    /// 新工程的轨道：字幕、视频、音频各一条。界面上从上到下就是这个顺序（剪映的排法：
+    /// 文字轨在最上，视频主轨在视频轨的最下面，音频轨在最下面）。
     #[must_use]
     pub fn mvp(ids: &mut IdGen) -> Self {
+        let (s, v, a) = (ids.track(), ids.track(), ids.track());
         Self {
             tracks: vec![
-                Track::new(ids.track(), TrackKind::Video),
-                Track::new(ids.track(), TrackKind::Audio),
-                Track::new(ids.track(), TrackKind::Subtitle),
+                Track::new(s, TrackKind::Subtitle),
+                Track::new(v, TrackKind::Video),
+                Track::new(a, TrackKind::Audio),
             ],
+            markers: Vec::new(),
         }
+    }
+
+    /// `at` 之后的第一个标记。
+    #[must_use]
+    pub fn next_marker(&self, at: Time) -> Option<Time> {
+        self.markers.iter().copied().find(|m| *m > at)
+    }
+
+    /// `at` 之前的最后一个标记。
+    #[must_use]
+    pub fn prev_marker(&self, at: Time) -> Option<Time> {
+        self.markers.iter().rev().copied().find(|m| *m < at)
+    }
+
+    /// 在 `at` 打标记；那里已经有就去掉。返回现在那里有没有标记。
+    pub fn toggle_marker(&mut self, at: Time) -> bool {
+        match self.markers.binary_search(&at) {
+            Ok(i) => {
+                self.markers.remove(i);
+                false
+            }
+            Err(i) => {
+                self.markers.insert(i, at);
+                true
+            }
+        }
+    }
+
+    /// 把字幕轨挪到最前面（其余轨道的相对顺序不变），标记排好序去重。旧版工程文件里字幕轨在最后。
+    pub fn normalize_order(&mut self) {
+        self.tracks.sort_by_key(|t| t.kind != TrackKind::Subtitle);
+        // 手改过的文件里标记可能乱序或重复
+        self.markers.sort_unstable();
+        self.markers.dedup();
     }
 
     /// 视频轨，从最下层到最上层（合成顺序）。轨道列表的顺序就是界面上从上到下的顺序。
@@ -270,6 +371,24 @@ impl Timeline {
     /// 第一条该类型的轨道（可变）。
     pub fn track_of_kind_mut(&mut self, kind: TrackKind) -> Option<&mut Track> {
         self.tracks.iter_mut().find(|t| t.kind == kind)
+    }
+
+    /// 起点在 `at` 之前的片段（剪映「向左全选」）。
+    #[must_use]
+    pub fn clips_before(&self, at: Time) -> Vec<ClipId> {
+        self.tracks
+            .iter()
+            .flat_map(|t| t.clips.iter().filter(|c| c.start < at).map(|c| c.id))
+            .collect()
+    }
+
+    /// 终点在 `at` 之后的片段（剪映「向右全选」）。
+    #[must_use]
+    pub fn clips_after(&self, at: Time) -> Vec<ClipId> {
+        self.tracks
+            .iter()
+            .flat_map(|t| t.clips.iter().filter(|c| c.end() > at).map(|c| c.id))
+            .collect()
     }
 
     /// 找片段及其所在轨道。
@@ -330,7 +449,11 @@ fn check_clip(
     if !clip.gain_db.is_finite() {
         return Err(InvariantError::BadGain { clip: id });
     }
-    if !clip.transform.is_valid() || !clip.animation.is_valid() {
+    if !clip.transform.is_valid()
+        || !clip.animation.is_valid()
+        || !clip.adjust.is_valid()
+        || !(SPEED_RANGE.0..=SPEED_RANGE.1).contains(&clip.speed)
+    {
         return Err(InvariantError::BadTransform { clip: id });
     }
     if clip.fade_in < Time::ZERO
@@ -353,7 +476,7 @@ fn check_clip(
             if !fits {
                 return Err(InvariantError::WrongTrackKind { clip: id });
             }
-            if *source_in < Time::ZERO || *source_in + clip.duration > a.source_limit() {
+            if *source_in < Time::ZERO || *source_in + clip.source_span() > a.source_limit() {
                 return Err(InvariantError::OutOfSource { clip: id });
             }
             Ok(())
@@ -375,7 +498,7 @@ mod tests {
         let kinds: Vec<TrackKind> = project.timeline.tracks.iter().map(|t| t.kind).collect();
         assert_eq!(
             kinds,
-            [TrackKind::Video, TrackKind::Audio, TrackKind::Subtitle]
+            [TrackKind::Subtitle, TrackKind::Video, TrackKind::Audio]
         );
         assert!(project.timeline.track_of_kind(TrackKind::Audio).is_some());
         assert_eq!(project.timeline.duration(), Time::ZERO);
@@ -610,5 +733,61 @@ mod tests {
             project.timeline.check_invariants(&project.assets),
             Err(InvariantError::WrongTrackKind { .. })
         ));
+    }
+
+    #[test]
+    fn clips_before_and_after_a_time() {
+        let (p, ids) = sample_project();
+        let mut before = p.timeline.clips_before(Time::from_secs(4));
+        before.sort_unstable();
+        let mut want_before = vec![ids.v1, ids.a1, ids.s1];
+        want_before.sort_unstable();
+        assert_eq!(before, want_before);
+        let mut after = p.timeline.clips_after(Time::from_secs(4));
+        after.sort_unstable();
+        let mut want_after = vec![ids.v1, ids.v2, ids.a1];
+        want_after.sort_unstable();
+        assert_eq!(after, want_after);
+        assert_eq!(
+            p.timeline.clips_after(Time::from_secs(8)),
+            Vec::<ClipId>::new()
+        );
+    }
+
+    #[test]
+    fn normalize_moves_text_tracks_first_keeping_the_rest() {
+        let mut ids = IdGen::default();
+        let (v2, v1, a1, s1) = (ids.track(), ids.track(), ids.track(), ids.track());
+        let mut tl = Timeline {
+            markers: Vec::new(),
+            tracks: vec![
+                Track::new(v2, TrackKind::Video),
+                Track::new(v1, TrackKind::Video),
+                Track::new(a1, TrackKind::Audio),
+                Track::new(s1, TrackKind::Subtitle),
+            ],
+        };
+        tl.markers = vec![Time::from_secs(3), Time::from_secs(1), Time::from_secs(3)];
+        tl.normalize_order();
+        let order: Vec<_> = tl.tracks.iter().map(|t| t.id).collect();
+        assert_eq!(order, [s1, v2, v1, a1]);
+        assert_eq!(tl.markers, [Time::from_secs(1), Time::from_secs(3)]);
+    }
+
+    #[test]
+    fn markers_toggle_and_navigate() {
+        let mut tl = Timeline::mvp(&mut IdGen::default());
+        assert!(tl.toggle_marker(Time::from_secs(5)));
+        assert!(tl.toggle_marker(Time::from_secs(2)));
+        assert_eq!(
+            tl.markers,
+            [Time::from_secs(2), Time::from_secs(5)],
+            "排好序"
+        );
+        assert_eq!(tl.next_marker(Time::from_secs(2)), Some(Time::from_secs(5)));
+        assert_eq!(tl.prev_marker(Time::from_secs(2)), None);
+        assert_eq!(tl.prev_marker(Time::from_secs(9)), Some(Time::from_secs(5)));
+        assert!(!tl.toggle_marker(Time::from_secs(5)), "再按一次去掉");
+        assert_eq!(tl.markers, [Time::from_secs(2)]);
     }
 }

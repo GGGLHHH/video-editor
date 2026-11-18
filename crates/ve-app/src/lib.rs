@@ -11,13 +11,22 @@
 
 pub mod actions;
 pub mod app;
+pub mod autosave;
+mod chrome;
+mod clip_ops;
 pub mod document;
 pub mod export_ui;
 mod file_actions;
 pub mod import;
 pub mod inspector;
+mod inspector_adjust;
 mod inspector_keyframes;
+mod inspector_motion;
+mod inspector_speed;
+mod inspector_subtitles;
+mod inspector_text_style;
 pub mod inspector_transform;
+mod layout;
 pub mod media_bin;
 mod platform_cursor;
 pub mod preview;
@@ -30,6 +39,8 @@ pub mod rotate_cursor;
 mod startup;
 pub mod theme;
 pub mod timeline;
+mod topbar;
+mod transition_ui;
 pub mod workspace;
 
 pub use app::run;

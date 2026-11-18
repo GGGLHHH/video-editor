@@ -5,7 +5,8 @@
 
 use crate::preview::fit_rect;
 use crate::preview_handles::{
-    Guides, HandleHit, cursor_for, drag_move, drag_rotate, drag_scale, hit, rotate_handle,
+    Edge, Guides, HandleHit, cursor_for, drag_move, drag_rotate, drag_scale, drag_scale_edge, hit,
+    rotate_handle,
 };
 use crate::theme::palette;
 use crate::workspace::Workspace;
@@ -69,7 +70,10 @@ impl Mapping {
 /// 选中框的绘制数据（屏幕坐标），给画布闭包用。
 struct Overlay {
     corners: [(f32, f32); 4],
-    top_mid: (f32, f32),
+    /// 下边中点（连到下方的旋转手柄）。
+    bottom_mid: (f32, f32),
+    /// 四条边的中点（缩放手柄）。
+    edges: [(f32, f32); 4],
     rotate: (f32, f32),
     /// 参考线：竖线的 x、横线的 y。
     lines: (Option<f32>, Option<f32>),
@@ -138,7 +142,9 @@ impl Workspace {
         let zone = ROTATE_ZONE_PX / m.scale;
         selected
             .and_then(|layer| match hit(&layer.2, p, tolerance, offset, zone) {
-                h @ (HandleHit::Corner(_) | HandleHit::Rotate) => Some((layer, h)),
+                h @ (HandleHit::Corner(_) | HandleHit::Edge(_) | HandleHit::Rotate) => {
+                    Some((layer, h))
+                }
                 HandleHit::Body | HandleHit::None => None,
             })
             .or_else(|| {
@@ -224,6 +230,7 @@ impl Workspace {
         let rotating = (drag.mode == HandleHit::Rotate).then_some(drag.geom.center);
         let t = match drag.mode {
             HandleHit::Corner(corner) => drag_scale(&drag.start, &drag.geom, corner, p),
+            HandleHit::Edge(edge) => drag_scale_edge(&drag.start, &drag.geom, edge, p),
             // 按住 Shift：15° 一档
             HandleHit::Rotate => drag_rotate(
                 &drag.start,
@@ -310,7 +317,8 @@ impl Workspace {
         let (cw, ch) = (m.canvas.0 as f32, m.canvas.1 as f32);
         let overlay = Overlay {
             corners: geom.corners().map(|c| m.to_screen(c)),
-            top_mid: m.to_screen(geom.rotate((s.x + s.w / 2.0, s.y))),
+            bottom_mid: m.to_screen(geom.rotate((s.x + s.w / 2.0, s.y + s.h))),
+            edges: Edge::ALL.map(|e| m.to_screen(geom.rotate(e.point(s)))),
             rotate: m.to_screen(rotate_handle(&geom, ROTATE_PX / m.scale)),
             lines: (
                 lines.0.map(|x| m.to_screen((x, 0.0)).0),
@@ -339,7 +347,7 @@ fn square(c: (f32, f32), side: f32) -> Bounds<Pixels> {
     )
 }
 
-/// 画选中框：按实际角度的边框、角上小方块、上边中点连到旋转手柄的线和圆点、对齐参考线。
+/// 画选中框：按实际角度的边框、角和边中点的小方块、下边中点连到旋转手柄的线和圆点、对齐参考线。
 fn paint_overlay(o: &Overlay, window: &mut Window) {
     let at = |p: (f32, f32)| point(px(p.0), px(p.1));
     let (vx, vy, vw, vh) = o.video;
@@ -362,7 +370,7 @@ fn paint_overlay(o: &Overlay, window: &mut Window) {
     }
     frame.close();
     let mut stem = PathBuilder::stroke(px(1.0));
-    stem.move_to(at(o.top_mid));
+    stem.move_to(at(o.bottom_mid));
     stem.line_to(at(o.rotate));
     for path in [frame, stem] {
         if let Ok(path) = path.build() {
@@ -372,6 +380,11 @@ fn paint_overlay(o: &Overlay, window: &mut Window) {
     for c in o.corners {
         window.paint_quad(fill(square(c, HANDLE_PX), o.color));
         window.paint_quad(fill(square(c, HANDLE_PX - 2.0), o.handle_bg));
+    }
+    // 边中点：小一号的方块
+    for e in o.edges {
+        window.paint_quad(fill(square(e, HANDLE_PX - 2.0), o.color));
+        window.paint_quad(fill(square(e, HANDLE_PX - 4.0), o.handle_bg));
     }
     window.paint_quad(fill(square(o.rotate, HANDLE_PX + 2.0), o.color).corner_radii(px(HANDLE_PX)));
     window.paint_quad(

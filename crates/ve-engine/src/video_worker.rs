@@ -14,11 +14,46 @@ use ve_render::{Compositor, FramePixels, Layer};
 /// 播放时最多提前排几帧。
 const AHEAD: usize = 3;
 
+/// 倒放时每段往回顺着解几帧（按取帧的间隔算）。
+const REVERSE_BLOCK: i64 = 24;
+
+/// 倒放时取帧的间隔：时钟每秒走过的帧数超过 60 时隔几帧取一帧。
+fn reverse_stride(play_rate: f64, rate: ve_core::FrameRate) -> i64 {
+    let per_second = play_rate.abs() * rate.as_f64();
+    #[expect(clippy::cast_possible_truncation, reason = "倍数最多 8、帧率几十")]
+    let stride = (per_second / 60.0).ceil() as i64;
+    stride.max(1)
+}
+
+/// 倒放时往下提前解码的进度（工程帧号）。
+#[derive(Debug, Clone, Copy)]
+struct ReverseAhead {
+    /// 从这帧往上（到当前）都已经解好放进缓存了。
+    low: i64,
+    /// 正在解的一段 `[from, to)`，下一个要解的是 `next`。
+    from: i64,
+    next: i64,
+    to: i64,
+}
+
+impl ReverseAhead {
+    /// 刚解出 `frame`：从它下面开始一段段往下解。
+    const fn below(frame: i64) -> Self {
+        Self {
+            low: frame,
+            from: frame,
+            next: frame,
+            to: frame,
+        }
+    }
+}
+
 struct Worker<'a> {
     shared: &'a Shared,
     /// 解码器及其打开的文件（素材编号可能被重复使用，要连路径一起比对）。
     /// 按「轨道 + 素材」各一个解码器：同一素材在两条轨上同时出现时互不抢着定位。
-    decoders: HashMap<(TrackId, AssetId), (PathBuf, VideoDecoder)>,
+    /// 解码器按（轨道，素材，交替位）分：转场时同一条轨上前后两段同时解码，各用各的。
+    decoders: HashMap<(TrackId, AssetId, u8), (PathBuf, VideoDecoder)>,
     /// 打不开的素材及其路径。
     failed: HashMap<AssetId, PathBuf>,
     /// 帧缓存里每个素材对应的路径。
@@ -27,6 +62,8 @@ struct Worker<'a> {
     generation: Option<u64>,
     revision: Option<u64>,
     next_time: Option<Time>,
+    /// 倒放时往下提前解码到哪了。
+    reverse: Option<ReverseAhead>,
     /// 合成器（第一次用到时创建）；创建失败后退回只显示最上层。
     compositor: Option<Compositor>,
     compositor_failed: bool,
@@ -42,6 +79,7 @@ pub(crate) fn run(shared: &Shared) {
         generation: None,
         revision: None,
         next_time: None,
+        reverse: None,
         compositor: None,
         compositor_failed: false,
     };
@@ -52,7 +90,7 @@ pub(crate) fn run(shared: &Shared) {
 
 impl Worker<'_> {
     fn step(&mut self) {
-        let (project, playing, generation, seek, revision) = {
+        let (project, playing, generation, seek, revision, play_rate) = {
             let mut c = self.shared.control();
             (
                 Arc::clone(&c.project),
@@ -60,6 +98,7 @@ impl Worker<'_> {
                 c.generation,
                 c.seek.take(),
                 c.revision,
+                c.rate,
             )
         };
         if self.generation != Some(generation) || self.revision != Some(revision) {
@@ -67,6 +106,7 @@ impl Worker<'_> {
             self.revision = Some(revision);
             self.prune(&project);
             self.next_time = None;
+            self.reverse = None;
             if playing {
                 lock(&self.shared.frames).items.clear();
             }
@@ -94,7 +134,101 @@ impl Worker<'_> {
             }
             return;
         }
-        self.play_step(&project, generation);
+        if play_rate < 0.0 {
+            self.reverse_step(&project, generation);
+        } else {
+            self.play_step(&project, generation);
+        }
+    }
+
+    /// 倒放（J）。解码器只能往后解，往回跳要从关键帧解起：每帧都跳又慢又卡。所以先把
+    /// 时钟所在那帧直接解出来，再在它下面一段一段地「顺着」解（每段只定位一次），放进帧缓存，
+    /// 时钟退到哪帧就从缓存里取。倍数高时隔几帧取一帧（屏幕也就刷新那么快）。倒到开头自动暂停。
+    fn reverse_step(&mut self, project: &Project, generation: u64) {
+        let rate = project.settings.frame_rate;
+        let fd = rate.frame_duration();
+        let now = self.shared.clock.position();
+        if now <= Time::ZERO {
+            let mut c = self.shared.control();
+            if c.playing && c.generation == generation {
+                self.shared.pause_at(&mut c, Time::ZERO);
+                drop(c);
+                let _ = self.shared.events.try_send(EngineEvent::Ended);
+            }
+            return;
+        }
+        let stride = reverse_stride(self.shared.clock.rate(), rate);
+        let last = rate.frame_of((project.timeline.duration() - fd).max(Time::ZERO));
+        let here = rate.frame_of(now).min(last);
+        let here = here - here.rem_euclid(stride);
+        let current = rate.time_of_frame(here);
+        if self.next_time != Some(current) {
+            // 正在往上解、还没解到这帧：等它解到，不另外往回跳
+            let coming = self
+                .reverse
+                .as_ref()
+                .is_some_and(|r| (r.next..r.to).contains(&here));
+            if !coming || self.is_cached(project, current) {
+                if !self.is_cached(project, current) {
+                    // 缓存里没有（刚开始倒放，或者解码跟不上被时钟甩下了）：直接解这一帧，
+                    // 从这里往下重新一段段解
+                    self.reverse = Some(ReverseAhead::below(here));
+                }
+                let frame = self.render(project, current);
+                if self.shared.control().generation != generation {
+                    return;
+                }
+                let mut q = lock(&self.shared.frames);
+                q.items.clear();
+                q.push(current, frame);
+                drop(q);
+                self.next_time = Some(current);
+                return;
+            }
+        }
+        let Some(ahead) = self.reverse.as_mut() else {
+            self.reverse = Some(ReverseAhead::below(here));
+            return;
+        };
+        if ahead.next >= ahead.to {
+            // 这段解完了；剩下的不到一段时接着解下面一段
+            ahead.low = ahead.low.min(ahead.from);
+            if ahead.low > 0 && here - ahead.low < REVERSE_BLOCK * stride {
+                ahead.to = ahead.low;
+                ahead.from = (ahead.low - REVERSE_BLOCK * stride).max(0);
+                ahead.next = ahead.from;
+            } else {
+                let c = self.shared.control();
+                if c.generation == generation {
+                    self.shared.wait(c, Duration::from_millis(4));
+                } else {
+                    drop(c);
+                }
+                return;
+            }
+        }
+        let t = rate.time_of_frame(ahead.next);
+        ahead.next += stride;
+        let layers = resolve_layers(project, t);
+        drop(self.layer_frames(project, &layers));
+    }
+
+    /// 时间轴时刻 `t` 的各层画面是不是都已经在缓存里。
+    fn is_cached(&self, project: &Project, t: Time) -> bool {
+        resolve_layers(project, t).iter().all(|l| {
+            let Some(asset) = project.assets.get(&l.asset) else {
+                return true;
+            };
+            let Some(info) = asset.video else { return true };
+            let index = if info.still {
+                0
+            } else {
+                info.frame_rate.frame_of(l.source_time)
+            };
+            self.failed.get(&l.asset).is_some_and(|p| *p == asset.path)
+                || (self.cached.get(&l.asset).is_some_and(|p| *p == asset.path)
+                    && self.cache.contains((l.asset, index)))
+        })
     }
 
     fn play_step(&mut self, project: &Project, generation: u64) {
@@ -146,7 +280,7 @@ impl Worker<'_> {
     fn prune(&mut self, project: &Project) {
         let current =
             |id: &AssetId, path: &Path| project.assets.get(id).is_some_and(|a| a.path == path);
-        self.decoders.retain(|(track, id), (path, _)| {
+        self.decoders.retain(|(track, id, _), (path, _)| {
             current(id, path) && project.timeline.track(*track).is_some()
         });
         self.failed.retain(|id, path| current(id, path));
@@ -206,6 +340,7 @@ impl Worker<'_> {
                     },
                     geometry: ve_core::layer_geometry(canvas, source, &l.transform),
                     opacity: l.transform.opacity,
+                    adjust: l.adjust,
                 })
             })
             .collect();
@@ -257,7 +392,7 @@ impl Worker<'_> {
                 slots.push(i);
                 continue;
             }
-            let key = (l.track, l.asset);
+            let key = (l.track, l.asset, l.lane);
             if self
                 .decoders
                 .get(&key)
@@ -287,11 +422,15 @@ impl Worker<'_> {
                     index,
                     time: l.source_time,
                     path,
+                    seeks_before: decoder.seeks(),
                     decoder,
                 });
             }
         }
         for (job, result) in decode_all(jobs) {
+            self.shared
+                .seeks
+                .fetch_add(job.decoder.seeks() - job.seeks_before, Ordering::Relaxed);
             match result {
                 Ok(f) => {
                     self.shared.decoded.fetch_add(1, Ordering::Relaxed);
@@ -317,11 +456,13 @@ impl Worker<'_> {
 /// 一层的解码任务：解码器暂时从表里拿出来，解完再放回去。
 struct Job {
     slot: usize,
-    key: (TrackId, AssetId),
+    key: (TrackId, AssetId, u8),
     index: i64,
     time: Time,
     path: PathBuf,
     decoder: VideoDecoder,
+    /// 解码前解码器定位过几次（解完相减就是这次定位了没有）。
+    seeks_before: u64,
 }
 
 /// 解码各层；多于一层时每层一个线程并行。

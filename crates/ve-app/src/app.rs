@@ -86,7 +86,13 @@ pub fn run() {
             };
             let opened = gpui_kit::open_window(window_options(cx), cx, |window, cx| {
                 let view = workspace::build(engine, window, cx);
-                view.update(cx, |ws, cx| ws.startup(&args, window, cx));
+                view.update(cx, |ws, cx| {
+                    ws.startup(&args, window, cx);
+                    // 性能测试时不自动保存（别往草稿目录里写东西）
+                    if args.bench_seconds.is_none() {
+                        ws.enable_autosave(crate::autosave::default_dir(), window, cx);
+                    }
+                });
                 view
             });
             if let Err(e) = opened {

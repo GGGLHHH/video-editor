@@ -61,6 +61,7 @@ impl Document {
     }
 
     /// 执行一次编辑：成功且确有变化才记撤销步骤；失败时什么都不变。
+    /// 编辑后按工程设置做主轨磁吸和联动（见 [`ve_core::magnet`]）。
     ///
     /// # Errors
     /// 编辑操作本身的错误。
@@ -69,7 +70,10 @@ impl Document {
         f: impl FnOnce(&mut Project) -> Result<T, EditError>,
     ) -> Result<T, EditError> {
         let before = self.project.clone();
+        let layout = ve_core::magnet::Layout::of(&self.project.timeline);
         let out = f(&mut self.project)?;
+        // 主轨磁吸 / 联动：每次编辑后收尾（开关在工程设置里）
+        ve_core::magnet::settle(&mut self.project, &layout);
         if self.project != before {
             self.history.record(&before);
             self.changed();
@@ -259,14 +263,19 @@ impl Document {
         self.dirty = false;
     }
 
+    /// 工程名：文件名（不带扩展名），没保存过的叫「未命名」。
+    #[must_use]
+    pub fn name(&self) -> String {
+        self.path
+            .as_deref()
+            .and_then(Path::file_stem)
+            .map_or_else(|| "未命名".to_owned(), |s| s.to_string_lossy().into_owned())
+    }
+
     /// 窗口标题：工程名，未保存时加 ` *`。
     #[must_use]
     pub fn title(&self) -> String {
-        let name = self
-            .path
-            .as_deref()
-            .and_then(Path::file_stem)
-            .map_or_else(|| "未命名".to_owned(), |s| s.to_string_lossy().into_owned());
+        let name = self.name();
         if self.dirty {
             format!("{name} *")
         } else {
@@ -282,8 +291,11 @@ mod tests {
     use ve_core::testing::{sample_project, video_info};
     use ve_core::{Asset, AssetId, FrameRate, Time, VideoInfo};
 
+    /// 撤销、选择等基本行为在磁吸、联动都关着时测。
     fn doc() -> (Document, ve_core::testing::SampleIds) {
-        let (p, ids) = sample_project();
+        let (mut p, ids) = sample_project();
+        p.settings.main_magnet = false;
+        p.settings.linkage = false;
         (Document::from_project(p, None), ids)
     }
 
@@ -304,13 +316,14 @@ mod tests {
         // 没有起点：只选中点到的
         d.select_range(ids.v2);
         assert_eq!(d.selection(), [ids.v2]);
-        // 起点 s1（字幕轨 1–3 秒）到 a1（音频轨 0–8 秒）：音频、字幕两条轨上 0–8 秒内的
+        // 轨道从上到下是 字幕、视频、音频。起点 s1（字幕轨 1–3 秒）到 a1（音频轨 0–8 秒）：
+        // 三条轨上 0–8 秒内的全选上
         d.select(ids.s1, false);
         d.select_range(ids.a1);
-        assert_eq!(sorted(&d), set(vec![ids.a1, ids.s1]));
-        // 起点不变：再 Shift 点 v1，范围改成 视频—字幕 三条轨、0–5 秒
+        assert_eq!(sorted(&d), set(vec![ids.v1, ids.v2, ids.a1, ids.s1]));
+        // 起点不变：再 Shift 点 v1，范围改成 字幕—视频 两条轨、0–5 秒
         d.select_range(ids.v1);
-        assert_eq!(sorted(&d), set(vec![ids.v1, ids.a1, ids.s1]));
+        assert_eq!(sorted(&d), set(vec![ids.v1, ids.s1]));
         // 同一轨：v1 到 v2
         d.select(ids.v1, false);
         d.select_range(ids.v2);
@@ -323,9 +336,16 @@ mod tests {
         d.select(ids.v1, false);
         d.select(ids.a1, true);
         assert!(d.is_selected(ids.v1) && d.is_selected(ids.a1));
-        // 起点跟着最后一次点击走
+        // 起点跟着最后一次点击走：a1（音频，最下）到 s1（字幕，最上），三条轨 0–8 秒
         d.select_range(ids.s1);
-        assert_eq!(sorted(&d), set(vec![ids.a1, ids.s1]));
+        assert_eq!(sorted(&d), set(vec![ids.v1, ids.v2, ids.a1, ids.s1]));
+        d.select(ids.v2, false);
+        d.select_range(ids.a1);
+        assert_eq!(
+            sorted(&d),
+            set(vec![ids.v1, ids.v2, ids.a1]),
+            "视频—音频两条轨"
+        );
         d.set_selection(vec![ids.v2, ids.v2, ClipId(999)]);
         assert_eq!(d.selection(), [ids.v2], "去重、去掉不存在的");
     }
@@ -497,5 +517,18 @@ mod tests {
         assert!(!d.undo());
         assert!(!d.redo());
         assert!(!d.can_redo());
+    }
+
+    #[test]
+    fn edits_settle_main_magnet_and_linkage() {
+        let (p, ids) = sample_project();
+        let mut d = Document::from_project(p, None);
+        // 删掉主轨第一段：后面的补上来，一步撤销能回去
+        d.edit(|p| delete_clips(p, &[ids.v1])).unwrap();
+        let v2 = d.project.timeline.find_clip(ids.v2).unwrap().1.start;
+        assert_eq!(v2, Time::ZERO);
+        assert!(d.undo());
+        let v2 = d.project.timeline.find_clip(ids.v2).unwrap().1.start;
+        assert_eq!(v2, Time::from_secs(5));
     }
 }

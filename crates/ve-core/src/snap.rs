@@ -2,10 +2,11 @@
 
 use crate::{ClipId, Time, Timeline};
 
-/// 吸附目标：0、播放头、所有片段（除 `exclude`）的起点和终点，升序去重。
+/// 吸附目标：0、播放头、标记、所有片段（除 `exclude`）的起点和终点，升序去重。
 #[must_use]
 pub fn snap_targets(timeline: &Timeline, playhead: Time, exclude: &[ClipId]) -> Vec<Time> {
     let mut targets = vec![Time::ZERO, playhead];
+    targets.extend(&timeline.markers);
     for track in &timeline.tracks {
         for clip in track.clips.iter().filter(|c| !exclude.contains(&c.id)) {
             targets.push(clip.start);
@@ -62,5 +63,12 @@ mod tests {
         assert_eq!(snap(Time(160), &targets, Time(50)), Some(Time(200)));
         assert_eq!(snap(Time(150), &targets, Time(10)), None);
         assert_eq!(snap(Time(5), &[], Time(10)), None);
+    }
+
+    #[test]
+    fn markers_are_snap_targets() {
+        let (mut p, _) = sample_project();
+        p.timeline.toggle_marker(Time::from_secs(12));
+        assert!(snap_targets(&p.timeline, Time::ZERO, &[]).contains(&Time::from_secs(12)));
     }
 }

@@ -3,49 +3,8 @@
 use std::fmt::Write as _;
 use ve_core::{Project, Time, TrackKind};
 
-/// 字幕样式（预览和导出共用）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct SubtitleStyle {
-    /// 字体。
-    pub font: String,
-    /// 字号 = 画面高 × 该比例。
-    pub size_ratio: f32,
-    /// 描边宽度（以 1080 高为基准的像素）。
-    pub outline: f32,
-    /// 底边距 = 画面高 × 该比例。
-    pub margin_ratio: f32,
-}
-
-impl Default for SubtitleStyle {
-    fn default() -> Self {
-        Self {
-            font: "Microsoft YaHei".into(),
-            size_ratio: 0.055,
-            outline: 2.5,
-            margin_ratio: 0.05,
-        }
-    }
-}
-
-impl SubtitleStyle {
-    /// 在高 `height` 像素的画面上的字号。
-    #[must_use]
-    pub fn font_px(&self, height: u32) -> f64 {
-        (f64::from(height) * f64::from(self.size_ratio)).round()
-    }
-
-    /// 在高 `height` 像素的画面上的描边宽度。
-    #[must_use]
-    pub fn outline_px(&self, height: u32) -> f64 {
-        f64::from(self.outline) * f64::from(height) / 1080.0
-    }
-
-    /// 在高 `height` 像素的画面上的底边距。
-    #[must_use]
-    pub fn margin_px(&self, height: u32) -> f64 {
-        (f64::from(height) * f64::from(self.margin_ratio)).round()
-    }
-}
+/// 字幕样式（预览和导出共用），存在工程里。
+pub use ve_core::SubtitleStyle;
 
 /// 工程里是否有字幕。
 #[must_use]
@@ -54,7 +13,7 @@ pub fn has_subtitles(project: &Project) -> bool {
         .timeline
         .tracks
         .iter()
-        .any(|t| t.kind == TrackKind::Subtitle && !t.clips.is_empty())
+        .any(|t| t.kind == TrackKind::Subtitle && t.clips.iter().any(|c| c.enabled()))
 }
 
 fn ass_time(out: &mut String, t: Time) {
@@ -80,7 +39,8 @@ fn escape(text: &str) -> String {
 
 /// 生成 ASS 字幕文件内容。
 #[must_use]
-pub fn write_ass(project: &Project, style: &SubtitleStyle) -> String {
+pub fn write_ass(project: &Project) -> String {
+    let style = &project.subtitle_style;
     let (w, h) = (project.settings.width, project.settings.height);
     let mut out = String::new();
     let _ = write!(
@@ -89,10 +49,13 @@ pub fn write_ass(project: &Project, style: &SubtitleStyle) -> String {
          [V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, \
          Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, \
          Alignment, MarginL, MarginR, MarginV, Encoding\n\
-         Style: Default,{},{},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,{:.1},0,2,20,20,{},1\n\n\
+         Style: Default,{},{},{},&H000000FF,{},&H64000000,{},0,0,0,100,100,0,0,1,{:.1},0,2,20,20,{},1\n\n\
          [Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
         style.font,
         style.font_px(h),
+        SubtitleStyle::ass_color(style.color),
+        SubtitleStyle::ass_color(style.outline_color),
+        if style.bold { -1 } else { 0 },
         style.outline_px(h),
         style.margin_px(h),
     );
@@ -102,6 +65,7 @@ pub fn write_ass(project: &Project, style: &SubtitleStyle) -> String {
         .iter()
         .filter(|t| t.kind == TrackKind::Subtitle)
         .flat_map(|t| t.clips.iter())
+        .filter(|c| c.enabled())
         .filter_map(|c| c.subtitle_text().map(|text| (c.start, c.end(), text)))
         .collect();
     clips.sort_by_key(|c| c.0);
@@ -124,7 +88,7 @@ mod tests {
     #[test]
     fn ass_header_and_dialogue() {
         let (p, _) = sample_project();
-        let ass = write_ass(&p, &SubtitleStyle::default());
+        let ass = write_ass(&p);
         assert!(ass.starts_with("[Script Info]\n"));
         assert!(ass.contains("PlayResX: 1920\nPlayResY: 1080\n"));
         // 1080 × 0.055 ≈ 59
@@ -136,10 +100,33 @@ mod tests {
     }
 
     #[test]
+    fn ass_uses_the_project_style() {
+        let (mut p, _) = sample_project();
+        p.subtitle_style.color = 0xFF_D700;
+        p.subtitle_style.bold = true;
+        p.subtitle_style.font = "SimHei".into();
+        let ass = write_ass(&p);
+        assert!(
+            ass.contains(
+                "Style: Default,SimHei,59,&H0000D7FF,&H000000FF,&H00000000,&H64000000,-1,"
+            ),
+            "{ass}"
+        );
+    }
+
+    #[test]
+    fn disabled_subtitles_are_not_burned_in() {
+        let (mut p, ids) = sample_project();
+        ve_core::edit::set_disabled(&mut p, &[ids.s1], true).unwrap();
+        assert!(!has_subtitles(&p));
+        assert!(!write_ass(&p).contains("你好"));
+    }
+
+    #[test]
     fn ass_escapes_special_chars() {
         let (mut p, ids) = sample_project();
         set_subtitle_text(&mut p, ids.s1, "a{b}c\\d,e\n第二行".into()).unwrap();
-        let ass = write_ass(&p, &SubtitleStyle::default());
+        let ass = write_ass(&p);
         assert!(ass.contains(",,a\\{b\\}c＼d,e\\N第二行\n"), "{ass}");
     }
 
@@ -153,7 +140,7 @@ mod tests {
             "late".into(),
         )
         .unwrap();
-        let ass = write_ass(&p, &SubtitleStyle::default());
+        let ass = write_ass(&p);
         let late = ass.find("late").unwrap();
         let early = ass.find("你好").unwrap();
         assert!(early < late);

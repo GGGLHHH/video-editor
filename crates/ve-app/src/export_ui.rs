@@ -1,6 +1,8 @@
-//! 导出界面：选输出文件 → 选项对话框（分辨率 / 码率 / 编码器）→ 后台导出，工具栏显示进度和取消。
+//! 导出界面（剪映式）：选输出文件 → 导出对话框（分辨率 / 帧率 / 码率 / 编码，高级里选编码器，
+//! 底部实时显示时长和估计大小）→ 后台导出，顶栏显示进度和取消。
 
 use crate::actions as act;
+use crate::chrome;
 use crate::workspace::Workspace;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::ActiveTheme as _;
@@ -10,13 +12,15 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
-    AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, SharedString, Styled as _, Window, div,
+    AnyElement, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window,
+    div, px,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use ve_export::{Encoder, ExportSettings};
+use ve_core::{FrameRate, ProjectSettings, Time, format_timecode};
+use ve_export::{Codec, Encoder, ExportSettings, estimated_bytes, recommended_kbps};
 
 /// 进行中的导出。
 #[derive(Debug)]
@@ -29,142 +33,375 @@ pub struct ExportProgress {
     pub path: PathBuf,
 }
 
-/// 输出分辨率选项。
+/// 输出分辨率选项（按短边，和剪映一样：竖屏的 720P 是 720×1280）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolution {
     /// 跟工程一样。
     Project,
-    /// 高 1080。
-    P1080,
-    /// 高 720。
+    /// 短边 720。
     P720,
+    /// 短边 1080。
+    P1080,
+    /// 短边 1440（2K）。
+    P1440,
+    /// 短边 2160（4K）。
+    P2160,
 }
 
-/// 按目标高度等比缩放，宽取偶数。
+/// 按目标短边等比缩放，宽高取偶数。
 #[must_use]
 pub fn scaled_size(width: u32, height: u32, res: Resolution) -> (u32, u32) {
-    let target = match res {
+    let target: u32 = match res {
         Resolution::Project => return (width, height),
-        Resolution::P1080 => 1080,
         Resolution::P720 => 720,
+        Resolution::P1080 => 1080,
+        Resolution::P1440 => 1440,
+        Resolution::P2160 => 2160,
     };
-    let w = u32::try_from(u64::from(width) * u64::from(target) / u64::from(height.max(1)))
-        .unwrap_or(u32::MAX);
-    ((w & !1).max(2), target)
+    let short = u64::from(width.min(height).max(1));
+    let scale = |v: u32| {
+        let s = u32::try_from(u64::from(v) * u64::from(target) / short).unwrap_or(u32::MAX);
+        (s & !1).max(2)
+    };
+    (scale(width), scale(height))
+}
+
+/// 码率档位（剪映：更低 / 推荐 / 更高 / 自定义）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bitrate {
+    /// 推荐的一半。
+    Lower,
+    /// 按分辨率和帧率推荐。
+    Recommended,
+    /// 推荐的两倍。
+    Higher,
+    /// 自己填。
+    Custom,
+}
+
+/// 导出对话框里选的东西（纯数据，方便测试）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportChoices {
+    /// 分辨率。
+    pub resolution: Resolution,
+    /// 帧率；`None` 跟工程一样。
+    pub frame_rate: Option<FrameRate>,
+    /// 码率档位。
+    pub bitrate: Bitrate,
+    /// 自定义码率（kbps）。
+    pub custom_kbps: u32,
+    /// 编码格式。
+    pub codec: Codec,
+    /// 编码器。
+    pub encoder: Encoder,
+}
+
+impl Default for ExportChoices {
+    fn default() -> Self {
+        Self {
+            resolution: Resolution::Project,
+            frame_rate: None,
+            bitrate: Bitrate::Recommended,
+            custom_kbps: 12_000,
+            codec: Codec::H264,
+            encoder: Encoder::Nvenc,
+        }
+    }
+}
+
+impl ExportChoices {
+    /// 按工程设置换算成导出设置。
+    #[must_use]
+    pub fn settings(&self, path: PathBuf, project: &ProjectSettings) -> ExportSettings {
+        let (width, height) = scaled_size(project.width, project.height, self.resolution);
+        let frame_rate = self.frame_rate.unwrap_or(project.frame_rate);
+        let recommended = recommended_kbps(width, height, frame_rate, self.codec);
+        let video_bitrate_kbps = match self.bitrate {
+            Bitrate::Lower => (recommended / 2).max(500),
+            Bitrate::Recommended => recommended,
+            Bitrate::Higher => recommended.saturating_mul(2),
+            Bitrate::Custom => self.custom_kbps.clamp(100, 500_000),
+        };
+        ExportSettings {
+            path,
+            width,
+            height,
+            frame_rate,
+            video_bitrate_kbps,
+            encoder: self.encoder,
+            codec: self.codec,
+            render: ve_export::RenderConfig::default(),
+        }
+    }
+}
+
+/// 估计大小的写法：「约 12.3 MB」。
+#[must_use]
+pub fn size_text(bytes: u64) -> String {
+    #[expect(clippy::cast_precision_loss, reason = "只是给人看的估计值")]
+    let mb = bytes as f64 / 1_000_000.0;
+    if mb >= 1000.0 {
+        format!("约 {:.2} GB", mb / 1000.0)
+    } else {
+        format!("约 {mb:.1} MB")
+    }
 }
 
 /// 导出选项表单。
 #[derive(Debug)]
 pub struct ExportForm {
     path: PathBuf,
-    resolution: Resolution,
-    encoder: Encoder,
-    bitrate: Entity<InputState>,
+    project: ProjectSettings,
+    duration: Time,
+    choices: ExportChoices,
+    custom: Entity<InputState>,
+    advanced: bool,
 }
 
 impl ExportForm {
-    fn new(path: PathBuf, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
-        let bitrate = cx.new(|cx| InputState::new(window, cx).default_value("12000"));
+    fn new(
+        path: PathBuf,
+        project: ProjectSettings,
+        duration: Time,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        let custom = cx.new(|cx| InputState::new(window, cx).default_value("12000"));
         Self {
             path,
-            resolution: Resolution::Project,
-            encoder: Encoder::Nvenc,
-            bitrate,
+            project,
+            duration,
+            choices: ExportChoices::default(),
+            custom,
+            advanced: false,
         }
     }
 
-    fn settings(&self, project: &ve_core::Project, cx: &gpui_kit::App) -> ExportSettings {
-        let s = project.settings;
-        let (width, height) = scaled_size(s.width, s.height, self.resolution);
-        let kbps = self
-            .bitrate
-            .read(cx)
-            .value()
-            .trim()
-            .parse()
-            .unwrap_or(12_000);
-        ExportSettings {
-            path: self.path.clone(),
-            width,
-            height,
-            frame_rate: s.frame_rate,
-            video_bitrate_kbps: kbps,
-            encoder: self.encoder,
-            render: ve_export::RenderConfig::default(),
+    fn settings(&self, cx: &gpui_kit::App) -> ExportSettings {
+        let mut c = self.choices;
+        if let Ok(v) = self.custom.read(cx).value().trim().parse() {
+            c.custom_kbps = v;
         }
+        c.settings(self.path.clone(), &self.project)
+    }
+
+    /// 一个选项小块：点了就改 `choices`。
+    fn pick(
+        id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        on: bool,
+        change: impl Fn(&mut ExportChoices) + 'static,
+        cx: &Context<'_, Self>,
+    ) -> AnyElement {
+        let id: SharedString = id.into();
+        chrome::chip(id, label.into(), on, cx)
+            .on_click(cx.listener(move |f, _, _, cx| {
+                change(&mut f.choices);
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+}
+
+/// 一行：左边名字，右边一排选项。
+fn row(label: &'static str, items: Vec<AnyElement>, cx: &gpui_kit::App) -> impl IntoElement {
+    h_flex()
+        .gap_2()
+        .items_start()
+        .child(
+            div()
+                .w(px(72.))
+                .flex_none()
+                .pt_1()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(label),
+        )
+        .child(h_flex().flex_1().flex_wrap().gap_1().children(items))
+}
+
+impl ExportForm {
+    /// 各行的选项：（分辨率，帧率，码率，编码，编码器）。
+    #[expect(clippy::type_complexity, reason = "五组选项一起算，拆开反而难读")]
+    fn option_items(
+        &self,
+        cx: &Context<'_, Self>,
+    ) -> (
+        Vec<AnyElement>,
+        Vec<AnyElement>,
+        Vec<AnyElement>,
+        Vec<AnyElement>,
+        Vec<AnyElement>,
+    ) {
+        let c = self.choices;
+        let res_items = [
+            ("res-project", "原始", Resolution::Project),
+            ("res-720", "720P", Resolution::P720),
+            ("res-1080", "1080P", Resolution::P1080),
+            ("res-1440", "2K", Resolution::P1440),
+            ("res-2160", "4K", Resolution::P2160),
+        ]
+        .map(|(id, label, r)| {
+            Self::pick(
+                id,
+                label,
+                c.resolution == r,
+                move |ch| ch.resolution = r,
+                cx,
+            )
+        })
+        .into();
+        let fps_items = std::iter::once(Self::pick(
+            "fps-project",
+            "同工程",
+            c.frame_rate.is_none(),
+            |ch| ch.frame_rate = None,
+            cx,
+        ))
+        .chain([24, 25, 30, 50, 60].map(|n| {
+            let r = FrameRate::new(n, 1);
+            Self::pick(
+                format!("fps-{n}"),
+                n.to_string(),
+                c.frame_rate == Some(r),
+                move |ch| {
+                    ch.frame_rate = Some(r);
+                },
+                cx,
+            )
+        }))
+        .collect();
+        let br_items = [
+            ("br-low", "更低", Bitrate::Lower),
+            ("br-rec", "推荐", Bitrate::Recommended),
+            ("br-high", "更高", Bitrate::Higher),
+            ("br-custom", "自定义", Bitrate::Custom),
+        ]
+        .map(|(id, label, b)| Self::pick(id, label, c.bitrate == b, move |ch| ch.bitrate = b, cx))
+        .into();
+        let codec_items = [
+            ("codec-h264", "H.264（最通用）", Codec::H264),
+            ("codec-hevc", "HEVC（更省空间）", Codec::Hevc),
+        ]
+        .map(|(id, label, k)| Self::pick(id, label, c.codec == k, move |ch| ch.codec = k, cx))
+        .into();
+        let enc_items = [
+            ("enc-nvenc", "显卡（NVENC）", Encoder::Nvenc),
+            ("enc-x264", "CPU", Encoder::X264),
+        ]
+        .map(|(id, label, e)| Self::pick(id, label, c.encoder == e, move |ch| ch.encoder = e, cx))
+        .into();
+        (res_items, fps_items, br_items, codec_items, enc_items)
+    }
+
+    /// 底部：时长和估计大小。
+    fn render_estimate(
+        &self,
+        preview: &ExportSettings,
+        cx: &Context<'_, Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .id("export-estimate")
+            .test_support()
+            .pt_2()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .gap_2()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(SharedString::from(format!(
+                "时长 {}",
+                format_timecode(self.duration, preview.frame_rate)
+            )))
+            .child("｜")
+            .child(SharedString::from(format!(
+                "大小 {}（估计，码率 {} kbps）",
+                size_text(estimated_bytes(preview.video_bitrate_kbps, self.duration)),
+                preview.video_bitrate_kbps
+            )))
     }
 }
 
 impl Render for ExportForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        let choice = |id: &'static str, label: &'static str, on: bool| {
-            let b = Button::new(id).compact().label(label);
-            if on { b.primary() } else { b.ghost() }
-        };
-        let res = self.resolution;
-        let enc = self.encoder;
+        let c = self.choices;
+        let preview = self.settings(cx);
+        let (res_items, fps_items, br_items, codec_items, enc_items) = self.option_items(cx);
+        let muted = cx.theme().muted_foreground;
+        let file_name = self
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         v_flex()
             .gap_3()
             .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(SharedString::from(self.path.display().to_string())),
-            )
-            .child(
-                h_flex()
-                    .gap_1()
-                    .child(div().w_20().text_sm().child("分辨率"))
+                v_flex()
+                    .gap_0p5()
+                    .child(div().text_sm().child(SharedString::from(file_name)))
                     .child(
-                        choice("res-project", "同工程", res == Resolution::Project).on_click(
-                            cx.listener(|f, _, _, cx| {
-                                f.resolution = Resolution::Project;
-                                cx.notify();
-                            }),
-                        ),
-                    )
-                    .child(
-                        choice("res-1080", "1080p", res == Resolution::P1080).on_click(
-                            cx.listener(|f, _, _, cx| {
-                                f.resolution = Resolution::P1080;
-                                cx.notify();
-                            }),
-                        ),
-                    )
-                    .child(choice("res-720", "720p", res == Resolution::P720).on_click(
-                        cx.listener(|f, _, _, cx| {
-                            f.resolution = Resolution::P720;
-                            cx.notify();
-                        }),
-                    )),
-            )
-            .child(
-                h_flex()
-                    .gap_1()
-                    .child(div().w_20().text_sm().child("编码"))
-                    .child(
-                        choice("enc-nvenc", "NVENC（显卡）", enc == Encoder::Nvenc).on_click(
-                            cx.listener(|f, _, _, cx| {
-                                f.encoder = Encoder::Nvenc;
-                                cx.notify();
-                            }),
-                        ),
-                    )
-                    .child(
-                        choice("enc-x264", "x264（CPU）", enc == Encoder::X264).on_click(
-                            cx.listener(|f, _, _, cx| {
-                                f.encoder = Encoder::X264;
-                                cx.notify();
-                            }),
-                        ),
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .truncate()
+                            .child(SharedString::from(self.path.display().to_string())),
                     ),
             )
+            .child(row("分辨率", res_items, cx))
             .child(
-                h_flex()
-                    .gap_1()
-                    .child(div().w_20().text_sm().child("码率 kbps"))
-                    .child(Input::new(&self.bitrate)),
+                div()
+                    .pl(px(80.))
+                    .text_xs()
+                    .text_color(muted)
+                    .child(SharedString::from(format!(
+                        "输出 {}×{}（按工程比例换算）",
+                        preview.width, preview.height
+                    ))),
             )
+            .child(row("帧率", fps_items, cx))
+            .child(row("码率", br_items, cx))
+            .children((c.bitrate == Bitrate::Custom).then(|| {
+                h_flex()
+                    .pl(px(80.))
+                    .gap_2()
+                    .child(div().w(px(120.)).child(Input::new(&self.custom)))
+                    .child(div().text_sm().text_color(muted).child("kbps"))
+            }))
+            .child(row("视频编码", codec_items, cx))
+            .child(
+                div()
+                    .id("export-advanced")
+                    .test_support()
+                    .text_xs()
+                    .text_color(muted)
+                    .cursor_pointer()
+                    .child(if self.advanced {
+                        "高级 ▴"
+                    } else {
+                        "高级 ▾"
+                    })
+                    .on_click(cx.listener(|f, _, _, cx| {
+                        f.advanced = !f.advanced;
+                        cx.notify();
+                    })),
+            )
+            .children(self.advanced.then(|| {
+                v_flex()
+                    .gap_2()
+                    .child(row("编码器", enc_items, cx))
+                    .child(row(
+                        "音频",
+                        vec![
+                            div()
+                                .pt_1()
+                                .text_sm()
+                                .child("AAC 192 kbps")
+                                .into_any_element(),
+                        ],
+                        cx,
+                    ))
+            }))
+            .child(self.render_estimate(&preview, cx))
     }
 }
 
@@ -183,7 +420,7 @@ impl Workspace {
         if self.export.is_some() {
             return;
         }
-        if self.doc.project.timeline.duration() <= ve_core::Time::ZERO {
+        if self.doc.project.timeline.duration() <= Time::ZERO {
             crate::workspace::notify(Notification::warning("时间轴是空的"), window, cx);
             return;
         }
@@ -195,22 +432,30 @@ impl Workspace {
         let rx = cx.prompt_for_new_path(&dir, Some("导出.mp4"));
         self.tasks.push(cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(path))) = rx.await {
-                let _ignored = this.update_in(cx, |_, window, cx| {
-                    Self::open_export_dialog(path, window, cx);
+                let _ignored = this.update_in(cx, |this, window, cx| {
+                    let project = this.doc.project.settings;
+                    let duration = this.doc.project.timeline.duration();
+                    Self::open_export_dialog(path, project, duration, window, cx);
                 });
             }
         }));
     }
 
-    fn open_export_dialog(path: PathBuf, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let form = cx.new(|cx| ExportForm::new(path, window, cx));
+    fn open_export_dialog(
+        path: PathBuf,
+        project: ProjectSettings,
+        duration: Time,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let form = cx.new(|cx| ExportForm::new(path, project, duration, window, cx));
         let ws = cx.entity();
         window.open_dialog(cx, move |dialog, _, _| {
             let form = form.clone();
             let ws = ws.clone();
             dialog
-                .title("导出视频")
-                .width(gpui_kit::px(460.))
+                .title("导出")
+                .width(px(560.))
                 .child(form.clone())
                 // 普通 Dialog 不会自己画按钮：on_ok 只登记回调，按钮要放进 footer
                 .footer(
@@ -226,8 +471,7 @@ impl Workspace {
                         )),
                 )
                 .on_ok(move |_, window, cx| {
-                    let settings = ws.read(cx).doc.project.clone();
-                    let settings = form.read(cx).settings(&settings, cx);
+                    let settings = form.read(cx).settings(cx);
                     ws.update(cx, |this, cx| this.start_export(settings, window, cx));
                     true
                 })
@@ -337,10 +581,7 @@ impl Workspace {
         self.export.is_some()
     }
 
-    pub(crate) fn render_export_status(
-        &self,
-        cx: &Context<'_, Self>,
-    ) -> Option<gpui_kit::AnyElement> {
+    pub(crate) fn render_export_status(&self, cx: &Context<'_, Self>) -> Option<AnyElement> {
         let Some(e) = self.export.as_ref() else {
             let done = self.last_export.clone()?;
             return Some(
@@ -388,7 +629,44 @@ mod tests {
     fn scaled_size_keeps_aspect_and_even_width() {
         assert_eq!(scaled_size(1920, 1080, Resolution::Project), (1920, 1080));
         assert_eq!(scaled_size(1920, 1080, Resolution::P720), (1280, 720));
-        assert_eq!(scaled_size(1080, 1920, Resolution::P720), (404, 720));
+        // 按短边：竖屏的 720P 是 720×1280（剪映的叫法）
+        assert_eq!(scaled_size(1080, 1920, Resolution::P720), (720, 1280));
         assert_eq!(scaled_size(3840, 2160, Resolution::P1080), (1920, 1080));
+        assert_eq!(scaled_size(1920, 1080, Resolution::P2160), (3840, 2160));
+        assert_eq!(scaled_size(1920, 1080, Resolution::P1440), (2560, 1440));
+    }
+
+    #[test]
+    fn choices_turn_into_export_settings() {
+        let project = ProjectSettings::default();
+        let path = PathBuf::from("out.mp4");
+        let rec = ExportChoices::default().settings(path.clone(), &project);
+        assert_eq!((rec.width, rec.height), (1920, 1080));
+        assert_eq!(rec.frame_rate, project.frame_rate);
+        assert_eq!(rec.video_bitrate_kbps, 9300);
+        assert_eq!(rec.codec, Codec::H264);
+        let small = ExportChoices {
+            resolution: Resolution::P720,
+            frame_rate: Some(FrameRate::new(60, 1)),
+            bitrate: Bitrate::Lower,
+            codec: Codec::Hevc,
+            ..ExportChoices::default()
+        }
+        .settings(path.clone(), &project);
+        assert_eq!((small.width, small.height), (1280, 720));
+        assert_eq!(small.frame_rate, FrameRate::new(60, 1));
+        assert_eq!(
+            small.video_bitrate_kbps, 2900,
+            "720p60 HEVC 推荐 5800 的一半"
+        );
+        let custom = ExportChoices {
+            bitrate: Bitrate::Custom,
+            custom_kbps: 3,
+            ..ExportChoices::default()
+        }
+        .settings(path, &project);
+        assert_eq!(custom.video_bitrate_kbps, 100, "夹到最小值");
+        assert_eq!(size_text(12_345_678), "约 12.3 MB");
+        assert_eq!(size_text(2_500_000_000), "约 2.50 GB");
     }
 }

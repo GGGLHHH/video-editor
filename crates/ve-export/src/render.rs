@@ -43,6 +43,7 @@ struct LayerFrame {
     frame: Arc<VideoFrame>,
     source: (u32, u32),
     transform: Transform,
+    adjust: ve_core::ColorAdjust,
 }
 
 /// 按顺序读一个片段的画面：第一次定位，之后一直往后读。
@@ -166,16 +167,16 @@ fn layer_frames(
             stepper,
             l.source_time,
             source,
-            l.transform,
+            (l.transform, l.adjust),
             asset.name.clone(),
         ));
     }
-    let step = |(key, mut stepper, time, source, transform, name): (
+    let step = |(key, mut stepper, time, source, (transform, adjust), name): (
         Key,
         Stepper,
         Time,
         (u32, u32),
-        Transform,
+        (Transform, ve_core::ColorAdjust),
         String,
     )| {
         let r = stepper.frame_at(time).map_err(|e| render_error(&name, &e));
@@ -186,6 +187,7 @@ fn layer_frames(
                 frame,
                 source,
                 transform,
+                adjust,
             }),
         )
     };
@@ -300,6 +302,7 @@ pub fn render_video(
                     },
                     geometry: layer_geometry(size, l.source, &l.transform),
                     opacity: l.transform.opacity,
+                    adjust: l.adjust,
                 })
                 .collect();
             if let Err(e) = compositor.submit_nv12(size, &gpu) {

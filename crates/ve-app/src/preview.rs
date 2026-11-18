@@ -1,13 +1,15 @@
 //! 预览面板：显示引擎交出的帧（按实验结论换帧后回收上上帧的贴图），叠加字幕，播放控制条。
 
 use crate::actions as act;
+use crate::chrome;
 use crate::theme::palette;
 use crate::workspace::Workspace;
 use gpui_kit::StatefulInteractiveElement as _;
+use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{IconName, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Icon, IconName, h_flex, v_flex};
 use gpui_kit::{
     Bounds, Context, InteractiveElement as _, IntoElement, MouseButton, MouseUpEvent,
     ParentElement as _, Pixels, RenderImage, SharedString, Styled as _, Window, canvas, div, img,
@@ -33,12 +35,16 @@ pub struct PreviewState {
     pub long_gaps: u64,
     /// 上一次换帧的时刻。
     last_shown: Option<std::time::Instant>,
-    /// 字幕字体的 em / 行高（见 [`ass_em_ratio`]），第一次渲染时按实际字体度量算出。
+    /// 字幕字体的 em / 行高（见 [`ass_em_ratio`]）和量的是哪个字体；换了字体就重新量。
     pub em_ratio: Option<f32>,
+    /// `em_ratio` 量的字体。
+    pub em_font: String,
     /// 正在预览上拖动的图层。
     pub(crate) drag: Option<crate::preview_edit::PreviewDrag>,
     /// 鼠标样式（悬停 / 拖动时按位置变）。
     pub(crate) cursor: gpui_kit::CursorStyle,
+    /// 底栏「比例」菜单是否展开。
+    pub(crate) ratio_menu: bool,
 }
 
 /// BGRA 帧 → 可直接上传的图片（GPUI 的 `RenderImage` 内部就是 BGRA）。
@@ -63,11 +69,13 @@ pub fn ass_em_ratio(ascent: f32, descent: f32, size: f32) -> f32 {
 impl Workspace {
     /// 按字幕字体的实际度量算一次 em / 行高。
     pub(crate) fn measure_subtitle_font(&mut self, window: &Window) {
-        if self.preview.em_ratio.is_some() {
+        let family = self.doc.project.subtitle_style.font.clone();
+        if self.preview.em_ratio.is_some() && self.preview.em_font == family {
             return;
         }
         let ts = window.text_system();
-        let id = ts.resolve_font(&gpui_kit::font(SubtitleStyle::default().font));
+        let id = ts.resolve_font(&gpui_kit::font(family.clone()));
+        self.preview.em_font = family;
         let size = px(100.0);
         self.preview.em_ratio = Some(ass_em_ratio(
             f32::from(ts.ascent(id, size)),
@@ -132,7 +140,7 @@ impl Workspace {
         let (vx, vy) = local(video);
         let project = Arc::clone(&self.project);
         let subtitles = ve_engine::resolve_subtitles(&project, self.playhead);
-        let style = SubtitleStyle::default();
+        let style = self.doc.project.subtitle_style.clone();
         // 预览里的字号、描边按画面实际显示高度换算，和导出一致
         let shown_h = f32::from(video.size.height);
         #[expect(
@@ -145,8 +153,13 @@ impl Workspace {
         #[expect(clippy::cast_possible_truncation, reason = "字号很小")]
         let line = px(style.font_px(shown_h_px) as f32);
         let font = line * self.preview.em_ratio.unwrap_or(1.0);
+        // 描边为 0 时不画；有描边时至少 1 像素，缩小的预览里也看得见
         #[expect(clippy::cast_possible_truncation, reason = "描边很小")]
-        let outline = (style.outline_px(shown_h_px) as f32).max(1.0);
+        let outline = if style.outline > 0.0 {
+            (style.outline_px(shown_h_px) as f32).max(1.0)
+        } else {
+            0.0
+        };
         #[expect(clippy::cast_possible_truncation, reason = "边距很小")]
         let margin = px(style.margin_px(shown_h_px) as f32);
 
@@ -172,7 +185,16 @@ impl Workspace {
             )
             .child(
                 canvas(
-                    move |bounds, _, cx| this.update(cx, |w, _| w.preview.bounds = bounds),
+                    move |bounds, window, cx| {
+                        // 布局量出的新尺寸这一帧才拿到，画面已经按旧尺寸摆好了：尺寸变了就再画一帧
+                        // （改窗口大小、拖分隔条后停着不动时，画面否则会一直偏在一边）
+                        let changed = this.update(cx, |w, _| {
+                            std::mem::replace(&mut w.preview.bounds, bounds) != bounds
+                        });
+                        if changed {
+                            window.request_animation_frame();
+                        }
+                    },
                     |_, (), _, _| {},
                 )
                 .absolute()
@@ -194,7 +216,7 @@ impl Workspace {
                     ),
             )
             .children(subtitles.into_iter().map(|text| {
-                subtitle_overlay(text, font, line, outline, &style.font)
+                subtitle_overlay(text, font, line, outline, &style)
                     .absolute()
                     .left(vx)
                     .w(video.size.width)
@@ -205,75 +227,195 @@ impl Workspace {
 
         v_flex()
             .size_full()
+            .child(chrome::panel_header("播放器", cx))
             .child(frame)
             .child(self.render_transport(cx))
     }
 
+    /// 播放器底栏（剪映式）：左边当前时间（青）/ 总长，中间播放键，右边比例和全屏。
     fn render_transport(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let rate = self.doc.project.settings.frame_rate;
-        let timecode = format!(
-            "{} / {}",
-            format_timecode(self.playhead, rate),
-            format_timecode(self.doc.project.timeline.duration(), rate)
-        );
         let playing = self.engine.is_playing();
         h_flex()
             .id("transport")
             .test_support()
+            .relative()
             .h(px(40.))
-            .px_2()
-            .gap_1()
-            .justify_center()
-            .border_t_1()
-            .border_color(cx.theme().border)
+            .flex_none()
+            .px_3()
+            .gap_2()
             .child(
-                Button::new("tr-start")
-                    .ghost()
-                    .compact()
-                    .label("|◀")
-                    .on_click(cx.listener(|this, _, _, cx| this.seek(ve_core::Time::ZERO, cx))),
-            )
-            .child(
-                Button::new("tr-back")
-                    .ghost()
-                    .compact()
-                    .label("◀|")
-                    .on_click(cx.listener(|_, _, w, cx| {
-                        w.dispatch_action(Box::new(act::StepBack), cx);
+                h_flex()
+                    .id("timecode")
+                    .gap_2()
+                    .font_family("Consolas")
+                    .text_xs()
+                    .child(
+                        div()
+                            .text_color(palette::accent())
+                            .child(SharedString::from(format_timecode(self.playhead, rate))),
+                    )
+                    .child(
+                        div()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(SharedString::from(format_timecode(
+                                self.doc.project.timeline.duration(),
+                                rate,
+                            ))),
+                    )
+                    .children(shuttle_label(playing, self.engine.rate()).map(|label| {
+                        div()
+                            .id("tr-rate")
+                            .test_support()
+                            .text_color(palette::accent())
+                            .child(label)
                     })),
             )
             .child(
-                Button::new("tr-play")
-                    .primary()
-                    .compact()
-                    .icon(if playing {
-                        IconName::Pause
-                    } else {
-                        IconName::Play
-                    })
-                    .on_click(
-                        cx.listener(|_, _, w, cx| w.dispatch_action(Box::new(act::PlayPause), cx)),
+                // 播放键在整条底栏里居中
+                h_flex()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .top_0()
+                    .bottom_0()
+                    .justify_center()
+                    .child(
+                        Button::new("tr-play")
+                            .ghost()
+                            .icon(if playing {
+                                IconName::Pause
+                            } else {
+                                IconName::Play
+                            })
+                            .tooltip("播放 / 暂停（空格）")
+                            .on_click(cx.listener(|_, _, w, cx| {
+                                w.dispatch_action(Box::new(act::PlayPause), cx);
+                            })),
                     ),
             )
+            .child(div().flex_1())
+            .child(self.render_ratio_button(cx))
             .child(
-                Button::new("tr-fwd")
+                Button::new("tr-fullscreen")
                     .ghost()
                     .compact()
-                    .label("|▶")
-                    .on_click(cx.listener(|_, _, w, cx| {
-                        w.dispatch_action(Box::new(act::StepForward), cx);
-                    })),
-            )
-            .child(
-                div()
-                    .id("timecode")
-                    .ml_3()
-                    .font_family("Consolas")
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(SharedString::from(timecode)),
+                    .icon(Icon::new(Lucide::Maximize))
+                    .tooltip("全屏预览（后续支持）")
+                    .disabled(true),
             )
     }
+}
+
+/// 比例选项：（元素编号，名字，比例；`None` 是「原始」）。
+pub type RatioOption = (&'static str, &'static str, Option<(u32, u32)>);
+
+/// 比例菜单里的选项。
+pub const RATIOS: [RatioOption; 8] = [
+    ("ratio-original", "原始", None),
+    ("ratio-16-9", "16:9", Some((16, 9))),
+    ("ratio-9-16", "9:16", Some((9, 16))),
+    ("ratio-4-3", "4:3", Some((4, 3))),
+    ("ratio-3-4", "3:4", Some((3, 4))),
+    ("ratio-1-1", "1:1", Some((1, 1))),
+    ("ratio-21-9", "21:9", Some((21, 9))),
+    ("ratio-235-100", "2.35:1", Some((235, 100))),
+];
+
+impl Workspace {
+    /// 底栏的「比例」按钮和向上弹出的菜单（剪映：横竖屏一键切换，画面自动适配）。
+    fn render_ratio_button(&self, cx: &Context<'_, Self>) -> impl IntoElement {
+        let s = self.doc.project.settings;
+        let current = aspect_label(s.width, s.height);
+        div()
+            .relative()
+            .child(
+                Button::new("tr-ratio")
+                    .ghost()
+                    .compact()
+                    .label(SharedString::from(current.clone()))
+                    .tooltip("画面比例：换比例时保持短边，画面自动适配")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.preview.ratio_menu = !this.preview.ratio_menu;
+                        cx.notify();
+                    })),
+            )
+            .children(self.preview.ratio_menu.then(|| {
+                let items = RATIOS.iter().map(|&(id, label, ratio)| {
+                    let on = ratio.is_some() && label == current;
+                    h_flex()
+                        .id(id)
+                        .test_support()
+                        .h(px(26.))
+                        .px_2()
+                        .gap_2()
+                        .rounded(px(4.))
+                        .text_sm()
+                        .cursor_pointer()
+                        .hover(|st| st.bg(palette::menu_hover()))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.preview.ratio_menu = false;
+                            this.apply(window, cx, |p| ve_core::edit::set_aspect(p, ratio));
+                        }))
+                        .child(div().w(px(12.)).text_color(palette::accent()).child(if on {
+                            "✓"
+                        } else {
+                            ""
+                        }))
+                        .child(label)
+                });
+                gpui_kit::deferred(
+                    v_flex()
+                        .id("ratio-menu")
+                        .test_support()
+                        .absolute()
+                        .bottom(px(30.))
+                        .right_0()
+                        .w(px(120.))
+                        .p_1()
+                        .bg(palette::menu_bg())
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .rounded(px(chrome::CARD_RADIUS))
+                        .shadow_lg()
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.preview.ratio_menu = false;
+                            cx.notify();
+                        }))
+                        .children(items),
+                )
+                .with_priority(1)
+            }))
+    }
+}
+
+/// 画面比例的叫法：常见的写成「16:9」这样，其他的约分后写出来。
+#[must_use]
+pub fn aspect_label(width: u32, height: u32) -> String {
+    const fn gcd(a: u32, b: u32) -> u32 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+    if width == 0 || height == 0 {
+        return "—".to_owned();
+    }
+    let g = gcd(width, height);
+    let (w, h) = (width / g, height / g);
+    // 1366×768 这类近似 16:9 的也按 16:9 叫
+    let r = f64::from(width) / f64::from(height);
+    for (name, v) in [
+        ("16:9", 16.0 / 9.0),
+        ("9:16", 9.0 / 16.0),
+        ("4:3", 4.0 / 3.0),
+        ("3:4", 3.0 / 4.0),
+        ("1:1", 1.0),
+        ("21:9", 21.0 / 9.0),
+        ("2.35:1", 2.35),
+    ] {
+        if (r - v).abs() < 0.01 {
+            return name.to_owned();
+        }
+    }
+    format!("{w}:{h}")
 }
 
 /// 白字黑描边：8 个方向偏移的黑字垫底 + 白字。
@@ -282,49 +424,83 @@ fn subtitle_overlay(
     font: Pixels,
     line: Pixels,
     outline: f32,
-    family: &str,
+    style: &SubtitleStyle,
 ) -> gpui_kit::Div {
-    let family: SharedString = family.to_owned().into();
+    let family: SharedString = style.font.clone().into();
     let text: SharedString = text.to_owned().into();
+    let weight = if style.bold {
+        gpui_kit::FontWeight::BOLD
+    } else {
+        gpui_kit::FontWeight::NORMAL
+    };
     let styled = |d: gpui_kit::Div, color: gpui_kit::Hsla| {
         d.w_full()
             .text_center()
             .text_size(font)
             .line_height(line)
             .font_family(family.clone())
+            .font_weight(weight)
             .text_color(color)
             .child(text.clone())
     };
-    // 白字在文档流里，决定高度；8 个方向偏移的黑字叠在下面作描边
+    let (fill, edge): (gpui_kit::Hsla, gpui_kit::Hsla) = (
+        gpui_kit::rgb(style.color).into(),
+        gpui_kit::rgb(style.outline_color).into(),
+    );
+    // 正文在文档流里，决定高度；8 个方向偏移的描边色字叠在下面作描边（描边为 0 时不画）
     let mut root = div().relative();
-    for (dx, dy) in [
-        (-1.0, -1.0),
-        (0.0, -1.0),
-        (1.0, -1.0),
-        (-1.0, 0.0),
-        (1.0, 0.0),
-        (-1.0, 1.0),
-        (0.0, 1.0),
-        (1.0, 1.0),
-    ] {
+    let offsets: &[(f32, f32)] = if outline > 0.0 {
+        &[
+            (-1.0, -1.0),
+            (0.0, -1.0),
+            (1.0, -1.0),
+            (-1.0, 0.0),
+            (1.0, 0.0),
+            (-1.0, 1.0),
+            (0.0, 1.0),
+            (1.0, 1.0),
+        ]
+    } else {
+        &[]
+    };
+    for &(dx, dy) in offsets {
         root = root.child(styled(
             div()
                 .absolute()
                 .left(px(dx * outline))
                 .top(px(dy * outline)),
-            gpui_kit::black(),
+            edge,
         ));
     }
-    root.child(
-        styled(div(), gpui_kit::white())
-            .id("subtitle-main")
-            .test_support(),
-    )
+    root.child(styled(div(), fill).id("subtitle-main").test_support())
+}
+
+/// 倍速 / 倒放时时间码旁边的提示（原速、暂停时不显示）。
+fn shuttle_label(playing: bool, rate: f32) -> Option<SharedString> {
+    if !playing || (rate - 1.0).abs() < f32::EPSILON {
+        return None;
+    }
+    Some(if rate < 0.0 {
+        format!("◀ {}x", -rate).into()
+    } else {
+        format!("{rate}x").into()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aspect_labels_use_common_names() {
+        assert_eq!(aspect_label(1920, 1080), "16:9");
+        assert_eq!(aspect_label(1080, 1920), "9:16");
+        assert_eq!(aspect_label(1366, 768), "16:9", "近似 16:9 也叫 16:9");
+        assert_eq!(aspect_label(1000, 1000), "1:1");
+        assert_eq!(aspect_label(1440, 1080), "4:3");
+        assert_eq!(aspect_label(1000, 700), "10:7");
+        assert_eq!(aspect_label(0, 1080), "—");
+    }
 
     #[test]
     fn ass_font_size_is_line_height_not_em() {

@@ -13,10 +13,10 @@ const CHANNELS: usize = 2;
 pub fn gain_at(seg: &AudioSegment, t: Time) -> f32 {
     let mut env = 1.0f64;
     if seg.fade_in > Time::ZERO {
-        env = env.min((t - seg.clip_start).as_secs_f64() / seg.fade_in.as_secs_f64());
+        env = env.min((t - seg.sound_start).as_secs_f64() / seg.fade_in.as_secs_f64());
     }
     if seg.fade_out > Time::ZERO {
-        env = env.min((seg.clip_end - t).as_secs_f64() / seg.fade_out.as_secs_f64());
+        env = env.min((seg.sound_end - t).as_secs_f64() / seg.fade_out.as_secs_f64());
     }
     seg.gain * env.clamp(0.0, 1.0) as f32
 }
@@ -51,6 +51,35 @@ pub fn mix_into(
     }
 }
 
+/// 把交错立体声 `src` 线性插值拉伸 / 压缩成 `out_frames` 帧（变速：音调跟着变，和导出的
+/// `asetrate` 一样）。
+#[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "帧数很小、下标非负"
+)]
+pub fn resample_linear(src: &[f32], out_frames: usize) -> Vec<f32> {
+    let in_frames = src.len() / CHANNELS;
+    let mut out = vec![0.0; out_frames * CHANNELS];
+    if in_frames == 0 || out_frames == 0 {
+        return out;
+    }
+    let step = in_frames as f64 / out_frames as f64;
+    for frame in 0..out_frames {
+        let pos = frame as f64 * step;
+        let lo = (pos.floor() as usize).min(in_frames - 1);
+        let hi = (lo + 1).min(in_frames - 1);
+        let weight = (pos - lo as f64) as f32;
+        for ch in 0..CHANNELS {
+            let (from, to) = (src[lo * CHANNELS + ch], src[hi * CHANNELS + ch]);
+            out[frame * CHANNELS + ch] = (to - from).mul_add(weight, from);
+        }
+    }
+    out
+}
+
 /// 限幅到 [-1, 1]。
 pub fn clamp_mix(out: &mut [f32]) {
     for v in out {
@@ -81,8 +110,10 @@ mod tests {
             gain,
             fade_in: ms(fade_in_ms),
             fade_out: ms(fade_out_ms),
-            clip_start: ms(start_ms),
-            clip_end: ms(start_ms + dur_ms),
+            sound_start: ms(start_ms),
+            sound_end: ms(start_ms + dur_ms),
+            speed: 1.0,
+            keep_pitch: true,
         }
     }
 
@@ -143,5 +174,19 @@ mod tests {
         let mut neg = vec![-3.0f32, 0.25];
         clamp_mix(&mut neg);
         assert_eq!(neg, vec![-1.0, 0.25]);
+    }
+
+    #[test]
+    fn resample_stretches_and_squeezes() {
+        // 4 帧斜坡（左右声道一样）
+        let src: Vec<f32> = [0.0, 1.0, 2.0, 3.0].iter().flat_map(|&v| [v, v]).collect();
+        assert_eq!(resample_linear(&src, 4), src, "同样长度原样");
+        // 2 倍速：一半的帧，取 0、2
+        assert_eq!(resample_linear(&src, 2), [0.0, 0.0, 2.0, 2.0]);
+        // 慢放到 8 帧：中间插值
+        let slow = resample_linear(&src, 8);
+        assert_eq!(slow.len(), 16);
+        assert!((slow[2] - 0.5).abs() < 1e-6, "{slow:?}");
+        assert!(resample_linear(&[], 3).iter().all(|v| *v == 0.0));
     }
 }

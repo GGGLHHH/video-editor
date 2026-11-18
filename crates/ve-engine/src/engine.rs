@@ -79,6 +79,8 @@ pub struct FrameUpdate {
 pub struct EngineStats {
     /// 真正解码过的帧数（不含缓存命中）。
     pub decoded_frames: u64,
+    /// 解码器真正定位（往回或往前跳远，要从关键帧解起）的次数。
+    pub seeks: u64,
 }
 
 /// 引擎错误。
@@ -99,6 +101,8 @@ pub(crate) struct Control {
     pub(crate) start: Time,
     /// 工程修订号：播放中换工程只加它（不换代、不清音频缓冲、不重启时钟）。
     pub(crate) revision: u64,
+    /// 播放倍数（J / K / L；负数倒放）。
+    pub(crate) rate: f32,
 }
 
 pub(crate) struct Queued {
@@ -134,6 +138,7 @@ pub(crate) struct Shared {
     pub(crate) events: smol::channel::Sender<EngineEvent>,
     pub(crate) shutdown: Arc<AtomicBool>,
     pub(crate) decoded: AtomicU64,
+    pub(crate) seeks: AtomicU64,
     pub(crate) preview_max: ScaleTarget,
     pub(crate) cache_bytes: usize,
     pub(crate) render: ve_render::RenderConfig,
@@ -226,6 +231,7 @@ impl Engine {
                 seek: None,
                 start: Time::ZERO,
                 revision: 0,
+                rate: 1.0,
             }),
             wake: Condvar::new(),
             clock,
@@ -234,6 +240,7 @@ impl Engine {
             events,
             shutdown: Arc::clone(&shutdown),
             decoded: AtomicU64::new(0),
+            seeks: AtomicU64::new(0),
             preview_max: config.preview_max,
             cache_bytes: config.cache_bytes,
             render: config.render,
@@ -300,20 +307,35 @@ impl Engine {
         drop(c);
     }
 
-    /// 播放；已在结尾则从头开始。
+    /// 原速播放；已在结尾则从头开始。正在倍速 / 倒放时回到原速。
     pub fn play(&self) {
-        let mut c = self.shared.control();
-        if c.playing {
-            return;
+        if !self.is_playing() || (self.rate() - 1.0).abs() > f32::EPSILON {
+            self.play_at_rate(1.0);
         }
-        let mut pos = self.shared.clock.position();
-        if pos >= c.project.timeline.duration() {
+    }
+
+    /// 按倍数播放（剪映 J / L：负数倒放）。正放时已在结尾就从头开始，倒放时已在开头就从结尾开始。
+    /// 倍速时声音变速不变调，倒放时声音倒着放。
+    pub fn play_at_rate(&self, rate: f32) {
+        let mut c = self.shared.control();
+        let duration = c.project.timeline.duration();
+        let mut pos = self.shared.clock.position().min(duration);
+        if rate >= 0.0 && pos >= duration {
             pos = Time::ZERO;
+        } else if rate < 0.0 && pos <= Time::ZERO {
+            pos = duration;
         }
         c.playing = true;
-        self.shared.clock.start(pos);
+        c.rate = rate;
+        self.shared.clock.start_at_rate(pos, f64::from(rate));
         self.shared.bump(&mut c, pos);
         drop(c);
+    }
+
+    /// 当前播放倍数（暂停时是上一次的）。
+    #[must_use]
+    pub fn rate(&self) -> f32 {
+        self.shared.control().rate
     }
 
     /// 暂停。
@@ -366,9 +388,11 @@ impl Engine {
     #[must_use]
     pub fn take_frame(&self) -> Option<FrameUpdate> {
         let playing = self.shared.clock.is_playing();
+        let reverse = self.shared.clock.rate() < 0.0;
         let now = self.shared.clock.position();
         let mut q = lock(&self.shared.frames);
-        let idx = if playing {
+        // 正放：到点的最后一帧；暂停和倒放：最新的一帧（倒放的帧解好时时钟可能已经退过它了）
+        let idx = if playing && !reverse {
             q.items.iter().rposition(|f| f.time <= now)?
         } else {
             q.items.len().checked_sub(1)?
@@ -398,6 +422,7 @@ impl Engine {
     pub fn stats(&self) -> EngineStats {
         EngineStats {
             decoded_frames: self.shared.decoded.load(Ordering::Relaxed),
+            seeks: self.shared.seeks.load(Ordering::Relaxed),
         }
     }
 
@@ -506,6 +531,112 @@ mod tests {
         assert!((gray(&f) - expected_gray(30)).abs() <= 2.0, "{}", gray(&f));
         assert!(e.take_frame().is_none(), "同一帧只交一次");
         assert_eq!(e.duration(), Time::from_secs(2));
+    }
+
+    #[test]
+    fn reverse_shows_earlier_frames_and_stops_at_start() {
+        let e = engine();
+        e.set_project(Arc::new(project_with(&[Fixture::FrameIndexed30]).0));
+        let events = e.events();
+        e.seek(Time::from_millis(500));
+        e.play_at_rate(-1.0);
+        assert!((e.rate() + 1.0).abs() < f32::EPSILON);
+        let mut times = Vec::new();
+        assert!(wait_until(4000, || {
+            if let Some(u) = e.take_frame()
+                && let Some(f) = u.frame
+            {
+                let index = RATE.frame_of(u.time);
+                assert!(
+                    (gray(&f) - expected_gray(index)).abs() <= 2.0,
+                    "第 {index} 帧"
+                );
+                times.push(u.time);
+            }
+            matches!(events.try_recv(), Ok(EngineEvent::Ended))
+        }));
+        // 倒到开头自动暂停时会再交一次开头那帧（暂停画面）
+        times.dedup();
+        assert!(times.len() >= 3, "{times:?}");
+        assert!(
+            times.windows(2).all(|w| w[1] < w[0]),
+            "时间往回走：{times:?}"
+        );
+        assert!(!e.is_playing());
+        assert_eq!(e.position(), Time::ZERO);
+        // 在开头按倒放：从结尾开始
+        e.play_at_rate(-2.0);
+        assert!(e.position() > Time::from_millis(1500));
+        e.pause();
+    }
+
+    #[test]
+    fn reverse_decodes_ahead_instead_of_seeking_every_frame() {
+        // 往回跳要从关键帧解起：每帧都跳就又慢又卡。提前顺着解好一段放进缓存，
+        // 2 秒倒完只该定位寥寥几次（每帧都跳是 60 次）
+        let e = engine();
+        e.set_project(Arc::new(project_with(&[Fixture::FrameIndexed30]).0));
+        let events = e.events();
+        e.seek(RATE.time_of_frame(59));
+        drop(wait_frame_at(&e, RATE.time_of_frame(59)));
+        let before = e.stats().seeks;
+        e.play_at_rate(-1.0);
+        let mut times = Vec::new();
+        assert!(wait_until(5000, || {
+            if let Some(u) = e.take_frame()
+                && let Some(f) = u.frame
+            {
+                let index = RATE.frame_of(u.time);
+                assert!(
+                    (gray(&f) - expected_gray(index)).abs() <= 2.0,
+                    "第 {index} 帧"
+                );
+                times.push(u.time);
+            }
+            matches!(events.try_recv(), Ok(EngineEvent::Ended))
+        }));
+        let seeks = e.stats().seeks - before;
+        assert!(seeks <= 12, "定位了 {seeks} 次");
+        times.dedup();
+        assert!(times.len() >= 30, "倒放要连贯：只出了 {} 帧", times.len());
+    }
+
+    #[test]
+    fn reverse_shows_a_late_frame_even_after_the_clock_passed_it() {
+        // 倒放时解码一帧可能要很久（长 GOP 往回跳要从关键帧解起）：解好时时钟已经退到它前面了，
+        // 这一帧还是要显示，不能因为「比现在晚」就扔掉
+        let e = engine();
+        e.shared.clock.start_at_rate(Time::from_millis(1000), -1.0);
+        lock(&e.shared.frames).push(Time::from_millis(1500), None);
+        let u = e.take_frame().expect("倒放时最新的一帧照样交出");
+        assert_eq!(u.time, Time::from_millis(1500));
+        e.shared.clock.stop();
+    }
+
+    #[test]
+    fn fast_forward_runs_the_clock_faster_and_play_returns_to_normal() {
+        let e = engine();
+        e.set_project(Arc::new(
+            project_with(&[Fixture::FrameIndexed30, Fixture::ToneStereo48k]).0,
+        ));
+        e.play_at_rate(4.0);
+        sleep(Duration::from_millis(200));
+        let fast = e.position();
+        assert!(
+            fast < Time::from_millis(1300),
+            "不该比 4 倍快太多：{fast:?}"
+        );
+        assert!(
+            fast > Time::from_millis(500),
+            "4 倍速 0.2 秒应走过 0.8 秒左右：{fast:?}"
+        );
+        e.play();
+        assert!((e.rate() - 1.0).abs() < f32::EPSILON);
+        let at = e.position();
+        sleep(Duration::from_millis(200));
+        let walked = e.position() - at;
+        assert!(walked < Time::from_millis(400), "原速：{walked:?}");
+        e.pause();
     }
 
     #[test]

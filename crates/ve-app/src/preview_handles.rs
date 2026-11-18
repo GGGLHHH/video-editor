@@ -43,6 +43,35 @@ impl Corner {
     }
 }
 
+/// 四条边的中点（按画面自己的方向）。剪映的选中框除了四个角还有四个边中点手柄。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edge {
+    /// 上边。
+    Top,
+    /// 下边。
+    Bottom,
+    /// 左边。
+    Left,
+    /// 右边。
+    Right,
+}
+
+impl Edge {
+    /// 全部四条边。
+    pub const ALL: [Self; 4] = [Self::Top, Self::Bottom, Self::Left, Self::Right];
+
+    /// 这条边的中点在（转之前的）矩形上的位置。
+    #[must_use]
+    pub fn point(self, r: Rect) -> (f32, f32) {
+        match self {
+            Self::Top => (r.x + r.w / 2.0, r.y),
+            Self::Bottom => (r.x + r.w / 2.0, r.y + r.h),
+            Self::Left => (r.x, r.y + r.h / 2.0),
+            Self::Right => (r.x + r.w, r.y + r.h / 2.0),
+        }
+    }
+}
+
 /// 点在画面框的哪里。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandleHit {
@@ -50,20 +79,22 @@ pub enum HandleHit {
     Body,
     /// 角上：拖动缩放。
     Corner(Corner),
+    /// 边中点上：拖动缩放（等比，和剪映「等比缩放」开着时一样）。
+    Edge(Edge),
     /// 旋转手柄上，或者角的外侧一点：拖动旋转。
     Rotate,
     /// 框外。
     None,
 }
 
-/// 旋转手柄的位置：画面上边中点再往「画面的上方」`offset` 像素，跟着画面一起转。
+/// 旋转手柄的位置：画面下边中点再往「画面的下方」`offset` 像素（剪映的位置），跟着画面一起转。
 #[must_use]
 pub fn rotate_handle(geom: &LayerGeometry, offset: f32) -> (f32, f32) {
     let s = geom.shown;
-    geom.rotate((s.x + s.w / 2.0, s.y - offset))
+    geom.rotate((s.x + s.w / 2.0, s.y + s.h + offset))
 }
 
-/// 命中测试：旋转手柄 > 角 > 框内 > 角的外侧（旋转区）。`tolerance` 是手柄的判定半径，
+/// 命中测试：旋转手柄 > 角 > 边中点 > 框内 > 角的外侧（旋转区）。`tolerance` 是手柄的判定半径，
 /// `offset` 是旋转手柄离上边的距离，`zone` 是角手柄外面再往外多远算旋转区（和 Figma、
 /// Photoshop 一样：鼠标移到角外侧一点就能转）。
 #[must_use]
@@ -81,6 +112,12 @@ pub fn hit(
     let corners = Corner::ALL.map(|c| (c, geom.rotate(c.point(geom.shown))));
     if let Some((c, _)) = corners.iter().find(|(_, q)| near(*q)) {
         return HandleHit::Corner(*c);
+    }
+    if let Some(e) = Edge::ALL
+        .into_iter()
+        .find(|e| near(geom.rotate(e.point(geom.shown))))
+    {
+        return HandleHit::Edge(e);
     }
     if geom.contains(p.0, p.1) {
         return HandleHit::Body;
@@ -104,8 +141,22 @@ pub fn corner_cursor(geom: &LayerGeometry, corner: Corner) -> CursorStyle {
         Corner::TopLeft | Corner::BottomRight => 45.0,
         Corner::TopRight | Corner::BottomLeft => 135.0,
     };
-    // 屏幕 y 向下：45° 指向右下，即「\」
-    let axis = (base + geom.angle.to_degrees()).rem_euclid(180.0);
+    axis_cursor(base + geom.angle.to_degrees())
+}
+
+/// 边中点上的缩放箭头：上下边是上下箭头、左右边是左右箭头，再加上画面的旋转角。
+#[must_use]
+pub fn edge_cursor(geom: &LayerGeometry, edge: Edge) -> CursorStyle {
+    let base = match edge {
+        Edge::Top | Edge::Bottom => 90.0,
+        Edge::Left | Edge::Right => 0.0,
+    };
+    axis_cursor(base + geom.angle.to_degrees())
+}
+
+/// 沿 `degrees` 方向（屏幕 y 向下：45° 指向右下，即「\」）最接近的双向箭头。
+fn axis_cursor(degrees: f32) -> CursorStyle {
+    let axis = degrees.rem_euclid(180.0);
     match axis {
         a if a < 22.5 || a >= 157.5 => CursorStyle::ResizeLeftRight,
         a if a < 67.5 => CursorStyle::ResizeUpLeftDownRight,
@@ -122,6 +173,7 @@ pub fn cursor_for(hit: HandleHit, geom: &LayerGeometry, dragging: bool) -> Curso
         HandleHit::Body if dragging => CursorStyle::ClosedHand,
         HandleHit::Body => CursorStyle::OpenHand,
         HandleHit::Corner(c) => corner_cursor(geom, c),
+        HandleHit::Edge(e) => edge_cursor(geom, e),
         HandleHit::Rotate => CursorStyle::PointingHand,
         HandleHit::None => CursorStyle::Arrow,
     }
@@ -192,14 +244,71 @@ pub fn drag_move(
     let sy = snap_axis([y0, y0 + b.h / 2.0, y0 + b.h], &guides.ys, snap);
     let dx = delta.0 + sx.map_or(0.0, |(d, _)| d);
     let dy = delta.1 + sy.map_or(0.0, |(d, _)| d);
+    let x = start.x + dx / canvas.0.max(1.0);
+    let y = start.y + dy / canvas.1.max(1.0);
     Moved {
         transform: Transform {
-            x: start.x + dx / canvas.0.max(1.0),
-            y: start.y + dy / canvas.1.max(1.0),
+            // 吸住的轴去掉浮点尾巴：吸到中线就是精确的 0（像素换算会留下 1e-8 级的误差）
+            x: if sx.is_some() { tidy(x) } else { x },
+            y: if sy.is_some() { tidy(y) } else { y },
             ..*start
         },
         lines: (sx.map(|(_, l)| l), sy.map(|(_, l)| l)),
     }
+}
+
+/// 属性面板「对齐」按钮（剪映的六个对齐）：把图层（转过的按外接框）贴到画布的边或中线。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Align {
+    /// 左对齐。
+    Left,
+    /// 水平居中。
+    CenterX,
+    /// 右对齐。
+    Right,
+    /// 顶对齐。
+    Top,
+    /// 垂直居中。
+    CenterY,
+    /// 底对齐。
+    Bottom,
+}
+
+impl Align {
+    /// 从左到右的按钮顺序。
+    pub const ALL: [Self; 6] = [
+        Self::Left,
+        Self::CenterX,
+        Self::Right,
+        Self::Top,
+        Self::CenterY,
+        Self::Bottom,
+    ];
+}
+
+/// 对齐后的画面属性：只改位置，`canvas` 是画布像素尺寸。
+#[must_use]
+pub fn align(t: &Transform, geom: &LayerGeometry, canvas: (f32, f32), how: Align) -> Transform {
+    let b = geom.bounds();
+    let (cw, ch) = (canvas.0.max(1.0), canvas.1.max(1.0));
+    let (dx, dy) = match how {
+        Align::Left => (-b.x, 0.0),
+        Align::CenterX => (cw / 2.0 - (b.x + b.w / 2.0), 0.0),
+        Align::Right => (cw - (b.x + b.w), 0.0),
+        Align::Top => (0.0, -b.y),
+        Align::CenterY => (0.0, ch / 2.0 - (b.y + b.h / 2.0)),
+        Align::Bottom => (0.0, ch - (b.y + b.h)),
+    };
+    Transform {
+        x: tidy(t.x + dx / cw),
+        y: tidy(t.y + dy / ch),
+        ..*t
+    }
+}
+
+/// 取到 1e-6 的整数倍（1920 宽的画布上约 0.002 像素）。
+fn tidy(v: f32) -> f32 {
+    (v * 1e6).round() / 1e6
 }
 
 /// 拖角缩放：以整幅画面框的中心为基准等比缩放，缩放比 = 指针到中心的距离 / 这个角原来到中心的距离。
@@ -216,6 +325,27 @@ pub fn drag_scale(
     let from = (cx - center.0).hypot(cy - center.1);
     let to = (p.0 - center.0).hypot(p.1 - center.1);
     let ratio = if from > 0.0 { to / from } else { 1.0 };
+    Transform {
+        scale: (start.scale * ratio).clamp(Transform::SCALE_RANGE.0, Transform::SCALE_RANGE.1),
+        ..*start
+    }
+}
+
+/// 拖边中点缩放：以整幅画面框的中心为基准等比缩放，缩放比 = 指针在「中心 → 这条边中点」方向上的投影
+/// / 这条边中点原来到中心的距离（沿边拖动不改变大小）。
+#[must_use]
+pub fn drag_scale_edge(
+    start: &Transform,
+    geom: &LayerGeometry,
+    edge: Edge,
+    p: (f32, f32),
+) -> Transform {
+    let c = geom.center;
+    let m = geom.rotate(edge.point(geom.shown));
+    let n = (m.0 - c.0, m.1 - c.1);
+    let len2 = n.0.mul_add(n.0, n.1 * n.1);
+    let along = (p.0 - c.0).mul_add(n.0, (p.1 - c.1) * n.1);
+    let ratio = if len2 > 0.0 { along / len2 } else { 1.0 };
     Transform {
         scale: (start.scale * ratio).clamp(Transform::SCALE_RANGE.0, Transform::SCALE_RANGE.1),
         ..*start
@@ -282,8 +412,30 @@ mod tests {
     #[test]
     fn hit_prefers_rotate_handle_then_corners_then_body() {
         let (_, g) = half();
-        // 框是 (250, 125) 到 (750, 375)；旋转手柄在上边中点再往上 30：(500, 95)
-        assert_eq!(hit(&g, (502.0, 97.0), 8.0, 30.0, 20.0), HandleHit::Rotate);
+        // 框是 (250, 125) 到 (750, 375)；旋转手柄在下边中点再往下 30：(500, 405)（剪映的位置）
+        assert_eq!(hit(&g, (502.0, 403.0), 8.0, 30.0, 20.0), HandleHit::Rotate);
+        assert_eq!(
+            hit(&g, (500.0, 95.0), 8.0, 30.0, 20.0),
+            HandleHit::None,
+            "上方不再有手柄"
+        );
+        // 四条边的中点
+        assert_eq!(
+            hit(&g, (500.0, 128.0), 8.0, 30.0, 20.0),
+            HandleHit::Edge(Edge::Top)
+        );
+        assert_eq!(
+            hit(&g, (500.0, 372.0), 8.0, 30.0, 20.0),
+            HandleHit::Edge(Edge::Bottom)
+        );
+        assert_eq!(
+            hit(&g, (253.0, 250.0), 8.0, 30.0, 20.0),
+            HandleHit::Edge(Edge::Left)
+        );
+        assert_eq!(
+            hit(&g, (747.0, 250.0), 8.0, 30.0, 20.0),
+            HandleHit::Edge(Edge::Right)
+        );
         assert_eq!(
             hit(&g, (255.0, 128.0), 8.0, 30.0, 20.0),
             HandleHit::Corner(Corner::TopLeft)
@@ -322,10 +474,16 @@ mod tests {
             hit(&g, (623.0, 3.0), 8.0, 30.0, 20.0),
             HandleHit::Corner(Corner::TopLeft)
         );
-        // 旋转手柄跟着转到右边：(655, 250)
-        assert_eq!(hit(&g, (655.0, 250.0), 8.0, 30.0, 20.0), HandleHit::Rotate);
+        // 旋转手柄（原本在下方）跟着转到左边：(345, 250)
+        assert_eq!(hit(&g, (345.0, 250.0), 8.0, 30.0, 20.0), HandleHit::Rotate);
         let handle = rotate_handle(&g, 30.0);
-        assert!((handle.0 - 655.0).abs() < 1e-3 && (handle.1 - 250.0).abs() < 1e-3);
+        assert!((handle.0 - 345.0).abs() < 1e-3 && (handle.1 - 250.0).abs() < 1e-3);
+        // 上边中点转到了右边：(625, 250)，箭头也转成左右
+        assert_eq!(
+            hit(&g, (622.0, 250.0), 8.0, 30.0, 20.0),
+            HandleHit::Edge(Edge::Top)
+        );
+        assert_eq!(edge_cursor(&g, Edge::Top), CursorStyle::ResizeLeftRight);
     }
 
     #[test]
@@ -349,6 +507,23 @@ mod tests {
         let off = drag_move(&t, (1000.0, 500.0), (5.0, 0.0), 0.0, &g, &canvas_only());
         assert!((off.transform.x - 0.005).abs() < 1e-6);
         assert_eq!(off.lines, (None, None));
+    }
+
+    #[test]
+    fn snapping_back_to_center_lands_exactly_on_zero() {
+        // 先偏到一个不整的位置，再拖回中线附近：吸住后位置应是精确的 0，不留浮点尾巴
+        for start_x in [0.0137_f32, -0.0291, 0.1, 0.333] {
+            let t = Transform {
+                scale: 0.5,
+                x: start_x,
+                ..Transform::default()
+            };
+            let g = layer_geometry(CANVAS, CANVAS, &t);
+            let back = -start_x * 1000.0 + 3.3;
+            let out = drag_move(&t, (1000.0, 500.0), (back, 0.0), 8.0, &g, &canvas_only());
+            assert_eq!(out.lines.0, Some(500.0), "{out:?}");
+            assert_eq!(out.transform.x, 0.0, "起点 {start_x}");
+        }
     }
 
     #[test]
@@ -501,5 +676,52 @@ mod tests {
         assert_eq!(tiny.scale, Transform::SCALE_RANGE.0);
         let huge = drag_scale(&t, &g, Corner::BottomRight, (1e6, 1e6));
         assert_eq!(huge.scale, Transform::SCALE_RANGE.1);
+    }
+
+    #[test]
+    fn edge_drag_scales_uniformly_along_its_normal() {
+        let (t, g) = half();
+        // 右边中点 (750, 250) 拖到 (875, 300)：沿法线方向是中心外 375（原来 250），放大 1.5 倍
+        let out = drag_scale_edge(&t, &g, Edge::Right, (875.0, 300.0));
+        assert!((out.scale - 0.75).abs() < 1e-6, "{out:?}");
+        // 上边中点 (500, 125) 往下拖到 (520, 187.5)：离中心只剩一半
+        let out = drag_scale_edge(&t, &g, Edge::Top, (520.0, 187.5));
+        assert!((out.scale - 0.25).abs() < 1e-6, "{out:?}");
+        assert_eq!(edge_cursor(&g, Edge::Top), CursorStyle::ResizeUpDown);
+        assert_eq!(edge_cursor(&g, Edge::Left), CursorStyle::ResizeLeftRight);
+        assert_eq!(
+            cursor_for(HandleHit::Edge(Edge::Bottom), &g, false),
+            CursorStyle::ResizeUpDown
+        );
+        // 拖过中心：缩到最小，不翻转
+        let flipped = drag_scale_edge(&t, &g, Edge::Right, (100.0, 250.0));
+        assert_eq!(flipped.scale, Transform::SCALE_RANGE.0);
+    }
+
+    #[test]
+    fn align_snaps_the_bounding_box_to_canvas_edges_and_centers() {
+        let (t, g) = half();
+        let canvas = (1000.0, 500.0);
+        // 框是 (250, 125) 到 (750, 375)
+        assert_eq!(align(&t, &g, canvas, Align::Left).x, -0.25);
+        assert_eq!(align(&t, &g, canvas, Align::Right).x, 0.25);
+        assert_eq!(align(&t, &g, canvas, Align::Top).y, -0.25);
+        assert_eq!(align(&t, &g, canvas, Align::Bottom).y, 0.25);
+        let left = align(&t, &g, canvas, Align::Left);
+        assert_eq!(left.y, t.y, "左对齐不动纵向");
+        // 偏到一边后再居中：回到 0
+        let off = Transform {
+            x: 0.137,
+            y: -0.21,
+            ..t
+        };
+        let og = layer_geometry(CANVAS, CANVAS, &off);
+        assert_eq!(align(&off, &og, canvas, Align::CenterX).x, 0.0);
+        assert_eq!(align(&off, &og, canvas, Align::CenterY).y, 0.0);
+        // 转 90° 的图层按外接框贴边：竖着的框宽 250，左对齐后框的左边在 0
+        let (rt, rg) = turned(90.0);
+        let aligned = align(&rt, &rg, canvas, Align::Left);
+        let after = layer_geometry(CANVAS, CANVAS, &aligned).bounds();
+        assert!(after.x.abs() < 1e-3, "{after:?}");
     }
 }

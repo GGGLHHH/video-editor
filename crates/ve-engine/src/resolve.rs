@@ -30,14 +30,18 @@ pub struct AudioSegment {
     pub duration: Time,
     /// 线性增益。
     pub gain: f32,
-    /// 片段淡入长度。
+    /// 淡入长度。
     pub fade_in: Time,
-    /// 片段淡出长度。
+    /// 淡出长度。
     pub fade_out: Time,
-    /// 片段在时间轴上的起点（淡入从这里算）。
-    pub clip_start: Time,
-    /// 片段在时间轴上的终点（淡出到这里结束）。
-    pub clip_end: Time,
+    /// 这个片段的声音在时间轴上开始放的时刻（淡入从这里算；转场处会早于片段起点）。
+    pub sound_start: Time,
+    /// 这个片段的声音放完的时刻（淡出到这里结束；转场处会晚于片段终点）。
+    pub sound_end: Time,
+    /// 变速倍数（素材时间 / 时间轴时间）。
+    pub speed: f32,
+    /// 变速时保持音调。
+    pub keep_pitch: bool,
 }
 
 /// dB 转线性增益。
@@ -71,25 +75,44 @@ pub fn resolve_audio(project: &Project, from: Time, len: Time) -> Vec<AudioSegme
         if !matches!(track.kind, TrackKind::Video | TrackKind::Audio) {
             continue;
         }
+        // 转场处声音会越过片段边界，但最多伸进相邻片段的一半：从前一个片段看起，
+        // 起点已经不早于区间终点的片段再往后的，声音都不会伸进区间
         let first = track.clips.partition_point(|c| c.end() <= from);
-        for clip in track.clips[first..].iter().take_while(|c| c.start < to) {
+        let mut past_end = false;
+        for clip in &track.clips[first.saturating_sub(1)..] {
+            if past_end {
+                break;
+            }
+            past_end = clip.start >= to;
+            if !clip.enabled() {
+                continue;
+            }
             let Some(asset) = clip.asset() else { continue };
             if project.assets.get(&asset).is_none_or(|a| a.audio.is_none()) {
                 continue;
             }
-            let start = clip.start.max(from);
-            let end = clip.end().min(to);
+            // 转场处两段的声音叠在一起交叉淡化（预览和导出同一套算法）
+            let Some(sound) = ve_core::compose::audio_span(project, clip.id) else {
+                continue;
+            };
+            let start = sound.start.max(from);
+            let end = sound.end.min(to);
+            if end <= start {
+                continue;
+            }
             out.push(AudioSegment {
                 asset,
                 clip: clip.id,
-                source_start: clip.source_in() + (start - clip.start),
+                source_start: clip.source_at(start - clip.start).max(Time::ZERO),
                 timeline_start: start,
                 duration: end - start,
                 gain: db_to_gain(clip.gain_db),
-                fade_in: clip.fade_in,
-                fade_out: clip.fade_out,
-                clip_start: clip.start,
-                clip_end: clip.end(),
+                fade_in: sound.fade_in,
+                fade_out: sound.fade_out,
+                sound_start: sound.start,
+                sound_end: sound.end,
+                speed: clip.speed,
+                keep_pitch: clip.keep_pitch,
             });
         }
     }
@@ -104,7 +127,11 @@ pub fn resolve_subtitles(project: &Project, t: Time) -> Vec<&str> {
         .tracks
         .iter()
         .filter(|tr| tr.kind == TrackKind::Subtitle)
-        .filter_map(|tr| tr.clip_at(t).and_then(|c| c.subtitle_text()))
+        .filter_map(|tr| {
+            tr.clip_at(t)
+                .filter(|c| c.enabled())
+                .and_then(|c| c.subtitle_text())
+        })
         .collect()
 }
 
@@ -174,9 +201,43 @@ mod tests {
             .unwrap();
         assert!((seg.gain - 0.501).abs() < 0.01, "{}", seg.gain);
         assert_eq!(
-            (seg.fade_in, seg.fade_out, seg.clip_start, seg.clip_end),
+            (seg.fade_in, seg.fade_out, seg.sound_start, seg.sound_end),
             (secs(1), secs(2), Time::ZERO, secs(8))
         );
+    }
+
+    #[test]
+    fn transition_overlaps_the_two_clips_sound() {
+        let (mut p, ids) = sample_project();
+        ve_core::edit::set_transition(
+            &mut p,
+            ids.v2,
+            Some(ve_core::Transition {
+                kind: ve_core::TransitionKind::Dissolve,
+                duration: secs(2),
+            }),
+        )
+        .unwrap();
+        // 4.5–5.5 秒：v1 越过切点放到 5.5（素材 4.5–5.5），v2 从 4.5 起提前放（素材 4.5–5.5）
+        let segs = resolve_audio(&p, Time::from_millis(4500), secs(1));
+        let of = |c| segs.iter().find(|s| s.clip == c).unwrap();
+        let v1 = of(ids.v1);
+        assert_eq!(
+            (v1.timeline_start, v1.duration, v1.source_start),
+            (Time::from_millis(4500), secs(1), Time::from_millis(4500))
+        );
+        assert_eq!((v1.sound_end, v1.fade_out), (secs(6), secs(2)));
+        let v2 = of(ids.v2);
+        assert_eq!(
+            (v2.timeline_start, v2.duration, v2.source_start),
+            (Time::from_millis(4500), secs(1), Time::from_millis(4500))
+        );
+        assert_eq!((v2.sound_start, v2.fade_in), (secs(4), secs(2)));
+        // 5.8 秒：已过切点 0.8 秒，v1 的声音还剩最后 0.2 秒
+        let late = resolve_audio(&p, Time::from_millis(5800), Time::from_millis(100));
+        assert!(late.iter().any(|s| s.clip == ids.v1), "{late:?}");
+        let after = resolve_audio(&p, secs(6), Time::from_millis(100));
+        assert!(after.iter().all(|s| s.clip != ids.v1), "{after:?}");
     }
 
     #[test]
@@ -202,6 +263,19 @@ mod tests {
         v.clips[0] = std::sync::Arc::new(clip);
         let segs = resolve_audio(&p, Time::ZERO, secs(1));
         assert!(segs.iter().all(|s| s.clip != ids.v1), "{segs:?}");
+    }
+
+    #[test]
+    fn disabled_clips_are_silent_and_hidden() {
+        let (mut p, ids) = sample_project();
+        ve_core::edit::set_disabled(&mut p, &[ids.a1, ids.s1], true).unwrap();
+        let segs = resolve_audio(&p, Time::ZERO, secs(8));
+        assert!(segs.iter().all(|s| s.clip != ids.a1), "停用的背景音乐不播");
+        assert!(segs.iter().any(|s| s.clip == ids.v1), "视频原声照常");
+        assert_eq!(
+            resolve_subtitles(&p, Time::from_millis(1500)),
+            Vec::<&str>::new()
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! 工具栏「最近 ▾」下拉菜单。
+//! 菜单里的「最近打开」：列表、打开、清空。
 
 use crate::recent::RecentList;
 use crate::workspace::Workspace;
@@ -8,8 +8,8 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::{
-    Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window, deferred, div, px,
+    AnyElement, Context, InteractiveElement as _, IntoElement as _, ParentElement as _,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use std::path::PathBuf;
 
@@ -39,7 +39,7 @@ impl Workspace {
     }
 
     fn open_recent(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<'_, Self>) {
-        self.recent_menu_open = false;
+        self.menu_open = false;
         if !path.exists() {
             self.recent.remove(&path);
             self.save_recent();
@@ -56,49 +56,32 @@ impl Workspace {
         });
     }
 
-    /// 「最近 ▾」按钮和展开的列表。
-    pub(crate) fn render_recent_button(&self, cx: &Context<'_, Self>) -> impl IntoElement {
-        div()
-            .relative()
-            .child(
-                Button::new("tb-recent")
-                    .ghost()
-                    .compact()
-                    .label("最近 ▾")
-                    .tooltip("最近打开的工程")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.recent_menu_open = true;
-                        cx.notify();
-                    })),
-            )
-            .children(
-                self.recent_menu_open
-                    .then(|| deferred(self.render_recent_list(cx)).with_priority(1)),
-            )
-    }
-
-    fn render_recent_list(&self, cx: &Context<'_, Self>) -> impl IntoElement {
+    /// 菜单里「最近打开」一节：每个工程一行，末尾「清空列表」。
+    pub(crate) fn recent_items(&self, cx: &Context<'_, Self>) -> Vec<AnyElement> {
         let muted = cx.theme().muted_foreground;
-        let items = self.recent.paths().iter().enumerate().map(|(i, path)| {
-            let exists = path.exists();
-            let name = path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let target = path.clone();
-            h_flex()
-                .id(SharedString::from(format!("recent-{i}")))
-                .test_support()
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .hover(|s| s.bg(cx.theme().accent))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_recent(target.clone(), window, cx);
-                }))
-                .child(
+        let mut rows: Vec<AnyElement> =
+            self.recent
+                .paths()
+                .iter()
+                .enumerate()
+                .map(|(i, path)| {
+                    let exists = path.exists();
+                    let name = path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let target = path.clone();
                     v_flex()
-                        .min_w_0()
+                        .id(SharedString::from(format!("recent-{i}")))
+                        .test_support()
+                        .px_2()
+                        .py_1()
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(crate::theme::palette::menu_hover()))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_recent(target.clone(), window, cx);
+                        }))
                         .child(div().text_sm().when_missing(!exists, muted).child(
                             SharedString::from(if exists {
                                 name
@@ -112,43 +95,24 @@ impl Workspace {
                                 .text_color(muted)
                                 .truncate()
                                 .child(SharedString::from(path.display().to_string())),
-                        ),
-                )
-        });
-        let empty = self.recent.paths().is_empty();
-        v_flex()
-            .id("recent-menu")
-            .test_support()
-            .absolute()
-            .top(px(34.))
-            .left_0()
-            .w(px(440.))
-            .p_1()
-            .gap_0p5()
-            .bg(cx.theme().background)
-            .border_1()
-            .border_color(cx.theme().border)
-            .rounded_md()
-            .shadow_lg()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.recent_menu_open = false;
-                cx.notify();
-            }))
-            .children(items)
-            .children(empty.then(|| {
+                        )
+                        .into_any_element()
+                })
+                .collect();
+        if rows.is_empty() {
+            rows.push(
                 div()
                     .px_2()
                     .py_1()
                     .text_sm()
                     .text_color(muted)
                     .child("还没有最近打开的工程")
-            }))
-            .children((!empty).then(|| {
+                    .into_any_element(),
+            );
+        } else {
+            rows.push(
                 h_flex()
                     .justify_end()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .pt_1()
                     .child(
                         Button::new("recent-clear")
                             .ghost()
@@ -157,11 +121,14 @@ impl Workspace {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.recent.clear();
                                 this.save_recent();
-                                this.recent_menu_open = false;
+                                this.menu_open = false;
                                 cx.notify();
                             })),
                     )
-            }))
+                    .into_any_element(),
+            );
+        }
+        rows
     }
 }
 

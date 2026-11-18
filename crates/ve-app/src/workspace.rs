@@ -4,21 +4,19 @@
 //! 都是 `impl Workspace` 的方法；纯逻辑在 `document`、`timeline::{geometry, interaction}`。
 
 use crate::actions as act;
+use crate::chrome;
 use crate::document::Document;
 use crate::inspector::Inspector;
 use crate::preview::PreviewState;
+use crate::theme::palette;
 use crate::timeline::view::TimelineUi;
-use gpui_kit::base::{Selectable as _, TestSupportExt as _};
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IconName, WindowExt as _, h_flex, h_resizable,
-    resizable_panel, v_flex, v_resizable,
-};
+use gpui_kit::component::{ActiveTheme as _, WindowExt as _, v_flex};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, ExternalPaths, FocusHandle, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, RenderImage, SharedString, Styled as _, Subscription,
-    Task, Window, div, px,
+    IntoElement, ParentElement as _, Render, RenderImage, Styled as _, Subscription, Task, Window,
+    div, px,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -35,6 +33,9 @@ pub struct MediaThumbs {
     /// 波形。
     pub peaks: Arc<Vec<(f32, f32)>>,
 }
+
+/// J / L 穿梭播放的最高倍数。
+const MAX_SHUTTLE: f32 = 8.0;
 
 /// 主窗口视图。
 pub struct Workspace {
@@ -58,7 +59,20 @@ pub struct Workspace {
     /// 最近打开的工程，及其存放文件。
     pub(crate) recent: crate::recent::RecentList,
     pub(crate) recent_file: std::path::PathBuf,
-    pub(crate) recent_menu_open: bool,
+    /// 「转场」标签里选的时长（秒）。
+    pub(crate) transition_secs: f64,
+    /// 布局模式。
+    pub(crate) layout: crate::layout::LayoutMode,
+    /// 顶栏「布局」菜单是否展开。
+    pub(crate) layout_menu: bool,
+    /// 片段 / 属性剪贴板。
+    pub(crate) clipboard: crate::clip_ops::ClipBoard,
+    /// 自动保存（正式启动的程序才打开）。
+    pub(crate) autosave: Option<crate::autosave::Autosave>,
+    /// 素材面板当前的一级标签。
+    pub(crate) bin_tab: crate::media_bin::BinTab,
+    /// 顶栏「菜单」是否展开。
+    pub(crate) menu_open: bool,
     title: String,
     pub(crate) tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -119,7 +133,13 @@ impl Workspace {
             importing: 0,
             recent: crate::recent::RecentList::load(&crate::recent::default_file()),
             recent_file: crate::recent::default_file(),
-            recent_menu_open: false,
+            menu_open: false,
+            bin_tab: crate::media_bin::BinTab::default(),
+            autosave: None,
+            clipboard: crate::clip_ops::ClipBoard::default(),
+            layout: crate::layout::LayoutMode::default(),
+            transition_secs: 1.0,
+            layout_menu: false,
             title: String::new(),
             tasks: vec![listen],
             _subscriptions: subscriptions,
@@ -226,13 +246,24 @@ impl Workspace {
     }
 
     fn play_forward(&mut self, _: &act::PlayForward, _: &mut Window, cx: &mut Context<'_, Self>) {
-        self.engine.play();
-        cx.notify();
+        self.shuttle(1.0, cx);
     }
 
-    fn jump_back(&mut self, _: &act::JumpBack, _: &mut Window, cx: &mut Context<'_, Self>) {
-        let t = self.engine.position() - Time::from_secs(1);
-        self.seek(t, cx);
+    fn play_backward(&mut self, _: &act::PlayBackward, _: &mut Window, cx: &mut Context<'_, Self>) {
+        self.shuttle(-1.0, cx);
+    }
+
+    /// J / L（剪映、Premiere 的穿梭播放）：往同一个方向再按一次倍数翻倍（最多 8 倍），
+    /// 换方向从 1 倍开始；K 暂停，空格回到原速。
+    fn shuttle(&self, direction: f32, cx: &mut Context<'_, Self>) {
+        let rate = self.engine.rate();
+        let next = if self.engine.is_playing() && rate * direction > 0.0 {
+            (rate * 2.0).clamp(-MAX_SHUTTLE, MAX_SHUTTLE)
+        } else {
+            direction
+        };
+        self.engine.play_at_rate(next);
+        cx.notify();
     }
 
     fn step(&mut self, frames: i64, cx: &mut Context<'_, Self>) {
@@ -275,25 +306,103 @@ impl Workspace {
         }
     }
 
-    fn split(&mut self, _: &act::Split, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let at = self
-            .doc
+    /// 播放头所在的帧（对齐到帧）。
+    fn playhead_frame(&self) -> Time {
+        self.doc
             .project
             .settings
             .frame_rate
-            .snap(self.engine.position());
+            .snap(self.engine.position())
+    }
+
+    /// 分割（Ctrl+B）：切开选中的片段，右半段自动选中（剪映）；没选中时切开播放头下的所有片段。
+    fn split(&mut self, _: &act::Split, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let at = self.playhead_frame();
         let selected = self.doc.selection().to_vec();
         if selected.is_empty() {
             self.apply(window, cx, |p| Ok(ve_core::edit::split_all_at(p, at)));
-        } else {
-            self.apply(window, cx, |p| {
-                for clip in selected {
-                    // 选中的片段里有些可能不跨过播放头，忽略即可
-                    let _ = ve_core::edit::split_at(p, clip, at);
-                }
-                Ok(())
-            });
+            return;
         }
+        let rights = self.apply(window, cx, |p| {
+            // 选中的片段里有些可能不跨过播放头，忽略即可
+            Ok(selected
+                .iter()
+                .filter_map(|&clip| ve_core::edit::split_at(p, clip, at).ok())
+                .collect::<Vec<_>>())
+        });
+        if let Some(rights) = rights.filter(|r| !r.is_empty()) {
+            self.doc.set_selection(rights);
+            self.after_change(window, cx);
+        }
+    }
+
+    /// 批量分割（Ctrl+Shift+B）：不管选中什么，切开播放头下所有轨道的片段。
+    fn split_all(&mut self, _: &act::SplitAll, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let at = self.playhead_frame();
+        self.apply(window, cx, |p| Ok(ve_core::edit::split_all_at(p, at)));
+    }
+
+    /// Q / W 的目标：选中的片段；没选中时是播放头下的所有片段。
+    fn trim_targets(&self) -> Vec<ve_core::ClipId> {
+        let selected = self.doc.selection().to_vec();
+        if selected.is_empty() {
+            let at = self.playhead_frame();
+            self.doc
+                .project
+                .timeline
+                .tracks
+                .iter()
+                .filter_map(|t| t.clip_at(at).map(|c| c.id))
+                .collect()
+        } else {
+            selected
+        }
+    }
+
+    /// 向左裁剪（Q）：剪掉播放头左边的部分。
+    fn trim_left(&mut self, _: &act::TrimLeft, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let (at, targets) = (self.playhead_frame(), self.trim_targets());
+        self.apply(window, cx, |p| ve_core::edit::trim_left_at(p, &targets, at));
+    }
+
+    /// 向右裁剪（W）：剪掉播放头右边的部分。
+    fn trim_right(&mut self, _: &act::TrimRight, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let (at, targets) = (self.playhead_frame(), self.trim_targets());
+        self.apply(window, cx, |p| {
+            ve_core::edit::trim_right_at(p, &targets, at)
+        });
+    }
+
+    /// 向左全选（[）：起点在播放头左边的所有片段。
+    fn select_left(
+        &mut self,
+        _: &act::SelectLeft,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let clips = self
+            .doc
+            .project
+            .timeline
+            .clips_before(self.engine.position());
+        self.doc.set_selection(clips);
+        self.after_change(window, cx);
+    }
+
+    /// 向右全选（]）：终点在播放头右边的所有片段。
+    fn select_right(
+        &mut self,
+        _: &act::SelectRight,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let clips = self
+            .doc
+            .project
+            .timeline
+            .clips_after(self.engine.position());
+        self.doc.set_selection(clips);
+        self.after_change(window, cx);
     }
 
     /// Esc：正在拖动（时间轴或预览）时取消这次拖动、回到按下前，不记撤销；
@@ -330,6 +439,32 @@ impl Workspace {
     ) {
         self.snapping = !self.snapping;
         cx.notify();
+    }
+
+    /// 主轨磁吸开关（P）：存在工程设置里，算一步撤销；打开时主轨立刻排紧。
+    fn toggle_magnet(
+        &mut self,
+        _: &act::ToggleMagnet,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.apply(window, cx, |p| {
+            p.settings.main_magnet = !p.settings.main_magnet;
+            Ok(())
+        });
+    }
+
+    /// 联动开关（~）：字幕跟着主轨片段走。
+    fn toggle_linkage(
+        &mut self,
+        _: &act::ToggleLinkage,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.apply(window, cx, |p| {
+            p.settings.linkage = !p.settings.linkage;
+            Ok(())
+        });
     }
 
     fn select_all(&mut self, _: &act::SelectAll, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -400,97 +535,52 @@ impl Workspace {
         self.zoom(0.8, cx);
     }
 
-    fn render_toolbar(&self, cx: &Context<'_, Self>) -> impl IntoElement {
-        let tool =
-            |id: &'static str, label: &'static str| Button::new(id).ghost().compact().label(label);
-        let playing = self.engine.is_playing();
-        h_flex()
-            .id("toolbar")
-            .test_support()
-            .h(px(40.))
-            .px_2()
-            .gap_1()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(
-                tool("tb-new", "新建").on_click(
-                    cx.listener(|this, _, w, cx| this.new_project(&act::NewProject, w, cx)),
-                ),
-            )
-            .child(
-                tool("tb-open", "打开")
-                    .icon(IconName::FolderOpen)
-                    .on_click(cx.listener(|this, _, w, cx| this.open(&act::Open, w, cx))),
-            )
-            .child(self.render_recent_button(cx))
-            .child(
-                tool("tb-save", "保存")
-                    .on_click(cx.listener(|this, _, w, cx| this.save(&act::Save, w, cx))),
-            )
-            .child(
-                tool("tb-import", "导入素材")
-                    .icon(IconName::Plus)
-                    .on_click(cx.listener(|this, _, w, cx| this.import(&act::Import, w, cx))),
-            )
-            .child(div().w(px(12.)))
-            .child(
-                tool("tb-undo", "撤销")
-                    .icon(IconName::Undo2)
-                    .on_click(cx.listener(|this, _, w, cx| this.undo(&act::Undo, w, cx))),
-            )
-            .child(
-                tool("tb-redo", "重做")
-                    .icon(IconName::Redo2)
-                    .on_click(cx.listener(|this, _, w, cx| this.redo(&act::Redo, w, cx))),
-            )
-            .child(div().w(px(12.)))
-            .child(
-                tool("tb-split", "分割 S")
-                    .on_click(cx.listener(|this, _, w, cx| this.split(&act::Split, w, cx))),
-            )
-            .child(
-                tool("tb-delete", "删除")
-                    .icon(IconName::Delete)
-                    .on_click(cx.listener(|this, _, w, cx| this.delete(&act::Delete, w, cx))),
-            )
-            .child(
-                tool("tb-snap", "吸附 N")
-                    .selected(self.snapping)
-                    .tooltip("吸附开关：拖动时贴到播放头、片段和画面边缘（按住 Alt 临时取反）")
-                    .on_click(cx.listener(|this, _, w, cx| {
-                        this.toggle_snapping(&act::ToggleSnapping, w, cx);
-                    })),
-            )
-            .child(tool("tb-subtitle", "加字幕 T").on_click(
-                cx.listener(|this, _, w, cx| this.add_subtitle(&act::AddSubtitle, w, cx)),
-            ))
-            .child(
-                tool("tb-srt-in", "导入 SRT").on_click(
-                    cx.listener(|this, _, w, cx| this.import_srt(&act::ImportSrt, w, cx)),
-                ),
-            )
-            .child(
-                tool("tb-srt-out", "导出 SRT").on_click(
-                    cx.listener(|this, _, w, cx| this.export_srt(&act::ExportSrt, w, cx)),
-                ),
-            )
-            .child(div().flex_1())
-            .children(self.render_export_status(cx))
-            .child(
-                Button::new("tb-export")
-                    .primary()
-                    .compact()
-                    .label("导出视频")
-                    .disabled(self.export.is_some())
-                    .on_click(cx.listener(|this, _, w, cx| this.export(&act::Export, w, cx))),
-            )
-            .child(div().w(px(4.)))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(SharedString::from(if playing { "播放中" } else { "" })),
-            )
+    /// 根元素上挂所有动作（快捷键和菜单都发到这里）。
+    fn bind_actions<E: gpui_kit::InteractiveElement>(el: E, cx: &Context<'_, Self>) -> E {
+        el.on_action(cx.listener(Self::new_project))
+            .on_action(cx.listener(Self::open))
+            .on_action(cx.listener(Self::save))
+            .on_action(cx.listener(Self::save_as))
+            .on_action(cx.listener(Self::import))
+            .on_action(cx.listener(Self::export))
+            .on_action(cx.listener(Self::import_srt))
+            .on_action(cx.listener(Self::export_srt))
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::toggle_snapping))
+            .on_action(cx.listener(Self::toggle_magnet))
+            .on_action(cx.listener(Self::toggle_linkage))
+            .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::cut))
+            .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::copy_attrs))
+            .on_action(cx.listener(Self::paste_attrs))
+            .on_action(cx.listener(Self::toggle_disabled))
+            .on_action(cx.listener(Self::toggle_marker))
+            .on_action(cx.listener(Self::next_marker))
+            .on_action(cx.listener(Self::prev_marker))
+            .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::deselect_all))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
+            .on_action(cx.listener(Self::play_pause))
+            .on_action(cx.listener(Self::pause))
+            .on_action(cx.listener(Self::play_forward))
+            .on_action(cx.listener(Self::play_backward))
+            .on_action(cx.listener(Self::step_forward))
+            .on_action(cx.listener(Self::step_back))
+            .on_action(cx.listener(Self::go_start))
+            .on_action(cx.listener(Self::go_end))
+            .on_action(cx.listener(Self::split))
+            .on_action(cx.listener(Self::split_all))
+            .on_action(cx.listener(Self::trim_left))
+            .on_action(cx.listener(Self::trim_right))
+            .on_action(cx.listener(Self::select_left))
+            .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::delete))
+            .on_action(cx.listener(Self::ripple_delete))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::add_subtitle))
     }
 }
 
@@ -510,67 +600,26 @@ impl Render for Workspace {
             self.title = title;
         }
 
-        let top = h_resizable("main-split")
-            .child(
-                resizable_panel()
-                    .size(px(260.))
-                    .child(self.render_media_bin(cx)),
-            )
-            .child(resizable_panel().child(self.render_preview(cx)))
-            .child(
-                resizable_panel()
-                    .size(px(290.))
-                    .child(self.render_inspector(cx)),
-            );
-
-        v_flex()
+        Self::bind_actions(v_flex(), cx)
             .id("workspace")
             .test_support()
             .size_full()
             .key_context(act::CONTEXT)
             .track_focus(&self.focus)
-            .bg(cx.theme().background)
+            .bg(palette::window_bg())
             .text_color(cx.theme().foreground)
-            .on_action(cx.listener(Self::new_project))
-            .on_action(cx.listener(Self::open))
-            .on_action(cx.listener(Self::save))
-            .on_action(cx.listener(Self::save_as))
-            .on_action(cx.listener(Self::import))
-            .on_action(cx.listener(Self::export))
-            .on_action(cx.listener(Self::import_srt))
-            .on_action(cx.listener(Self::export_srt))
-            .on_action(cx.listener(Self::cancel))
-            .on_action(cx.listener(Self::toggle_snapping))
-            .on_action(cx.listener(Self::select_all))
-            .on_action(cx.listener(Self::deselect_all))
-            .on_action(cx.listener(Self::undo))
-            .on_action(cx.listener(Self::redo))
-            .on_action(cx.listener(Self::play_pause))
-            .on_action(cx.listener(Self::pause))
-            .on_action(cx.listener(Self::play_forward))
-            .on_action(cx.listener(Self::jump_back))
-            .on_action(cx.listener(Self::step_forward))
-            .on_action(cx.listener(Self::step_back))
-            .on_action(cx.listener(Self::go_start))
-            .on_action(cx.listener(Self::go_end))
-            .on_action(cx.listener(Self::split))
-            .on_action(cx.listener(Self::delete))
-            .on_action(cx.listener(Self::ripple_delete))
-            .on_action(cx.listener(Self::zoom_in))
-            .on_action(cx.listener(Self::zoom_out))
-            .on_action(cx.listener(Self::add_subtitle))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 this.import_paths(paths.0.to_vec(), window, cx);
             }))
-            .child(self.render_toolbar(cx))
+            .relative()
+            .children(self.render_context_menu(window, cx))
+            .child(self.render_topbar(cx))
             .child(
-                v_resizable("vertical-split")
-                    .child(resizable_panel().child(top))
-                    .child(
-                        resizable_panel()
-                            .size(px(250.))
-                            .child(self.render_timeline(cx)),
-                    ),
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .px(px(chrome::CARD_GAP))
+                    .child(self.render_panels(window, cx)),
             )
     }
 }

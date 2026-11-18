@@ -5,7 +5,7 @@
 
 use super::{Hit, TimelineGeometry, Zone};
 use crate::document::Document;
-use ve_core::edit::{move_clip, move_clips, trim_end, trim_start};
+use ve_core::edit::{insert_slots, move_clip, move_clips, trim_end, trim_start};
 use ve_core::snap::{snap, snap_targets};
 use ve_core::{ClipId, FrameRate, Time};
 
@@ -45,6 +45,8 @@ pub struct DragOutcome {
     pub seek: Option<Time>,
     /// 吸附线位置（用于画提示竖线）。
     pub snap: Option<Time>,
+    /// 松手会在这条缝新建轨道（轨道列表下标，画白色横线提示）、片段放在这个起点。
+    pub insert: Option<(usize, Time)>,
 }
 
 impl Drag {
@@ -119,7 +121,7 @@ impl Drag {
         match *self {
             Self::Scrub => DragOutcome {
                 seek: Some(snapper.rate.snap(pointer)),
-                snap: None,
+                ..DragOutcome::default()
             },
             Self::Move {
                 clip,
@@ -127,8 +129,13 @@ impl Drag {
                 duration,
             } => {
                 let (start, line) = snapper.place_range((pointer - grab).max(Time::ZERO), duration);
+                let mut insert = None;
                 if group.is_empty() {
-                    move_to_hovered_track(doc, geo, clip, y, start);
+                    // 在缝上：片段先不动，松手时在那里新建轨道、放到 start
+                    insert = insert_slot_for(doc, geo, clip, y).map(|slot| (slot, start));
+                    if insert.is_none() {
+                        move_to_hovered_track(doc, geo, clip, y, start);
+                    }
                 } else if let Some((_, c)) = doc.project.timeline.find_clip(clip) {
                     let delta = start - c.start;
                     if delta != Time::ZERO {
@@ -138,22 +145,23 @@ impl Drag {
                 DragOutcome {
                     seek: None,
                     snap: line,
+                    insert,
                 }
             }
             Self::TrimStart { clip } => {
                 let (to, line) = snapper.place_point(pointer);
                 let _ = doc.edit(|p| trim_start(p, clip, to));
                 DragOutcome {
-                    seek: None,
                     snap: line,
+                    ..DragOutcome::default()
                 }
             }
             Self::TrimEnd { clip } => {
                 let (to, line) = snapper.place_point(pointer);
                 let _ = doc.edit(|p| trim_end(p, clip, to));
                 DragOutcome {
-                    seek: None,
                     snap: line,
+                    ..DragOutcome::default()
                 }
             }
         }
@@ -240,6 +248,17 @@ impl Snapper {
     }
 }
 
+/// 鼠标在一条缝上、且这条缝能插入片段所在类型的轨道时，返回缝的下标。
+fn insert_slot_for(doc: &Document, geo: &TimelineGeometry, clip: ClipId, y: f32) -> Option<usize> {
+    let tl = &doc.project.timeline;
+    let (track, _) = tl.find_clip(clip)?;
+    let kind = tl.track(track)?.kind;
+    let slot = geo.insert_slot(y, tl.tracks.len())?;
+    insert_slots(tl, kind)
+        .is_some_and(|r| r.contains(&slot))
+        .then_some(slot)
+}
+
 /// 移到鼠标所在轨道；类型不符或重叠时留在原轨道；都不行则不动。
 fn move_to_hovered_track(
     doc: &mut Document,
@@ -253,10 +272,50 @@ fn move_to_hovered_track(
         .track_index_at(y, doc.project.timeline.tracks.len())
         .and_then(|i| doc.project.timeline.tracks.get(i))
         .map(|track| track.id);
+    // 主轨磁吸开着、拖到主轨上：按位置插队（主轨始终首尾相接，不能放到空隙里）
+    if doc.project.settings.main_magnet
+        && hovered.is_some()
+        && hovered == ve_core::magnet::main_track(&doc.project.timeline)
+        && doc
+            .edit(|p| ve_core::magnet::insert_into_main(p, clip, start))
+            .is_ok()
+    {
+        return;
+    }
     for track in hovered.into_iter().chain(current) {
         if doc.edit(|p| move_clip(p, clip, track, start)).is_ok() {
             break;
         }
+    }
+}
+
+/// 时间轴上滚一下滚轮做什么。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Wheel {
+    /// 缩放（`true` 放大）。
+    Zoom(bool),
+    /// 滚动（像素，正数往右 / 往下）。
+    Scroll {
+        /// 横向。
+        dx: f32,
+        /// 纵向（轨道）。
+        dy: f32,
+    },
+}
+
+/// 剪映的滚轮习惯：滚轮上下滚轨道，Alt / Shift + 滚轮左右滚，Ctrl + 滚轮缩放；
+/// 触控板的横向滑动始终左右滚。`dx` / `dy` 是滚轮事件的像素增量（往上滚为正）。
+#[must_use]
+pub fn wheel_action(dx: f32, dy: f32, ctrl: bool, alt: bool, shift: bool) -> Wheel {
+    if ctrl {
+        Wheel::Zoom(dy > 0.0)
+    } else if alt || shift {
+        Wheel::Scroll {
+            dx: -(dx + dy),
+            dy: 0.0,
+        }
+    } else {
+        Wheel::Scroll { dx: -dx, dy: -dy }
     }
 }
 
@@ -266,8 +325,11 @@ mod tests {
     use crate::document::Document;
     use ve_core::testing::sample_project;
 
+    /// 拖拽的基本行为在磁吸、联动都关着时测（主轨磁吸另有测试）。
     fn setup() -> (Document, ve_core::testing::SampleIds, TimelineGeometry) {
-        let (p, ids) = sample_project();
+        let (mut p, ids) = sample_project();
+        p.settings.main_magnet = false;
+        p.settings.linkage = false;
         let g = TimelineGeometry {
             px_per_second: 100.0,
             scroll_x: 0.0,
@@ -279,6 +341,11 @@ mod tests {
     fn x(g: &TimelineGeometry, secs: f64) -> f32 {
         g.time_to_x(Time::from_secs_f64(secs))
     }
+
+    /// 示例工程的轨道行：字幕在最上（剪映的排法）。
+    const S: f32 = 0.0;
+    const V: f32 = 1.0;
+    const A: f32 = 2.0;
 
     fn row(g: &TimelineGeometry, i: f32) -> f32 {
         g.ruler_height + g.track_height * (i + 0.5)
@@ -305,16 +372,16 @@ mod tests {
         let (mut d, ids, g) = setup();
         d.begin_gesture();
         // 抓住 v2（5–8 秒）中间 6.5 秒处
-        let mut drag = Drag::begin(&d, &g, x(&g, 6.5), row(&g, 0.0), Time::ZERO).unwrap();
+        let mut drag = Drag::begin(&d, &g, x(&g, 6.5), row(&g, V), Time::ZERO).unwrap();
         assert!(matches!(drag, Drag::Move { .. }));
         // 拖到 12.06 秒：起点 10.56，不靠近任何目标 → 吸到最近的帧（第 317 帧）
-        drag.update(&mut d, &g, x(&g, 12.06), row(&g, 0.0), Time::ZERO, true);
+        drag.update(&mut d, &g, x(&g, 12.06), row(&g, V), Time::ZERO, true);
         assert_eq!(
             start_of(&d, ids.v2),
             FrameRate::new(30, 1).time_of_frame(317)
         );
         // 拖到起点 8.04 秒：离 a1 终点（8 秒）4px，吸过去
-        let out = drag.update(&mut d, &g, x(&g, 9.54), row(&g, 0.0), Time::ZERO, true);
+        let out = drag.update(&mut d, &g, x(&g, 9.54), row(&g, V), Time::ZERO, true);
         assert_eq!(start_of(&d, ids.v2), Time::from_secs(8));
         assert_eq!(out.snap, Some(Time::from_secs(8)));
         // 终点吸到播放头（20 秒）：起点 16.97 → 终点 19.97
@@ -322,7 +389,7 @@ mod tests {
             &mut d,
             &g,
             x(&g, 18.47),
-            row(&g, 0.0),
+            row(&g, V),
             Time::from_secs(20),
             true,
         );
@@ -335,25 +402,25 @@ mod tests {
     #[test]
     fn drag_into_overlap_keeps_last_valid_position() {
         let (mut d, ids, g) = setup();
-        let mut drag = Drag::begin(&d, &g, x(&g, 6.0), row(&g, 0.0), Time::ZERO).unwrap();
-        drag.update(&mut d, &g, x(&g, 21.0), row(&g, 0.0), Time::ZERO, true);
+        let mut drag = Drag::begin(&d, &g, x(&g, 6.0), row(&g, V), Time::ZERO).unwrap();
+        drag.update(&mut d, &g, x(&g, 21.0), row(&g, V), Time::ZERO, true);
         let ok = start_of(&d, ids.v2);
         // 拖到和 v1 重叠：保持上一个合法位置
-        drag.update(&mut d, &g, x(&g, 3.0), row(&g, 0.0), Time::ZERO, true);
+        drag.update(&mut d, &g, x(&g, 3.0), row(&g, V), Time::ZERO, true);
         assert_eq!(start_of(&d, ids.v2), ok);
     }
 
     #[test]
     fn drag_to_audio_track_changes_track_and_wrong_kind_stays() {
         let (mut d, ids, g) = setup();
-        let mut drag = Drag::begin(&d, &g, x(&g, 6.0), row(&g, 0.0), Time::ZERO).unwrap();
-        drag.update(&mut d, &g, x(&g, 21.0), row(&g, 1.0), Time::ZERO, true);
+        let mut drag = Drag::begin(&d, &g, x(&g, 6.0), row(&g, V), Time::ZERO).unwrap();
+        drag.update(&mut d, &g, x(&g, 21.0), row(&g, A), Time::ZERO, true);
         assert_eq!(
             d.project.timeline.find_clip(ids.v2).unwrap().0,
             ids.audio_track
         );
         // 拖到字幕轨：类型不符，留在原轨（音频轨）
-        drag.update(&mut d, &g, x(&g, 25.0), row(&g, 2.0), Time::ZERO, true);
+        drag.update(&mut d, &g, x(&g, 25.0), row(&g, S), Time::ZERO, true);
         assert_eq!(
             d.project.timeline.find_clip(ids.v2).unwrap().0,
             ids.audio_track
@@ -363,14 +430,14 @@ mod tests {
     #[test]
     fn drag_edge_trims() {
         let (mut d, ids, g) = setup();
-        let mut left = Drag::begin(&d, &g, x(&g, 5.0) + 2.0, row(&g, 0.0), Time::ZERO).unwrap();
+        let mut left = Drag::begin(&d, &g, x(&g, 5.0) + 2.0, row(&g, V), Time::ZERO).unwrap();
         assert!(matches!(left, Drag::TrimStart { .. }));
-        left.update(&mut d, &g, x(&g, 6.0), row(&g, 0.0), Time::ZERO, true);
+        left.update(&mut d, &g, x(&g, 6.0), row(&g, V), Time::ZERO, true);
         let c = std::sync::Arc::clone(d.project.timeline.find_clip(ids.v2).unwrap().1);
         assert_eq!((c.start, c.end()), (Time::from_secs(6), Time::from_secs(8)));
-        let mut right = Drag::begin(&d, &g, x(&g, 8.0) - 2.0, row(&g, 0.0), Time::ZERO).unwrap();
+        let mut right = Drag::begin(&d, &g, x(&g, 8.0) - 2.0, row(&g, V), Time::ZERO).unwrap();
         assert!(matches!(right, Drag::TrimEnd { .. }));
-        right.update(&mut d, &g, x(&g, 9.0), row(&g, 0.0), Time::ZERO, true);
+        right.update(&mut d, &g, x(&g, 9.0), row(&g, V), Time::ZERO, true);
         assert_eq!(
             d.project.timeline.find_clip(ids.v2).unwrap().1.end(),
             Time::from_secs(9)
@@ -381,9 +448,9 @@ mod tests {
     fn dragging_a_selected_clip_moves_the_whole_selection() {
         let (mut d, ids, g) = setup();
         d.set_selection(vec![ids.v2, ids.a1]);
-        let mut drag = Drag::begin(&d, &g, x(&g, 6.5), row(&g, 0.0), Time::ZERO).unwrap();
+        let mut drag = Drag::begin(&d, &g, x(&g, 6.5), row(&g, V), Time::ZERO).unwrap();
         // 往后 10 秒，鼠标还拖到了音频行：多选时只平移，不换轨
-        drag.update(&mut d, &g, x(&g, 16.5), row(&g, 1.0), Time::ZERO, true);
+        drag.update(&mut d, &g, x(&g, 16.5), row(&g, A), Time::ZERO, true);
         assert_eq!(start_of(&d, ids.v2), Time::from_secs(15));
         assert_eq!(start_of(&d, ids.a1), Time::from_secs(10));
         assert_eq!(
@@ -397,8 +464,8 @@ mod tests {
     fn dragging_an_unselected_clip_moves_only_it() {
         let (mut d, ids, g) = setup();
         d.set_selection(vec![ids.v1, ids.a1]);
-        let mut drag = Drag::begin(&d, &g, x(&g, 6.5), row(&g, 0.0), Time::ZERO).unwrap();
-        drag.update(&mut d, &g, x(&g, 16.5), row(&g, 0.0), Time::ZERO, true);
+        let mut drag = Drag::begin(&d, &g, x(&g, 6.5), row(&g, V), Time::ZERO).unwrap();
+        drag.update(&mut d, &g, x(&g, 16.5), row(&g, V), Time::ZERO, true);
         assert_eq!(start_of(&d, ids.v2), Time::from_secs(15));
         assert_eq!(start_of(&d, ids.a1), Time::ZERO);
     }
@@ -406,9 +473,9 @@ mod tests {
     #[test]
     fn snapping_off_places_on_frames_only() {
         let (mut d, ids, g) = setup();
-        let mut drag = Drag::begin(&d, &g, x(&g, 6.5), row(&g, 0.0), Time::ZERO).unwrap();
+        let mut drag = Drag::begin(&d, &g, x(&g, 6.5), row(&g, V), Time::ZERO).unwrap();
         // 起点 8.04 秒离 a1 终点（8 秒）4 像素：吸附关掉时只吸到帧（第 241 帧）
-        let out = drag.update(&mut d, &g, x(&g, 9.54), row(&g, 0.0), Time::ZERO, false);
+        let out = drag.update(&mut d, &g, x(&g, 9.54), row(&g, V), Time::ZERO, false);
         assert_eq!(
             start_of(&d, ids.v2),
             FrameRate::new(30, 1).time_of_frame(241)
@@ -420,15 +487,15 @@ mod tests {
     fn cursor_shows_what_a_press_would_do() {
         use gpui_kit::CursorStyle;
         let (d, ids, g) = setup();
-        let body = g.hit_test(x(&g, 6.5), row(&g, 0.0), &d.project.timeline);
-        let edge = g.hit_test(x(&g, 5.0) + 2.0, row(&g, 0.0), &d.project.timeline);
-        let empty = g.hit_test(x(&g, 30.0), row(&g, 0.0), &d.project.timeline);
+        let body = g.hit_test(x(&g, 6.5), row(&g, V), &d.project.timeline);
+        let edge = g.hit_test(x(&g, 5.0) + 2.0, row(&g, V), &d.project.timeline);
+        let empty = g.hit_test(x(&g, 30.0), row(&g, V), &d.project.timeline);
         assert_eq!(cursor_for(body, None, false), CursorStyle::OpenHand);
         assert_eq!(cursor_for(edge, None, false), CursorStyle::ResizeLeftRight);
         assert_eq!(cursor_for(empty, None, false), CursorStyle::Arrow);
         assert_eq!(cursor_for(Hit::Ruler, None, false), CursorStyle::Arrow);
         // 拖动中按拖的类型，不看鼠标下面是什么
-        let moving = Drag::begin(&d, &g, x(&g, 6.5), row(&g, 0.0), Time::ZERO).unwrap();
+        let moving = Drag::begin(&d, &g, x(&g, 6.5), row(&g, V), Time::ZERO).unwrap();
         assert_eq!(
             cursor_for(empty, Some(&moving), false),
             CursorStyle::ClosedHand
@@ -453,9 +520,86 @@ mod tests {
     fn empty_area_starts_nothing_and_selection_follows_click() {
         let (d, ids, g) = setup();
         assert!(Drag::begin(&d, &g, x(&g, 30.0), row(&g, 5.0), Time::ZERO).is_none());
-        assert!(Drag::begin(&d, &g, x(&g, 30.0), row(&g, 0.0), Time::ZERO).is_none());
-        let drag = Drag::begin(&d, &g, x(&g, 2.0), row(&g, 1.0), Time::ZERO).unwrap();
+        assert!(Drag::begin(&d, &g, x(&g, 30.0), row(&g, V), Time::ZERO).is_none());
+        let drag = Drag::begin(&d, &g, x(&g, 2.0), row(&g, A), Time::ZERO).unwrap();
         assert_eq!(drag.clip(), Some(ids.a1));
         assert_eq!(Drag::Scrub.clip(), None);
+    }
+
+    #[test]
+    fn wheel_follows_jianying_habits() {
+        // 往下滚（dy 为负）：轨道往下滚
+        assert_eq!(
+            wheel_action(0.0, -120.0, false, false, false),
+            Wheel::Scroll { dx: 0.0, dy: 120.0 }
+        );
+        // Alt / Shift：左右滚
+        for (alt, shift) in [(true, false), (false, true)] {
+            assert_eq!(
+                wheel_action(0.0, -120.0, false, alt, shift),
+                Wheel::Scroll { dx: 120.0, dy: 0.0 }
+            );
+        }
+        // 触控板横向滑动
+        assert_eq!(
+            wheel_action(-30.0, 0.0, false, false, false),
+            Wheel::Scroll { dx: 30.0, dy: 0.0 }
+        );
+        assert_eq!(
+            wheel_action(0.0, 120.0, true, false, false),
+            Wheel::Zoom(true)
+        );
+        assert_eq!(
+            wheel_action(0.0, -120.0, true, true, false),
+            Wheel::Zoom(false)
+        );
+    }
+
+    #[test]
+    fn dragging_onto_a_track_boundary_offers_a_new_track() {
+        let (mut d, ids, g) = setup();
+        let mut drag = Drag::begin(&d, &g, x(&g, 6.0), row(&g, V), Time::ZERO).unwrap();
+        // 字幕轨和视频轨之间的缝（第 1 条）：视频片段可以插在这里
+        let gap = g.ruler_height + g.track_height * V + 2.0;
+        let out = drag.update(&mut d, &g, x(&g, 7.0), gap, Time::ZERO, false);
+        assert_eq!(out.insert, Some((1, Time::from_secs(6))), "松手时放在 6 秒");
+        // 拖动中片段先不动（主轨磁吸开着时也不会被排回去）
+        assert_eq!(
+            d.project.timeline.find_clip(ids.v2).unwrap().0,
+            ids.video_track
+        );
+        assert_eq!(start_of(&d, ids.v2), Time::from_secs(5));
+        // 视频轨和音频轨之间（第 2 条）也行；最下面（第 3 条，音频块下面）不行
+        let between = g.ruler_height + g.track_height * A - 2.0;
+        assert_eq!(
+            drag.update(&mut d, &g, x(&g, 7.0), between, Time::ZERO, false)
+                .insert,
+            Some((2, Time::from_secs(6)))
+        );
+        let below = g.ruler_height + g.track_height * 3.0 + 30.0;
+        assert_eq!(
+            drag.update(&mut d, &g, x(&g, 7.0), below, Time::ZERO, false)
+                .insert,
+            None
+        );
+        // 回到轨道中间：不提示
+        assert_eq!(
+            drag.update(&mut d, &g, x(&g, 7.0), row(&g, V), Time::ZERO, false)
+                .insert,
+            None
+        );
+    }
+
+    #[test]
+    fn with_magnet_dragging_on_the_main_track_reorders() {
+        let (p, ids) = sample_project();
+        assert!(p.settings.main_magnet, "新工程默认开");
+        let mut d = Document::from_project(p, None);
+        let g = setup().2;
+        // v2（5–8）往前拖到 1 秒附近：排到 v1 前面，主轨仍然首尾相接
+        let mut drag = Drag::begin(&d, &g, x(&g, 6.0), row(&g, V), Time::ZERO).unwrap();
+        drag.update(&mut d, &g, x(&g, 2.0), row(&g, V), Time::ZERO, false);
+        assert_eq!(start_of(&d, ids.v2), Time::ZERO);
+        assert_eq!(start_of(&d, ids.v1), Time::from_secs(3));
     }
 }

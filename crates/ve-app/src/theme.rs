@@ -10,61 +10,91 @@ pub mod palette {
     /// 预览区背景。
     #[must_use]
     pub fn preview_bg() -> Hsla {
-        rgb(0x0b_0c0f).into()
+        rgb(0x25_2525).into()
     }
-    /// 时间轴背景。
+    /// 窗口底色（面板卡片之间的缝）。
+    #[must_use]
+    pub fn window_bg() -> Hsla {
+        rgb(0x14_1414).into()
+    }
+    /// 面板卡片底色。
+    #[must_use]
+    pub fn panel_bg() -> Hsla {
+        rgb(0x25_2525).into()
+    }
+    /// 主色（剪映的青）：选中的标签、开关、主按钮、当前时间。
+    #[must_use]
+    pub fn accent() -> Hsla {
+        rgb(0x00_c8d2).into()
+    }
+    /// 面板标题栏 / 标签栏的分隔线。
+    #[must_use]
+    pub fn divider() -> Hsla {
+        rgb(0x1c_1c1c).into()
+    }
+    /// 下拉菜单底色。
+    #[must_use]
+    pub fn menu_bg() -> Hsla {
+        rgb(0x33_3333).into()
+    }
+    /// 下拉菜单里鼠标悬停的那一项。
+    #[must_use]
+    pub fn menu_hover() -> Hsla {
+        rgb(0x44_4444).into()
+    }
+    /// 时间轴背景（和面板卡片同色）。
     #[must_use]
     pub fn timeline_bg() -> Hsla {
-        rgb(0x15_171c).into()
+        rgb(0x25_2525).into()
     }
     /// 轨道底色（交替）。
     #[must_use]
     pub fn track_bg(even: bool) -> Hsla {
         if even {
-            rgb(0x1b_1e24).into()
+            rgb(0x29_2929).into()
         } else {
-            rgb(0x18_1a20).into()
+            rgb(0x26_2626).into()
         }
     }
-    /// 标尺背景。
+    /// 标尺和轨道头背景。
     #[must_use]
     pub fn ruler_bg() -> Hsla {
-        rgb(0x11_1318).into()
+        rgb(0x22_2222).into()
     }
     /// 刻度与次要文字。
     #[must_use]
     pub fn tick() -> Hsla {
-        rgb(0x5d_6472).into()
+        rgb(0x6a_6a6a).into()
     }
     /// 主要文字。
     #[must_use]
     pub fn text() -> Hsla {
-        rgb(0xd7_dbe3).into()
+        rgb(0xe6_e6e6).into()
     }
-    /// 视频片段。
+    /// 视频片段（剪映的深青）。
     #[must_use]
     pub fn video_clip() -> Hsla {
-        rgb(0x2b_5b8c).into()
+        rgb(0x12_575d).into()
     }
     /// 音频片段。
     #[must_use]
     pub fn audio_clip() -> Hsla {
-        rgb(0x23_704d).into()
+        rgb(0x2a_5478).into()
     }
-    /// 字幕片段。
+    /// 字幕片段（剪映的砖红）。
     #[must_use]
     pub fn subtitle_clip() -> Hsla {
-        rgb(0x6a_4c9c).into()
+        rgb(0xa5_483a).into()
     }
     /// 波形。
     #[must_use]
     pub fn waveform() -> Hsla {
         rgba(0xb8f5_d0cc).into()
     }
-    /// 选中描边。
+    /// 选中描边（剪映是白色细描边）。
     #[must_use]
     pub fn selection() -> Hsla {
-        rgb(0xff_c94a).into()
+        rgb(0xff_ffff).into()
     }
     /// 时间轴上关键帧的小菱形。
     #[must_use]
@@ -74,12 +104,12 @@ pub mod palette {
     /// 关键帧小菱形的描边（压在花哨的缩略图上也看得清）。
     #[must_use]
     pub fn keyframe_edge() -> Hsla {
-        rgb(0x11_1318).into()
+        rgb(0x11_1111).into()
     }
     /// 鼠标悬停的片段描边（比选中弱得多）。
     #[must_use]
     pub fn hover() -> Hsla {
-        rgba(0xffff_ff80).into()
+        rgba(0xffff_ff66).into()
     }
     /// 拖动中片段原位置的影子。
     #[must_use]
@@ -89,27 +119,32 @@ pub mod palette {
     /// 框选矩形的填充。
     #[must_use]
     pub fn marquee() -> Hsla {
-        rgba(0xffc9_4a26).into()
+        rgba(0xffff_ff1a).into()
     }
     /// 选中片段上的整体蒙色。
     #[must_use]
     pub fn selection_tint() -> Hsla {
-        rgba(0xffc9_4a40).into()
+        rgba(0xffff_ff1a).into()
     }
-    /// 选中片段标题栏（亮底）上的文字。
+    /// 时间轴上转场小方块的底色。
     #[must_use]
-    pub fn selection_text() -> Hsla {
-        rgb(0x1a_1608).into()
+    pub fn transition() -> Hsla {
+        rgba(0x00c8_d266).into()
     }
-    /// 播放头。
+    /// 停用片段上压的深色。
+    #[must_use]
+    pub fn disabled_veil() -> Hsla {
+        rgba(0x1414_14c0).into()
+    }
+    /// 播放头（剪映是白色）。
     #[must_use]
     pub fn playhead() -> Hsla {
-        rgb(0xff_4d5e).into()
+        rgb(0xf2_f2f2).into()
     }
-    /// 吸附线。
+    /// 吸附线（主色青）。
     #[must_use]
     pub fn snap() -> Hsla {
-        rgb(0x5a_d1ff).into()
+        rgb(0x00_c8d2).into()
     }
 }
 
@@ -119,14 +154,22 @@ pub fn apply(cx: &mut App) {
     // 切换模式会重置颜色，所以覆盖要放在第二次 update 里
     Theme::update(cx, |t| {
         let c = |v: u32| -> Hsla { rgb(v).into() };
-        t.background = c(0x1e_2127);
-        t.foreground = c(0xd7_dbe3);
-        t.border = c(0x2c_313a);
-        t.muted = c(0x26_2a31);
-        t.muted_foreground = c(0x8b_93a1);
-        t.primary = c(0x3d_8bfd);
+        // 剪映的取色：面板 #252525、正文 #E6E6E6、次要字 #8A8A8A、主色青 #00C8D2
+        t.background = c(0x25_2525);
+        t.foreground = c(0xe6_e6e6);
+        t.border = c(0x38_3838);
+        t.muted = c(0x1e_1e1e);
+        t.muted_foreground = c(0x8a_8a8a);
+        t.primary = c(0x00_c8d2);
         t.primary_foreground = c(0xff_ffff);
-        t.accent = c(0x2a_2f38);
-        t.secondary = c(0x2a_2f38);
+        t.primary_hover = c(0x1f_d6df);
+        t.primary_active = c(0x00_aab3);
+        // 主按钮（导出等）单独有一套颜色，不跟着 primary 变
+        t.button_primary = c(0x00_c8d2);
+        t.button_primary_hover = c(0x1f_d6df);
+        t.button_primary_active = c(0x00_aab3);
+        t.button_primary_foreground = c(0xff_ffff);
+        t.accent = c(0x33_3333);
+        t.secondary = c(0x33_3333);
     });
 }

@@ -21,6 +21,42 @@ pub enum Encoder {
     X264,
 }
 
+/// 视频编码格式（剪映导出对话框的「视频编码」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Codec {
+    /// H.264：最通用。
+    #[default]
+    H264,
+    /// HEVC（H.265）：同样画质文件更小。
+    Hevc,
+}
+
+/// 推荐码率（kbps）：按每像素每帧 0.15 比特估，720p30 约 4 Mbps、1080p30 约 9 Mbps；HEVC 再省三成。
+#[must_use]
+pub fn recommended_kbps(width: u32, height: u32, frame_rate: FrameRate, codec: Codec) -> u32 {
+    let pixels = f64::from(width) * f64::from(height);
+    let kbps = pixels * frame_rate.as_f64() * 0.15 / 1000.0;
+    let kbps = match codec {
+        Codec::H264 => kbps,
+        Codec::Hevc => kbps * 0.7,
+    };
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "码率为正且远小于 u32 上限"
+    )]
+    let rounded = ((kbps / 100.0).round() * 100.0) as u32;
+    rounded.clamp(500, 200_000)
+}
+
+/// 估计的文件大小（字节）：视频码率 + 音频 192 kbps，乘以时长。
+#[must_use]
+pub fn estimated_bytes(video_kbps: u32, duration: Time) -> u64 {
+    let kbps = u64::from(video_kbps) + 192;
+    let ms = u64::try_from(duration.as_millis().max(0)).unwrap_or(0);
+    kbps * ms / 8
+}
+
 /// 导出设置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportSettings {
@@ -36,6 +72,8 @@ pub struct ExportSettings {
     pub video_bitrate_kbps: u32,
     /// 编码器。
     pub encoder: Encoder,
+    /// 编码格式。
+    pub codec: Codec,
     /// 画面合成器配置（测试里用软件显卡）。
     pub render: ve_render::RenderConfig,
 }
@@ -99,7 +137,7 @@ fn media_clips(project: &Project, kind: TrackKind) -> Vec<&Clip> {
         .iter()
         .filter(|t| t.kind == kind)
         .flat_map(|t| t.clips.iter().map(AsRef::as_ref))
-        .filter(|c| c.asset().is_some())
+        .filter(|c| c.asset().is_some() && c.enabled())
         .collect();
     clips.sort_by_key(|c| c.start);
     clips
@@ -141,7 +179,7 @@ fn push_audio_inputs<'a>(
     project: &'a Project,
     clips: &[&'a Clip],
     args: &mut Vec<OsString>,
-) -> Vec<(usize, &'a Clip)> {
+) -> Vec<AudioInput<'a>> {
     let mut audio_inputs = Vec::new();
     for &clip in clips {
         let Some(asset) = clip.asset().and_then(|a| project.assets.get(&a)) else {
@@ -150,17 +188,33 @@ fn push_audio_inputs<'a>(
         if asset.audio.is_none() {
             continue;
         }
+        // 转场处声音越过片段边界（和预览同一套算法）
+        let Some(sound) = ve_core::compose::audio_span(project, clip.id) else {
+            continue;
+        };
         args.extend([
             "-ss".into(),
-            secs(clip.source_in()).into(),
+            secs(clip.source_at(sound.start - clip.start).max(Time::ZERO)).into(),
             "-t".into(),
-            secs(clip.duration).into(),
+            // 变速：截取的是素材里用到的那一段
+            secs((sound.end - sound.start).scaled(f64::from(clip.speed))).into(),
             "-i".into(),
             asset.path.clone().into_os_string(),
         ]);
-        audio_inputs.push((audio_inputs.len() + 1, clip));
+        audio_inputs.push(AudioInput {
+            index: audio_inputs.len() + 1,
+            clip,
+            sound,
+        });
     }
     audio_inputs
+}
+
+/// 一路音频输入：ffmpeg 输入序号、片段、声音实际放的那一段。
+struct AudioInput<'a> {
+    index: usize,
+    clip: &'a Clip,
+    sound: ve_core::compose::AudioSpan,
 }
 
 /// 视频链：合成好的画面直接用，有字幕时再烧录。
@@ -173,34 +227,58 @@ fn video_chain(graph: &mut String, with_subtitles: bool) {
     let _ = writeln!(graph, "[0:v]{subs}[vout];");
 }
 
-fn audio_chain(graph: &mut String, audio_inputs: &[(usize, &Clip)], duration: Time) {
+/// 变速的音频滤镜（原速是空串）。保持音调：`atempo`（每级只能 0.5–2，超出就等分成几级串起来）；
+/// 变调：把采样率当成「倍数 × 48k」再重采样回 48k，快慢和音调一起变。都和预览一致。
+fn speed_filter(clip: &Clip) -> String {
+    #[expect(clippy::float_cmp, reason = "原速是精确的 1.0")]
+    if clip.speed == 1.0 {
+        return String::new();
+    }
+    if !clip.keep_pitch {
+        return format!(
+            ",asetrate={:.3},aresample={MIX_RATE}",
+            f64::from(MIX_RATE) * f64::from(clip.speed)
+        );
+    }
+    let speed = f64::from(clip.speed);
+    // 每级最多 ×2 或 ÷2：级数 = ⌈|log2 倍数|⌉，每级一样大
+    #[expect(clippy::cast_possible_truncation, reason = "倍数 0.1–10，最多 4 级")]
+    let stages = (speed.log2().abs().ceil() as i32).max(1);
+    let step = speed.powf(1.0 / f64::from(stages));
+    format!(",atempo={step:.6}").repeat(usize::try_from(stages).unwrap_or(1))
+}
+
+fn audio_chain(graph: &mut String, audio_inputs: &[AudioInput<'_>], duration: Time) {
     let _ = writeln!(
         graph,
         "anullsrc=r={MIX_RATE}:cl=stereo,atrim=duration={}[abase];",
         secs(duration)
     );
     let mut mix_labels = String::from("[abase]");
-    for &(index, clip) in audio_inputs {
+    for &AudioInput { index, clip, sound } in audio_inputs {
+        let speed = speed_filter(clip);
         let _ = write!(
             graph,
-            "[{index}:a]aresample={MIX_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo,volume={:.6}",
+            "[{index}:a]aresample={MIX_RATE}{speed},aformat=sample_fmts=fltp:channel_layouts=stereo,volume={:.6}",
             10f64.powf(f64::from(clip.gain_db) / 20.0)
         );
-        if clip.fade_in > Time::ZERO {
-            let _ = write!(graph, ",afade=t=in:st=0:d={}", secs(clip.fade_in));
+        // 和预览一样：转场处两段的声音叠在一起交叉淡化
+        let (fade_in, fade_out) = (sound.fade_in, sound.fade_out);
+        if fade_in > Time::ZERO {
+            let _ = write!(graph, ",afade=t=in:st=0:d={}", secs(fade_in));
         }
-        if clip.fade_out > Time::ZERO {
+        if fade_out > Time::ZERO {
             let _ = write!(
                 graph,
                 ",afade=t=out:st={}:d={}",
-                secs(clip.duration - clip.fade_out),
-                secs(clip.fade_out)
+                secs(sound.end - sound.start - fade_out),
+                secs(fade_out)
             );
         }
         let _ = writeln!(
             graph,
             ",adelay=delays={}S:all=1[a{index}];",
-            clip.start.to_samples(MIX_RATE)
+            sound.start.to_samples(MIX_RATE)
         );
         let _ = write!(mix_labels, "[a{index}]");
     }
@@ -234,9 +312,21 @@ fn push_output(args: &mut Vec<OsString>, settings: &ExportSettings, duration: Ti
         .map(OsString::from),
     );
     let kbps = settings.video_bitrate_kbps.max(100);
-    let codec: &[&str] = match settings.encoder {
-        Encoder::Nvenc => &["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr"],
-        Encoder::X264 => &["-c:v", "libx264", "-preset", "medium"],
+    // HEVC 加 hvc1 标签：苹果设备和大多数播放器才认 mp4 里的 HEVC
+    let codec: &[&str] = match (settings.encoder, settings.codec) {
+        (Encoder::Nvenc, Codec::H264) => &["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr"],
+        (Encoder::X264, Codec::H264) => &["-c:v", "libx264", "-preset", "medium"],
+        (Encoder::Nvenc, Codec::Hevc) => &[
+            "-c:v",
+            "hevc_nvenc",
+            "-preset",
+            "p5",
+            "-rc",
+            "vbr",
+            "-tag:v",
+            "hvc1",
+        ],
+        (Encoder::X264, Codec::Hevc) => &["-c:v", "libx265", "-preset", "medium", "-tag:v", "hvc1"],
     };
     args.extend(codec.iter().map(OsString::from));
     args.extend(
@@ -320,8 +410,117 @@ mod tests {
             frame_rate: FrameRate::new(30, 1),
             video_bitrate_kbps: 8000,
             encoder: Encoder::X264,
+            codec: Codec::H264,
             render: ve_render::RenderConfig { software: true },
         }
+    }
+
+    #[test]
+    fn transitions_fade_the_sound_around_the_cut() {
+        let (mut p, ids) = sample_project();
+        ve_core::edit::set_transition(
+            &mut p,
+            ids.v2,
+            Some(ve_core::Transition {
+                kind: ve_core::TransitionKind::Dissolve,
+                duration: Time::from_secs(2),
+            }),
+        )
+        .unwrap();
+        let job = build_job(&p, &settings(), false).unwrap();
+        let graph = &job.filter_graph;
+        // 和预览一样两段叠在一起：v1 放到 6 秒（4–6 秒淡出），v2 从 4 秒起（4–6 秒淡入）
+        assert!(
+            graph.contains("afade=t=out:st=4.000000:d=2.000000"),
+            "{graph}"
+        );
+        assert!(graph.contains("afade=t=in:st=0:d=2.000000"), "{graph}");
+        assert!(
+            graph.contains("adelay=delays=192000S"),
+            "v2 从 4 秒起：{graph}"
+        );
+        let args: Vec<String> = job
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let joined = args.join(" ");
+        // v1 取素材 0–6 秒，v2 取素材 4–8 秒
+        assert!(joined.contains("-ss 0.000000 -t 6.000000"), "{joined}");
+        assert!(joined.contains("-ss 4.000000 -t 4.000000"), "{joined}");
+    }
+
+    #[test]
+    fn keeping_the_pitch_chains_atempo_within_its_range() {
+        let (mut p, ids) = sample_project();
+        p.settings.main_magnet = false;
+        ve_core::edit::set_speed(&mut p, ids.v2, 5.0).unwrap();
+        ve_core::edit::set_speed(&mut p, ids.v1, 0.25).unwrap_err();
+        let graph = build_job(&p, &settings(), false).unwrap().filter_graph;
+        // 5 倍：三级各 1.71 倍
+        assert!(
+            graph.contains("atempo=1.709976,atempo=1.709976,atempo=1.709976,"),
+            "{graph}"
+        );
+        assert!(!graph.contains("asetrate"), "{graph}");
+        let mut c = Clip::clone(p.timeline.find_clip(ids.v1).unwrap().1);
+        c.speed = 0.25;
+        assert_eq!(speed_filter(&c), ",atempo=0.500000,atempo=0.500000");
+        c.speed = 1.5;
+        assert_eq!(speed_filter(&c), ",atempo=1.500000");
+        c.speed = 1.0;
+        assert_eq!(speed_filter(&c), "");
+    }
+
+    #[test]
+    fn sped_up_clips_take_more_source_and_shift_pitch() {
+        let (mut p, ids) = sample_project();
+        p.settings.main_magnet = false;
+        ve_core::edit::set_speed(&mut p, ids.v2, 2.0).unwrap();
+        ve_core::edit::set_keep_pitch(&mut p, ids.v2, false).unwrap();
+        let job = build_job(&p, &settings(), false).unwrap();
+        let args = args_text(&job);
+        // v2 在时间轴上 1.5 秒，用掉素材 5–8 秒
+        assert!(
+            args.contains("-ss 5.000000 -t 3.000000 -i clip.mp4"),
+            "{args}"
+        );
+        assert!(
+            job.filter_graph
+                .contains("asetrate=96000.000,aresample=48000"),
+            "{}",
+            job.filter_graph
+        );
+    }
+
+    #[test]
+    fn hevc_uses_hevc_encoders_with_hvc1_tag() {
+        let (p, _) = sample_project();
+        let mut s = settings();
+        s.codec = Codec::Hevc;
+        let args = args_text(&build_job(&p, &s, false).unwrap());
+        assert!(
+            args.contains("-c:v libx265 -preset medium -tag:v hvc1"),
+            "{args}"
+        );
+        s.encoder = Encoder::Nvenc;
+        let nvenc = args_text(&build_job(&p, &s, false).unwrap());
+        assert!(nvenc.contains("-c:v hevc_nvenc"), "{nvenc}");
+    }
+
+    #[test]
+    fn recommended_bitrate_and_size_estimate() {
+        let fps30 = FrameRate::new(30, 1);
+        assert_eq!(recommended_kbps(1920, 1080, fps30, Codec::H264), 9300);
+        assert_eq!(recommended_kbps(1280, 720, fps30, Codec::H264), 4100);
+        assert_eq!(recommended_kbps(1920, 1080, fps30, Codec::Hevc), 6500);
+        assert_eq!(
+            recommended_kbps(64, 36, fps30, Codec::H264),
+            500,
+            "最少 500"
+        );
+        // 10 秒、8000 + 192 kbps：约 10 MB
+        assert_eq!(estimated_bytes(8000, Time::from_secs(10)), 10_240_000);
     }
 
     fn args_text(job: &FfmpegJob) -> String {
@@ -330,6 +529,15 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    #[test]
+    fn disabled_audio_is_left_out_of_the_mix() {
+        let (mut p, ids) = sample_project();
+        ve_core::edit::set_disabled(&mut p, &[ids.a1], true).unwrap();
+        let args = args_text(&build_job(&p, &settings(), true).unwrap());
+        assert!(!args.contains("bgm.mp3"), "{args}");
+        assert!(args.contains("clip.mp4"), "{args}");
     }
 
     #[test]
