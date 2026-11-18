@@ -24,3 +24,6 @@ logs/
 
 # 性能测试输出
 ve-bench.log
+
+# 打包输出
+/dist/

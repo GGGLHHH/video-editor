@@ -1,0 +1,64 @@
+# 打包：推 v* 标签时先跑全量检查，再打 Windows 压缩包并建 GitHub Release；
+# 也可以在 Actions 页面手动运行（只生成压缩包，作为运行产物保留 14 天，不建 Release）。
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    uses: ./.github/workflows/ci.yml
+
+  package:
+    name: 打包（Windows x64）
+    needs: check
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+      # C 运行库静态链接：用户电脑上不用另装 VC++ 运行库
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust 工具链（按 rust-toolchain.toml）
+        run: rustup toolchain install
+
+      - name: libclang（ffmpeg-sys 的 bindgen 要用）
+        run: |
+          if (-not (Test-Path "$env:LIBCLANG_PATH\libclang.dll")) { choco install llvm -y --no-progress }
+          Test-Path "$env:LIBCLANG_PATH\libclang.dll"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      - name: FFmpeg（固定版本，校验哈希）
+        run: pwsh scripts/setup-ffmpeg.ps1 -Dest "$env:RUNNER_TEMP\ffmpeg"
+
+      - name: 编译发布版
+        run: cargo build --release --locked -p ve-app
+
+      - name: 打包
+        run: pwsh scripts/package.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: video-editor-windows-x64
+          path: dist/*.zip
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: 建 GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = (Get-ChildItem dist\*.zip).FullName
+          gh release create $env:GITHUB_REF_NAME $zip --title "视频剪辑器 $env:GITHUB_REF_NAME" --generate-notes

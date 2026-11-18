@@ -1,0 +1,47 @@
+# 全量检查：推到 main、提 PR 时跑；发布流程打包前也先调用它。
+# 和本机一样跑 scripts/check.ps1（格式、clippy、测试、文档、依赖审计、无用依赖、覆盖率门槛）。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+concurrency:
+  group: ${{ github.workflow }}-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: 全量检查（Windows）
+    runs-on: windows-latest
+    timeout-minutes: 150
+    env:
+      CARGO_TERM_COLOR: always
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust 工具链（按 rust-toolchain.toml）
+        run: rustup toolchain install
+
+      - name: libclang（ffmpeg-sys 的 bindgen 要用）
+        run: |
+          if (-not (Test-Path "$env:LIBCLANG_PATH\libclang.dll")) { choco install llvm -y --no-progress }
+          Test-Path "$env:LIBCLANG_PATH\libclang.dll"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: FFmpeg（固定版本，校验哈希）
+        run: pwsh scripts/setup-ffmpeg.ps1 -Dest "$env:RUNNER_TEMP\ffmpeg"
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-machete,cargo-llvm-cov
+
+      - name: 全量检查
+        run: pwsh scripts/check.ps1

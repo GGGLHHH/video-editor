@@ -75,6 +75,25 @@ cargo run --release -p ve-app -- 工程.vep              # 打开工程
 cargo run --release -p ve-app -- a.mp4 bgm.m4a        # 导入素材并依次放进时间轴
 ```
 
+## 打包与发布
+
+GitHub Actions 自动做（只打 Windows x64）：
+- 推到 main、提 PR：跑全量检查（`.github/workflows/ci.yml`）。
+- 推 `v*` 标签：先跑全量检查，再打压缩包，建 GitHub Release（`.github/workflows/release.yml`）。
+- 在 Actions 页面手动运行 Release：只生成压缩包，作为运行产物保留 14 天。
+
+压缩包解压即用：`video-editor.exe` + FFmpeg 的 DLL 和 `ffmpeg.exe` + `licenses/`。
+附带的是 gyan.dev 的 FFmpeg 9.0.2 完整版（GPLv3），所以压缩包按 GPLv3 分发；源码本身仍是 Apache-2.0。
+
+本机打包：
+
+```powershell
+$ff = pwsh scripts/setup-ffmpeg.ps1          # 下载固定版本的 FFmpeg 并校验哈希，放进 target/ffmpeg
+$env:RUSTFLAGS = '-C target-feature=+crt-static'
+cargo build --release -p ve-app
+pwsh scripts/package.ps1 -FfmpegDir $ff      # → dist/video-editor-<版本>-windows-x64.zip
+```
+
 ## 质量检查
 
 ```sh
