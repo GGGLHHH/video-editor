@@ -18,5 +18,5 @@ pub use frame_cache::FrameCache;
 pub use mix::{clamp_mix, gain_at, mix_into, resample_linear};
 pub use resolve::{
     AudioSegment, LayerSource, VideoSource, preview_canvas, resolve_audio, resolve_layers,
-    resolve_subtitles, resolve_video,
+    resolve_subtitle_poses, resolve_subtitles, resolve_video,
 };

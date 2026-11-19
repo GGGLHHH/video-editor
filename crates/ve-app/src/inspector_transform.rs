@@ -5,9 +5,11 @@ use crate::workspace::Workspace;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{
+    Input, InputEvent, InputState, NumberInput, NumberInputEvent, NumberStep, StepAction,
+};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, Styled as _, Subscription, Window, div, px,
@@ -32,9 +34,38 @@ pub struct TransformFields {
     crop: [Entity<InputState>; 4],
     opacity: Entity<SliderState>,
     opacity_gesture: bool,
+    /// 缩放滑块（1%–400%，剪映的「缩放」那一条）；超出范围的值靠输入框打。
+    scale_slider: Entity<SliderState>,
+    scale_gesture: bool,
     /// 上次填进输入框的文字：没被改过的字段提交时沿用片段的精确值，
     /// 不会把四舍五入后的显示值写回去（预览上拖出来的值精度比显示的高）。
     shown: [String; 8],
+}
+
+/// 缩放滑块的范围（%）。
+const SCALE_SLIDER: (f32, f32) = (1.0, 400.0);
+
+/// 带「−」「+」的数值框。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepField {
+    X,
+    Y,
+    Scale,
+    Rotation,
+}
+
+/// 按一格之后的文字：每格 1（%，或 1°）；文字不是数时从 0 起。
+fn stepped(text: &str, action: StepAction) -> String {
+    let v = text
+        .trim()
+        .trim_end_matches(['%', '°'])
+        .parse::<f64>()
+        .unwrap_or(0.0);
+    let next = match action {
+        StepAction::Increment => v + 1.0,
+        StepAction::Decrement => v - 1.0,
+    };
+    one_decimal(next)
 }
 
 /// 比例 → 百分比文字（去掉多余的小数）。
@@ -109,6 +140,7 @@ pub fn transform_from_text(current: &Transform, fields: &[String; 8]) -> Option<
         },
         opacity: current.opacity,
         rotation: wrap_degrees(parse_deg(&fields[7]).unwrap_or(current.rotation)),
+        mirror: current.mirror,
     };
     t.is_valid().then_some(t)
 }
@@ -116,13 +148,27 @@ pub fn transform_from_text(current: &Transform, fields: &[String; 8]) -> Option<
 impl TransformFields {
     /// 创建控件并订阅事件。
     pub fn new(window: &mut Window, cx: &mut Context<'_, Workspace>) -> (Self, Vec<Subscription>) {
-        let mut input = || cx.new(|cx| InputState::new(window, cx).placeholder("0"));
+        // 「−」「+」不让输入框自己悄悄改文字（那样不发事件），改成发 Step 事件，由这里改值并提交
+        let mut input = || {
+            cx.new(|cx| {
+                let mut state = InputState::new(window, cx).placeholder("0");
+                state.set_step(None::<NumberStep>, window, cx);
+                state
+            })
+        };
         let (x, y, scale, rotation) = (input(), input(), input(), input());
         let crop = [input(), input(), input(), input()];
         let opacity = cx.new(|_| {
             SliderState::new()
                 .min(0.0)
                 .max(100.0)
+                .step(1.0)
+                .default_value(100.0)
+        });
+        let scale_slider = cx.new(|_| {
+            SliderState::new()
+                .min(SCALE_SLIDER.0)
+                .max(SCALE_SLIDER.1)
                 .step(1.0)
                 .default_value(100.0)
         });
@@ -146,6 +192,29 @@ impl TransformFields {
             window,
             |this: &mut Workspace, _, e: &SliderEvent, window, cx| this.on_opacity(e, window, cx),
         ));
+        subs.push(cx.subscribe_in(
+            &scale_slider,
+            window,
+            |this: &mut Workspace, _, e: &SliderEvent, window, cx| {
+                this.on_scale_slider(e, window, cx);
+            },
+        ));
+        // 数值框两边的「−」「+」（和方向键 ↑ ↓）：按一格改值并立即生效
+        for (field, state) in [
+            (StepField::X, &x),
+            (StepField::Y, &y),
+            (StepField::Scale, &scale),
+            (StepField::Rotation, &rotation),
+        ] {
+            subs.push(cx.subscribe_in(
+                state,
+                window,
+                move |this: &mut Workspace, _, e: &NumberInputEvent, window, cx| {
+                    let NumberInputEvent::Step(action) = e;
+                    this.step_transform(field, *action, window, cx);
+                },
+            ));
+        }
         (
             Self {
                 x,
@@ -155,6 +224,8 @@ impl TransformFields {
                 crop,
                 opacity,
                 opacity_gesture: false,
+                scale_slider,
+                scale_gesture: false,
                 shown: Default::default(),
             },
             subs,
@@ -248,6 +319,72 @@ impl Workspace {
         let opacity = t.opacity * 100.0;
         f.opacity
             .update(cx, |s, cx| s.set_value(opacity, window, cx));
+        let scale = (t.scale * 100.0).clamp(SCALE_SLIDER.0, SCALE_SLIDER.1);
+        f.scale_slider
+            .update(cx, |s, cx| s.set_value(scale, window, cx));
+    }
+
+    /// 数值框的「−」「+」：改这一格、立即提交（一步撤销）。
+    fn step_transform(
+        &mut self,
+        field: StepField,
+        action: StepAction,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let f = &self.inspector.transform;
+        let state = match field {
+            StepField::X => &f.x,
+            StepField::Y => &f.y,
+            StepField::Scale => &f.scale,
+            StepField::Rotation => &f.rotation,
+        }
+        .clone();
+        let text = stepped(&state.read(cx).value(), action);
+        state.update(cx, |s, cx| s.set_value(text, window, cx));
+        self.commit_transform(window, cx);
+    }
+
+    /// 缩放滑块：拖动中实时改，松手合成一步撤销（和不透明度一样）。
+    fn on_scale_slider(
+        &mut self,
+        e: &SliderEvent,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((clip, current, at)) = self.bound_video_clip() else {
+            return;
+        };
+        match e {
+            SliderEvent::Change(v) => {
+                if !self.inspector.transform.scale_gesture {
+                    self.doc.begin_gesture();
+                    self.inspector.transform.scale_gesture = true;
+                }
+                let t = Transform {
+                    scale: (v.start() / 100.0)
+                        .clamp(Transform::SCALE_RANGE.0, Transform::SCALE_RANGE.1),
+                    ..current
+                };
+                let _ = self.doc.edit(|p| apply_transform_at(p, clip, at, t));
+                self.after_change(window, cx);
+                // 输入框跟着滑块走
+                if let Some((_, now, _)) = self.bound_video_clip() {
+                    let text = shown_texts(&now)[2].clone();
+                    self.inspector.transform.shown[2].clone_from(&text);
+                    self.inspector
+                        .transform
+                        .scale
+                        .update(cx, |s, cx| s.set_value(text, window, cx));
+                }
+            }
+            SliderEvent::Release(_) => {
+                if self.inspector.transform.scale_gesture {
+                    self.doc.end_gesture();
+                    self.inspector.transform.scale_gesture = false;
+                }
+            }
+        }
     }
 
     /// 输入框改完（回车 / 失焦）：按各字段写回；无效时恢复显示原值。
@@ -405,6 +542,15 @@ impl Workspace {
                 .test_support()
                 .child(Input::new(state))
         };
+        // 带「−」「+」的数值框（剪映的 ⇕ 微调）
+        let number = |id: &'static str, state: &Entity<InputState>| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .id(id)
+                .test_support()
+                .child(NumberInput::new(state).xsmall())
+        };
         let tag = |label: &'static str| div().text_xs().text_color(muted).child(label);
         // 剪映式：一行一个属性，左边名字、中间数值、右边这一行的关键帧 ‹ ◇ ›
         let line = |label: &'static str, body: gpui_kit::AnyElement, group: KeyGroup| {
@@ -428,7 +574,18 @@ impl Workspace {
                 .children(self.render_keyframe_bar(cx))
                 .child(line(
                     "缩放 %",
-                    field("tf-scale", &f.scale).into_any_element(),
+                    h_flex()
+                        .flex_1()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .id("tf-scale-slider")
+                                .test_support()
+                                .child(Slider::new(&f.scale_slider)),
+                        )
+                        .child(div().w(px(96.)).child(number("tf-scale", &f.scale)))
+                        .into_any_element(),
                     KeyGroup::Scale,
                 ))
                 .child(line(
@@ -437,16 +594,16 @@ impl Workspace {
                         .flex_1()
                         .gap_1()
                         .child(tag("X"))
-                        .child(field("tf-x", &f.x))
+                        .child(number("tf-x", &f.x))
                         .child(tag("Y"))
-                        .child(field("tf-y", &f.y))
+                        .child(number("tf-y", &f.y))
                         .into_any_element(),
                     KeyGroup::Position,
                 ))
                 .child(Self::render_align_row(cx))
                 .child(line(
                     "旋转 °",
-                    field("tf-rotation", &f.rotation).into_any_element(),
+                    number("tf-rotation", &f.rotation).into_any_element(),
                     KeyGroup::Rotation,
                 ))
                 .child(line(
@@ -467,26 +624,31 @@ impl Workspace {
                 ))
                 .child(line(
                     "不透明度",
-                    h_flex()
-                        .flex_1()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex_1()
-                                .id("tf-opacity")
-                                .test_support()
-                                .child(Slider::new(&f.opacity)),
-                        )
-                        .child(
-                            div()
-                                .w(px(48.))
-                                .text_sm()
-                                .child(SharedString::from(format!("{}%", pct(t.opacity)))),
-                        )
-                        .into_any_element(),
+                    self.opacity_row(t.opacity),
                     KeyGroup::Opacity,
                 )),
         )
+    }
+
+    /// 不透明度：滑块 + 百分比。
+    fn opacity_row(&self, opacity: f32) -> gpui_kit::AnyElement {
+        h_flex()
+            .flex_1()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .id("tf-opacity")
+                    .test_support()
+                    .child(Slider::new(&self.inspector.transform.opacity)),
+            )
+            .child(
+                div()
+                    .w(px(48.))
+                    .text_sm()
+                    .child(SharedString::from(format!("{}%", pct(opacity)))),
+            )
+            .into_any_element()
     }
 }
 
@@ -496,6 +658,19 @@ mod tests {
 
     fn fields(v: [&str; 8]) -> [String; 8] {
         v.map(str::to_owned)
+    }
+
+    #[test]
+    fn steppers_move_one_unit() {
+        assert_eq!(stepped("12", StepAction::Increment), "13");
+        assert_eq!(stepped("0.5", StepAction::Decrement), "-0.5");
+        assert_eq!(stepped(" 100% ", StepAction::Decrement), "99");
+        assert_eq!(stepped("45°", StepAction::Increment), "46");
+        assert_eq!(
+            stepped("abc", StepAction::Increment),
+            "1",
+            "不是数时从 0 起"
+        );
     }
 
     #[test]

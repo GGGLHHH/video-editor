@@ -106,6 +106,7 @@ pub fn sample_project() -> (Project, SampleIds) {
         duration: Time::from_secs(2),
         content: ClipContent::Subtitle {
             text: "你好".into(),
+            motion: crate::TextMotion::default(),
         },
         gain_db: 0.0,
         fade_in: Time::ZERO,

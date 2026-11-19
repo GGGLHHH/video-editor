@@ -64,11 +64,12 @@ fn slider_value(v: f32) -> f32 {
 }
 
 impl Workspace {
-    /// 选中的视频片段现在的调色。
+    /// 选中的视频片段（或调节片段）现在的调色。
     fn bound_adjust(&self) -> Option<(ve_core::ClipId, ColorAdjust)> {
-        let (clip, ..) = self.bound_video_clip()?;
-        let (_, c) = self.doc.project.timeline.find_clip(clip)?;
-        Some((clip, c.adjust))
+        let clip = self.inspector.bound?;
+        let (track, c) = self.doc.project.timeline.find_clip(clip)?;
+        let video = self.doc.project.timeline.track(track)?.kind == ve_core::TrackKind::Video;
+        video.then_some((clip, c.adjust))
     }
 
     /// 把片段的调色填进滑条。

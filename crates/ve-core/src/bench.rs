@@ -24,6 +24,7 @@ pub fn layer_transform(i: usize) -> Transform {
         crop: Crop::default(),
         opacity: 1.0,
         rotation: 0.0,
+        mirror: false,
     }
 }
 

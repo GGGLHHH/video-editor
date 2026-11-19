@@ -1,7 +1,12 @@
 //! 文档：一个打开的工程 + 撤销历史 + 选择 + 保存状态。不依赖界面框架。
 
 use std::path::{Path, PathBuf};
-use ve_core::{Asset, AssetId, ClipId, EditError, History, Project};
+use ve_core::{Asset, AssetId, ClipId, EditError, History, Project, Timeline, TrackId};
+
+/// 轨道没锁（找不到的轨道当成锁着）。
+fn unlocked(timeline: &Timeline, track: TrackId) -> bool {
+    timeline.track(track).is_some_and(|t| !t.locked)
+}
 
 /// 撤销步数上限。
 const HISTORY_LIMIT: usize = 200;
@@ -57,7 +62,12 @@ impl Document {
         self.dirty = true;
         self.revision += 1;
         let timeline = &self.project.timeline;
-        self.selection.retain(|c| timeline.find_clip(*c).is_some());
+        // 删掉的、所在轨道刚锁上的都不再选中
+        self.selection.retain(|c| {
+            timeline
+                .find_clip(*c)
+                .is_some_and(|(t, _)| unlocked(timeline, t))
+        });
     }
 
     /// 执行一次编辑：成功且确有变化才记撤销步骤；失败时什么都不变。
@@ -71,9 +81,20 @@ impl Document {
     ) -> Result<T, EditError> {
         let before = self.project.clone();
         let layout = ve_core::magnet::Layout::of(&self.project.timeline);
-        let out = f(&mut self.project)?;
+        let out = match f(&mut self.project) {
+            Ok(out) => out,
+            Err(e) => {
+                self.project = before;
+                return Err(e);
+            }
+        };
         // 主轨磁吸 / 联动：每次编辑后收尾（开关在工程设置里）
         ve_core::magnet::settle(&mut self.project, &layout);
+        // 锁定的轨道：动到了就整步撤回
+        if let Err(e) = ve_core::edit::check_locked(&before.timeline, &self.project.timeline) {
+            self.project = before;
+            return Err(e);
+        }
         if self.project != before {
             self.history.record(&before);
             self.changed();
@@ -167,6 +188,10 @@ impl Document {
 
     /// 选中片段；`additive` 时切换该片段的选中状态。
     pub fn select(&mut self, clip: ClipId, additive: bool) {
+        // 锁定轨道上的片段点不中
+        if !self.selectable(clip) {
+            return;
+        }
         self.anchor = Some(clip);
         if !additive {
             self.selection = vec![clip];
@@ -199,6 +224,7 @@ impl Document {
         let (lo, hi) = (from.1.min(target.1), from.2.max(target.2));
         self.selection = tl.tracks[top..=bottom]
             .iter()
+            .filter(|t| !t.locked)
             .flat_map(|t| t.clips.iter())
             .filter(|c| c.start < hi && c.end() > lo)
             .map(|c| c.id)
@@ -210,7 +236,7 @@ impl Document {
         let tl = &self.project.timeline;
         let mut out: Vec<ClipId> = Vec::with_capacity(clips.len());
         for c in clips {
-            if !out.contains(&c) && tl.find_clip(c).is_some() {
+            if !out.contains(&c) && tl.find_clip(c).is_some_and(|(t, _)| unlocked(tl, t)) {
                 out.push(c);
             }
         }
@@ -230,8 +256,16 @@ impl Document {
             .timeline
             .tracks
             .iter()
+            .filter(|t| !t.locked)
             .flat_map(|t| t.clips.iter().map(|c| c.id))
             .collect();
+    }
+
+    /// 片段能不能选中：存在、且不在锁定的轨道上。
+    #[must_use]
+    pub fn selectable(&self, clip: ClipId) -> bool {
+        let tl = &self.project.timeline;
+        tl.find_clip(clip).is_some_and(|(t, _)| unlocked(tl, t))
     }
 
     /// 取消选择。
@@ -426,6 +460,35 @@ mod tests {
         d.select(ids.a1, false);
         d.clear_selection();
         assert_eq!(d.selection(), &[] as &[ClipId]);
+    }
+
+    #[test]
+    fn locked_tracks_cannot_be_selected_or_edited() {
+        use ve_core::edit::{TrackFlag, set_track_flag};
+        let (mut d, ids) = doc();
+        d.select(ids.a1, false);
+        d.edit(|p| set_track_flag(p, ids.audio_track, TrackFlag::Locked, true))
+            .unwrap();
+        assert_eq!(d.selection(), &[] as &[ClipId], "锁上后不再选中");
+        d.select(ids.a1, false);
+        assert_eq!(d.selection(), &[] as &[ClipId]);
+        d.select_all();
+        assert!(!d.selection().contains(&ids.a1));
+        d.set_selection(vec![ids.a1, ids.v1]);
+        assert_eq!(d.selection(), &[ids.v1]);
+        d.select(ids.s1, false);
+        d.select_range(ids.v2);
+        assert!(!d.selection().contains(&ids.a1));
+        // 直接改锁着轨道上的片段：整步撤回，不记撤销
+        let before = d.project.clone();
+        assert_eq!(
+            d.edit(|p| delete_clips(p, &[ids.a1])),
+            Err(EditError::TrackLocked)
+        );
+        assert_eq!(d.project, before);
+        // 锁定本身能撤销
+        assert!(d.undo());
+        assert!(!d.project.timeline.track(ids.audio_track).unwrap().locked);
     }
 
     #[test]

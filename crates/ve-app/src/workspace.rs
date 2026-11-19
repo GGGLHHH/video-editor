@@ -13,6 +13,7 @@ use crate::timeline::view::TimelineUi;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{ActiveTheme as _, WindowExt as _, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, Context, Entity, ExternalPaths, FocusHandle, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, RenderImage, Styled as _, Subscription, Task, Window,
@@ -36,6 +37,52 @@ pub struct MediaThumbs {
 
 /// J / L 穿梭播放的最高倍数。
 const MAX_SHUTTLE: f32 = 8.0;
+
+/// 顶栏的弹出框。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Popup {
+    /// 「菜单」。
+    Menu,
+    /// 「布局」。
+    Layout,
+    /// 快捷键一览。
+    Shortcuts,
+}
+
+impl Workspace {
+    /// 打开 / 关上一个弹出框（开着别的就换成它）。
+    pub(crate) fn toggle_popup(&mut self, popup: Popup) {
+        self.popup = (self.popup != Some(popup)).then_some(popup);
+    }
+
+    /// 在弹出框外按下鼠标：关掉它，记下按在哪（见 [`Self::click_popup_button`]）。
+    pub(crate) const fn dismiss_popup(&mut self, at: gpui_kit::Point<gpui_kit::Pixels>) {
+        if let Some(open) = self.popup.take() {
+            self.popup_dismissed = Some((open, at));
+        }
+    }
+
+    /// 点弹出框的按钮。弹出框开着时点它的按钮，按下那一刻弹出框已经因为「点到外面」关了，
+    /// 松开时不能再把它打开——这一下就是要关。
+    pub(crate) fn click_popup_button(&mut self, popup: Popup, e: &gpui_kit::ClickEvent) {
+        let down = match e {
+            gpui_kit::ClickEvent::Mouse(m) => Some(m.down.position),
+            _ => None,
+        };
+        if let Some((closed, at)) = self.popup_dismissed.take()
+            && closed == popup
+            && Some(at) == down
+        {
+            return;
+        }
+        self.toggle_popup(popup);
+    }
+
+    /// 这个弹出框开着没有。
+    pub(crate) fn popup_open(&self, popup: Popup) -> bool {
+        self.popup == Some(popup)
+    }
+}
 
 /// 主窗口视图。
 pub struct Workspace {
@@ -63,18 +110,22 @@ pub struct Workspace {
     pub(crate) transition_secs: f64,
     /// 布局模式。
     pub(crate) layout: crate::layout::LayoutMode,
-    /// 顶栏「布局」菜单是否展开。
-    pub(crate) layout_menu: bool,
     /// 片段 / 属性剪贴板。
     pub(crate) clipboard: crate::clip_ops::ClipBoard,
     /// 自动保存（正式启动的程序才打开）。
     pub(crate) autosave: Option<crate::autosave::Autosave>,
     /// 素材面板当前的一级标签。
     pub(crate) bin_tab: crate::media_bin::BinTab,
-    /// 顶栏「菜单」是否展开。
-    pub(crate) menu_open: bool,
+    /// 顶栏展开着的弹出框（菜单、布局、快捷键），同时只开一个。
+    pub(crate) popup: Option<Popup>,
+    /// 刚被「点到外面」关掉的弹出框和按下的位置。
+    pub(crate) popup_dismissed: Option<(Popup, gpui_kit::Point<gpui_kit::Pixels>)>,
     title: String,
     pub(crate) tasks: Vec<Task<()>>,
+    /// 时间轴工具栏的缩放滑块（0–100，对数均匀）。
+    pub(crate) zoom_slider: Entity<gpui_kit::component::slider::SliderState>,
+    /// 定格图片存放的目录。
+    pub(crate) freeze_dir: std::path::PathBuf,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -112,7 +163,27 @@ impl Workspace {
                 }
             }
         });
-        let (inspector, subscriptions) = Inspector::new(window, cx);
+        let (inspector, mut subscriptions) = Inspector::new(window, cx);
+        let zoom_slider = cx.new(|_| {
+            gpui_kit::component::slider::SliderState::new()
+                .min(0.0)
+                .max(100.0)
+                .step(0.5)
+                .default_value(crate::timeline::geometry::zoom_level(
+                    crate::timeline::geometry::TimelineGeometry::default().px_per_second,
+                ))
+        });
+        subscriptions.push(cx.subscribe_in(
+            &zoom_slider,
+            window,
+            |this: &mut Self, _, e: &gpui_kit::component::slider::SliderEvent, _, cx| {
+                if let gpui_kit::component::slider::SliderEvent::Change(v) = e {
+                    let want = crate::timeline::geometry::px_for_zoom_level(v.start());
+                    let now = this.timeline.geometry.px_per_second;
+                    this.zoom(want / now, cx);
+                }
+            },
+        ));
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         let doc = Document::new();
@@ -133,15 +204,17 @@ impl Workspace {
             importing: 0,
             recent: crate::recent::RecentList::load(&crate::recent::default_file()),
             recent_file: crate::recent::default_file(),
-            menu_open: false,
+            popup: None,
+            popup_dismissed: None,
             bin_tab: crate::media_bin::BinTab::default(),
             autosave: None,
             clipboard: crate::clip_ops::ClipBoard::default(),
             layout: crate::layout::LayoutMode::default(),
             transition_secs: 1.0,
-            layout_menu: false,
             title: String::new(),
             tasks: vec![listen],
+            zoom_slider,
+            freeze_dir: crate::freeze::default_dir(),
             _subscriptions: subscriptions,
         }
     }
@@ -307,7 +380,7 @@ impl Workspace {
     }
 
     /// 播放头所在的帧（对齐到帧）。
-    fn playhead_frame(&self) -> Time {
+    pub(crate) fn playhead_frame(&self) -> Time {
         self.doc
             .project
             .settings
@@ -408,6 +481,11 @@ impl Workspace {
     /// Esc：正在拖动（时间轴或预览）时取消这次拖动、回到按下前，不记撤销；
     /// 正在框选时回到框之前的选择；否则取消选择。
     fn cancel(&mut self, _: &act::Cancel, window: &mut Window, cx: &mut Context<'_, Self>) {
+        // 全屏时 Esc 先退出全屏
+        if self.preview.fullscreen {
+            self.set_fullscreen(false, window, cx);
+            return;
+        }
         let preview = self.preview.drag.take().is_some();
         if preview {
             crate::platform_cursor::clear();
@@ -423,6 +501,29 @@ impl Workspace {
             self.doc.clear_selection();
         }
         self.after_change(window, cx);
+    }
+
+    fn toggle_fullscreen(
+        &mut self,
+        _: &act::ToggleFullscreen,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.set_fullscreen(!self.preview.fullscreen, window, cx);
+    }
+
+    /// 进入 / 退出全屏预览：窗口跟着进入 / 退出系统全屏。
+    pub(crate) fn set_fullscreen(&mut self, on: bool, window: &Window, cx: &mut Context<'_, Self>) {
+        if self.preview.fullscreen == on {
+            return;
+        }
+        self.preview.fullscreen = on;
+        // 拖到一半进全屏：这次拖动作废
+        self.preview.drag = None;
+        if window.is_fullscreen() != on {
+            window.toggle_fullscreen();
+        }
+        cx.notify();
     }
 
     /// 当前的鼠标样式：（时间轴，预览）。
@@ -536,6 +637,30 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Shift+Z：整条时间线刚好放进视图，滚回开头。
+    fn zoom_to_fit(&mut self, _: &act::ZoomToFit, _: &mut Window, cx: &mut Context<'_, Self>) {
+        let geo = &mut self.timeline.geometry;
+        let lane = f32::from(self.timeline.bounds.size.width) - geo.header_width;
+        if let Some(px) =
+            crate::timeline::geometry::fit_px_per_second(self.doc.project.timeline.duration(), lane)
+        {
+            geo.px_per_second = px;
+            geo.scroll_x = 0.0;
+            self.clamp_timeline_scroll();
+            cx.notify();
+        }
+    }
+
+    /// 缩放滑块跟着别处的缩放（Ctrl+滚轮、按钮、Shift+Z）走。
+    fn sync_zoom_slider(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let level = crate::timeline::geometry::zoom_level(self.timeline.geometry.px_per_second);
+        let shown = self.zoom_slider.read(cx).value().start();
+        if (shown - level).abs() > 0.25 {
+            self.zoom_slider
+                .update(cx, |s, cx| s.set_value(level, window, cx));
+        }
+    }
+
     fn zoom_in(&mut self, _: &act::ZoomIn, _: &mut Window, cx: &mut Context<'_, Self>) {
         self.zoom(1.25, cx);
     }
@@ -590,6 +715,11 @@ impl Workspace {
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::add_subtitle))
+            .on_action(cx.listener(Self::toggle_fullscreen))
+            .on_action(cx.listener(Self::mirror))
+            .on_action(cx.listener(Self::rotate_90))
+            .on_action(cx.listener(Self::zoom_to_fit))
+            .on_action(cx.listener(Self::freeze))
     }
 }
 
@@ -600,6 +730,7 @@ impl Render for Workspace {
         self.measure_subtitle_font(window);
         self.playhead = self.engine.position();
         self.follow_playhead_in_inspector(window, cx);
+        self.sync_zoom_slider(window, cx);
         if self.engine.is_playing() {
             window.request_animation_frame();
         }
@@ -621,15 +752,21 @@ impl Render for Workspace {
                 this.import_paths(paths.0.to_vec(), window, cx);
             }))
             .relative()
-            .children(self.render_context_menu(window, cx))
-            .child(self.render_topbar(cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .px(px(chrome::CARD_GAP))
-                    .child(self.render_panels(window, cx)),
-            )
+            .when(self.preview.fullscreen, |root| {
+                root.bg(palette::preview_bg())
+                    .child(self.render_preview_frame(cx))
+            })
+            .when(!self.preview.fullscreen, |root| {
+                root.children(self.render_context_menu(window, cx))
+                    .child(self.render_topbar(cx))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .px(px(chrome::CARD_GAP))
+                            .child(self.render_panels(window, cx)),
+                    )
+            })
     }
 }
 

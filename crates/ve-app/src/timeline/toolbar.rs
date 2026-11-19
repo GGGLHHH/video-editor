@@ -1,4 +1,5 @@
-//! 时间轴工具栏（剪映式）：左边撤销、恢复、分割、删除、加字幕，右边吸附开关和缩放。
+//! 时间轴工具栏（剪映式）：左边撤销、恢复、分割、裁剪、删除、镜像、旋转、标记、加字幕，
+//! 右边主轨磁吸、吸附、联动三个开关和缩放（适应窗口、缩小、滑块、放大）。
 //! 全是图标按钮，悬停出提示（带快捷键）。
 
 use crate::actions as act;
@@ -8,7 +9,8 @@ use crate::workspace::Workspace;
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{Icon, h_flex};
+use gpui_kit::component::slider::Slider;
+use gpui_kit::component::{Disableable as _, Icon, h_flex};
 use gpui_kit::{
     Action, Context, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _, div, px,
 };
@@ -115,6 +117,8 @@ impl Workspace {
                 cx,
             ))
             .child(gap())
+            .child(self.render_clip_tools(cx))
+            .child(gap())
             .child(tool(
                 "tb-marker",
                 Lucide::BookmarkPlus,
@@ -131,6 +135,43 @@ impl Workspace {
             ))
             .child(div().flex_1())
             .child(self.render_toolbar_switches(cx))
+    }
+
+    /// 改选中视频片段的一组：定格、镜像、旋转（没选中视频片段时变灰）。
+    fn render_clip_tools(&self, cx: &Context<'_, Self>) -> impl IntoElement {
+        let video_selected = !self.selected_video_clips().is_empty();
+        h_flex()
+            .gap_0p5()
+            .child(
+                tool(
+                    "tb-freeze",
+                    Lucide::Snowflake,
+                    "定格：在播放头处插入 3 秒静止画面（选中的视频片段）",
+                    || Box::new(act::Freeze),
+                    cx,
+                )
+                .disabled(!video_selected),
+            )
+            .child(
+                tool(
+                    "tb-mirror",
+                    Lucide::FlipHorizontal2,
+                    "镜像：选中的视频片段左右翻转",
+                    || Box::new(act::Mirror),
+                    cx,
+                )
+                .disabled(!video_selected),
+            )
+            .child(
+                tool(
+                    "tb-rotate",
+                    Lucide::RotateCw,
+                    "旋转：选中的视频片段顺时针转 90°",
+                    || Box::new(act::Rotate90),
+                    cx,
+                )
+                .disabled(!video_selected),
+            )
     }
 
     /// 工具栏右边：主轨磁吸、吸附、联动三个开关和缩放。
@@ -163,12 +204,27 @@ impl Workspace {
             ))
             .child(gap())
             .child(tool(
+                "tb-zoom-fit",
+                Lucide::Scan,
+                "全局预览缩放（Shift+Z）：整条时间线刚好放进视图",
+                || Box::new(act::ZoomToFit),
+                cx,
+            ))
+            .child(tool(
                 "tb-zoom-out",
                 Lucide::ZoomOut,
                 "缩小时间线（Ctrl+-）",
                 || Box::new(act::ZoomOut),
                 cx,
             ))
+            .child(
+                div()
+                    .id("tb-zoom-slider")
+                    .test_support()
+                    .w(px(96.))
+                    .px_1()
+                    .child(Slider::new(&self.zoom_slider)),
+            )
             .child(tool(
                 "tb-zoom-in",
                 Lucide::ZoomIn,

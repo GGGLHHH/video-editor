@@ -5,7 +5,7 @@
 use crate::actions as act;
 use crate::chrome;
 use crate::theme::palette;
-use crate::workspace::Workspace;
+use crate::workspace::{Popup, Workspace};
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::{Selectable as _, TestSupportExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -132,6 +132,7 @@ impl Workspace {
             )
             .child(div().flex_1())
             .children(self.render_export_status(cx))
+            .child(self.render_shortcuts_button(cx))
             .child(self.render_layout_button(cx))
             .child(
                 Button::new("tb-export")
@@ -168,14 +169,14 @@ impl Workspace {
                 Button::new("tb-menu")
                     .compact()
                     .label("菜单 ▾")
-                    .selected(self.menu_open)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.menu_open = !this.menu_open;
+                    .selected(self.popup_open(Popup::Menu))
+                    .on_click(cx.listener(|this, e: &gpui_kit::ClickEvent, _, cx| {
+                        this.click_popup_button(Popup::Menu, e);
                         cx.notify();
                     })),
             )
             .children(
-                self.menu_open
+                self.popup_open(Popup::Menu)
                     .then(|| deferred(self.render_menu(cx)).with_priority(1)),
             )
     }
@@ -203,7 +204,7 @@ impl Workspace {
                         .cursor_pointer()
                         .hover(|s| s.bg(palette::menu_hover()))
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.menu_open = false;
+                            this.popup = None;
                             cx.notify();
                             window.dispatch_action(action(), cx);
                         }))
@@ -231,8 +232,8 @@ impl Workspace {
             .border_color(cx.theme().border)
             .rounded(px(chrome::CARD_RADIUS))
             .shadow_lg()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.menu_open = false;
+            .on_mouse_down_out(cx.listener(|this, e: &gpui_kit::MouseDownEvent, _, cx| {
+                this.dismiss_popup(e.position);
                 cx.notify();
             }))
             .children(rows)

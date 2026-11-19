@@ -450,7 +450,9 @@ impl Workspace {
             BinTab::Media => self.render_media_tab(cx).into_any_element(),
             BinTab::Text => Self::render_text_tab(cx).into_any_element(),
             BinTab::Transition => self.render_transition_tab(cx).into_any_element(),
-            other => chrome::coming_soon(other.coming_soon(), cx).into_any_element(),
+            BinTab::Audio => self.render_audio_tab(cx).into_any_element(),
+            BinTab::Filter => self.render_filter_tab(cx).into_any_element(),
+            BinTab::Adjust => Self::render_adjust_bin_tab(cx).into_any_element(),
         };
         v_flex()
             .id("media-bin")
@@ -565,20 +567,11 @@ impl BinTab {
     const fn sections(self) -> &'static [&'static str] {
         match self {
             Self::Media => &["导入"],
-            Self::Audio => &["音乐", "音效"],
+            Self::Audio => &["音频提取"],
             Self::Text => &["新建文本"],
             Self::Transition => &["转场效果"],
             Self::Filter => &["滤镜库"],
             Self::Adjust => &["新建调节"],
-        }
-    }
-
-    const fn coming_soon(self) -> &'static str {
-        match self {
-            Self::Media | Self::Text | Self::Transition => "",
-            Self::Audio => "音乐、音效库（导入的音频在「素材」里）",
-            Self::Filter => "滤镜",
-            Self::Adjust => "调节：色温、色调、饱和度、亮度、对比度",
         }
     }
 }

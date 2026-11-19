@@ -42,7 +42,7 @@ impl Layout {
         let linked = timeline
             .tracks
             .iter()
-            .filter(|t| t.kind == TrackKind::Subtitle)
+            .filter(|t| t.kind == TrackKind::Subtitle && !t.locked)
             .flat_map(|t| t.clips.iter().map(|c| (c.id, c.start)))
             .collect();
         Self { main, linked }
@@ -57,6 +57,10 @@ pub fn pack(project: &mut Project) {
     let Some(track) = project.timeline.track_mut(main) else {
         return;
     };
+    // 锁着的主轨原样不动
+    if track.locked {
+        return;
+    }
     let mut at = Time::ZERO;
     for clip in &mut track.clips {
         if clip.start != at {
@@ -228,6 +232,27 @@ mod tests {
             "跟着 v2 往前挪了 5 秒"
         );
         p.timeline.check_invariants(&p.assets).unwrap();
+    }
+
+    #[test]
+    fn locked_tracks_stay_put() {
+        use crate::edit::{TrackFlag, set_track_flag};
+        let (mut p, ids) = with_switches(false, true);
+        move_clip(&mut p, ids.s1, ids.subtitle_track, secs(6)).unwrap();
+        // 主轨留个空隙（磁吸关着时做的），再锁上主轨、打开磁吸
+        move_clip(&mut p, ids.v2, ids.video_track, secs(6)).unwrap();
+        set_track_flag(&mut p, ids.video_track, TrackFlag::Locked, true).unwrap();
+        p.settings.main_magnet = true;
+        let before = Layout::of(&p.timeline);
+        settle(&mut p, &before);
+        assert_eq!(span(&p, ids.v2), (secs(6), secs(9)), "锁着的主轨不排紧");
+        // 锁着的字幕不跟着主轨走
+        set_track_flag(&mut p, ids.video_track, TrackFlag::Locked, false).unwrap();
+        set_track_flag(&mut p, ids.subtitle_track, TrackFlag::Locked, true).unwrap();
+        let unlocked_main = Layout::of(&p.timeline);
+        settle(&mut p, &unlocked_main);
+        assert_eq!(span(&p, ids.v2), (secs(5), secs(8)));
+        assert_eq!(span(&p, ids.s1), (secs(6), secs(8)), "锁着的字幕留在原处");
     }
 
     #[test]

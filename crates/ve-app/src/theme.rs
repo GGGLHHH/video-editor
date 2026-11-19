@@ -86,6 +86,11 @@ pub mod palette {
     pub fn subtitle_clip() -> Hsla {
         rgb(0xa5_483a).into()
     }
+    /// 调节片段（剪映特效、调节一类的紫色）。
+    #[must_use]
+    pub fn adjustment_clip() -> Hsla {
+        rgb(0x7b_4c8c).into()
+    }
     /// 波形。
     #[must_use]
     pub fn waveform() -> Hsla {
@@ -135,6 +140,11 @@ pub mod palette {
     #[must_use]
     pub fn disabled_veil() -> Hsla {
         rgba(0x1414_14c0).into()
+    }
+    /// 锁定轨道上的片段：比停用浅的一层灰。
+    #[must_use]
+    pub fn locked_veil() -> Hsla {
+        rgba(0x1414_1470).into()
     }
     /// 播放头（剪映是白色）。
     #[must_use]

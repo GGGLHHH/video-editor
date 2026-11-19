@@ -64,8 +64,8 @@ pub struct Layer<'a> {
     pub geometry: LayerGeometry,
     /// 不透明度（0–1）。
     pub opacity: f32,
-    /// 调色（全 0 时着色器跳过）。
-    pub adjust: ve_core::ColorAdjust,
+    /// 调色（单位矩阵时着色器跳过）。
+    pub color: ve_core::ColorMatrix,
 }
 
 /// 每层的参数，作为实例顶点数据传给着色器。
@@ -78,14 +78,17 @@ struct LayerInstance {
     bottom: [f32; 4],
     uv: [f32; 4],
     opacity: f32,
-    /// 调色：亮度、对比度、饱和度、色温。
-    adjust: [f32; 4],
-    /// 调色：色调。
-    tint: f32,
+    /// 调色矩阵的三行（输出 r、g、b = 行 · (r, g, b, 1)）。
+    red: [f32; 4],
+    green: [f32; 4],
+    blue: [f32; 4],
+    /// 1 = 要调色，0 = 原样（单位矩阵）。
+    colored: f32,
 }
 
-const INSTANCE_ATTRS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
-    0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32, 4 => Float32x4, 5 => Float32
+const INSTANCE_ATTRS: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![
+    0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32,
+    4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32
 ];
 
 /// 一个图层槽位：纹理按尺寸复用。
@@ -202,6 +205,8 @@ pub struct Compositor {
     in_flight: std::collections::VecDeque<InFlight>,
     adapter: String,
     software: bool,
+    /// 底色（没有画面的地方），默认黑；调节片段会把它也调了。
+    background: wgpu::Color,
 }
 
 impl std::fmt::Debug for Compositor {
@@ -388,6 +393,7 @@ impl Compositor {
             in_flight: std::collections::VecDeque::new(),
             adapter: name,
             software: cpu || config.software,
+            background: wgpu::Color::BLACK,
         })
     }
 
@@ -516,7 +522,7 @@ impl Compositor {
                 extent(pix),
             );
             let uv = layer.geometry.uv;
-            let a = layer.adjust;
+            let [red, green, blue] = layer.color.0;
             // 四个角已经按旋转算好（左上、右上、右下、左下），这里只换成 NDC
             let ndc = |(x, y): (f32, f32)| {
                 (
@@ -530,8 +536,10 @@ impl Compositor {
                 bottom: [bl.0, bl.1, br.0, br.1],
                 uv: [uv.x, uv.y, uv.x + uv.w, uv.y + uv.h],
                 opacity: layer.opacity.clamp(0.0, 1.0),
-                adjust: [a.brightness, a.contrast, a.saturation, a.temperature],
-                tint: a.tint,
+                red,
+                green,
+                blue,
+                colored: if layer.color.is_identity() { 0.0 } else { 1.0 },
             });
         }
         self.write_instances(&instances);
@@ -563,7 +571,14 @@ impl Compositor {
         }
     }
 
-    /// 把各层画到输出纹理上（黑底）。
+    /// 底色：黑色经 `color` 调色后的颜色（调节片段作用在没有画面的地方）；之后合成的帧都用它，
+    /// 直到再设。
+    pub fn set_background(&mut self, color: &ve_core::ColorMatrix) {
+        let [r, g, b] = color.apply([0.0, 0.0, 0.0]).map(f64::from);
+        self.background = wgpu::Color { r, g, b, a: 1.0 };
+    }
+
+    /// 把各层画到输出纹理上（底色见 [`Self::set_background`]）。
     fn draw(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, count: usize) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("compose"),
@@ -572,7 +587,7 @@ impl Compositor {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    load: wgpu::LoadOp::Clear(self.background),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -1044,7 +1059,7 @@ mod tests {
             },
             geometry,
             opacity,
-            adjust: ve_core::ColorAdjust::NONE,
+            color: ve_core::ColorMatrix::IDENTITY,
         }
     }
 
@@ -1166,7 +1181,7 @@ mod tests {
             ..ve_core::ColorAdjust::NONE
         };
         let mut tinted = layer(&red, 2, 2, FULL, 1.0);
-        tinted.adjust = adjust;
+        tinted.color = adjust.matrix();
         let mut out = Vec::new();
         comp.compose_bgra(SIZE, &[tinted], &mut out).unwrap();
         let [red_v, green_v, blue_v] = adjust.apply([1.0, 0.0, 0.0]);
@@ -1182,6 +1197,48 @@ mod tests {
         let plain = layer(&red, 2, 2, FULL, 1.0);
         comp.compose_bgra(SIZE, &[plain], &mut out).unwrap();
         assert_eq!(px(&out, 32, 18), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn adjusting_each_layer_and_the_background_equals_adjusting_the_whole_picture() {
+        let mut comp = compositor();
+        // 左半边：不透明的蓝上面压半透明的红；右半边什么都没有（黑底）
+        let blue = solid(2, 2, [255, 0, 0, 255]);
+        let red = solid(2, 2, [0, 0, 255, 255]);
+        let mut half = FULL;
+        half.full.w = 32.0;
+        half.shown = half.full;
+        half.center = (16.0, 18.0);
+        let m = ve_core::ColorAdjust {
+            brightness: 0.2,
+            saturation: -1.0,
+            ..ve_core::ColorAdjust::NONE
+        }
+        .matrix();
+        let mut bottom = layer(&blue, 2, 2, half, 1.0);
+        let mut top = layer(&red, 2, 2, half, 0.5);
+        bottom.color = m;
+        top.color = m;
+        comp.set_background(&m);
+        let mut out = Vec::new();
+        comp.compose_bgra(SIZE, &[bottom, top], &mut out).unwrap();
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "0–255"
+        )]
+        let bgr = |[r, g, b]: [f32; 3]| [b, g, r].map(|v| (v * 255.0).round() as u8);
+        // 先叠好（红蓝各半）再整体调色
+        let mixed = m.apply([0.5, 0.0, 0.5]);
+        let got = px(&out, 8, 18);
+        assert!(near(got, bgr(mixed), 2), "{got:?} vs {:?}", bgr(mixed));
+        let bg = px(&out, 56, 18);
+        let want_bg = bgr(m.apply([0.0, 0.0, 0.0]));
+        assert!(near(bg, want_bg, 1), "底色 {bg:?} vs {want_bg:?}");
+        // 换回黑底
+        comp.set_background(&ve_core::ColorMatrix::IDENTITY);
+        comp.compose_bgra(SIZE, &[], &mut out).unwrap();
+        assert_eq!(px(&out, 56, 18), [0, 0, 0, 255]);
     }
 
     #[test]
@@ -1209,6 +1266,28 @@ mod tests {
             px(&out, 32, 18)
         );
         assert!(near(px(&out, 60, 18), [255, 0, 0], 2));
+    }
+
+    #[test]
+    fn mirrored_layer_swaps_left_and_right() {
+        let mut c = compositor();
+        // 4×2：左半红、右半蓝；镜像后左边是蓝、右边是红
+        let mut tex = Vec::new();
+        for _ in 0..2 {
+            tex.extend(solid(2, 1, [0, 0, 255, 255]));
+            tex.extend(solid(2, 1, [255, 0, 0, 255]));
+        }
+        let mirrored = ve_core::Transform {
+            mirror: true,
+            ..ve_core::Transform::default()
+        };
+        let g = ve_core::layer_geometry(SIZE, (4, 2), &mirrored);
+        let mut out = Vec::new();
+        c.compose_bgra(SIZE, &[layer(&tex, 4, 2, g, 1.0)], &mut out)
+            .unwrap();
+        let (left, right) = (px(&out, 4, 18), px(&out, 60, 18));
+        assert!(near(left, [255, 0, 0], 2), "左边应是蓝：{left:?}");
+        assert!(near(right, [0, 0, 255], 2), "右边应是红：{right:?}");
     }
 
     #[test]

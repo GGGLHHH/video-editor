@@ -39,7 +39,7 @@ impl Workspace {
     }
 
     fn open_recent(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<'_, Self>) {
-        self.menu_open = false;
+        self.popup = None;
         if !path.exists() {
             self.recent.remove(&path);
             self.save_recent();
@@ -121,7 +121,7 @@ impl Workspace {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.recent.clear();
                                 this.save_recent();
-                                this.menu_open = false;
+                                this.popup = None;
                                 cx.notify();
                             })),
                     )

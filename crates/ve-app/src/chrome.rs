@@ -1,5 +1,5 @@
 //! 剪映式界面外壳的公用小件：圆角面板卡片、面板标题栏、图标标签、文字标签、
-//! 分段控件、「后续支持」占位、快捷键键帽。
+//! 分段控件、快捷键键帽。
 
 use crate::theme::palette;
 use gpui_kit::base::{ObservedElement, TestSupportExt as _};
@@ -159,19 +159,6 @@ pub(crate) fn chip(
         .cursor_pointer()
         .hover(|s| s.bg(cx.theme().accent))
         .child(label.into())
-}
-
-/// 还没做的功能：面板里居中一行灰字。
-pub(crate) fn coming_soon(what: impl Into<SharedString>, cx: &App) -> Div {
-    v_flex()
-        .size_full()
-        .items_center()
-        .justify_center()
-        .gap_1()
-        .text_sm()
-        .text_color(cx.theme().muted_foreground)
-        .child(what.into())
-        .child(div().text_xs().child("后续支持"))
 }
 
 /// 快捷键键帽：深色小圆角块 + 白字（菜单项右侧）。

@@ -8,6 +8,33 @@ use ve_core::{ClipId, Time, Timeline, TrackId};
 pub const MIN_PX_PER_SECOND: f32 = 2.0;
 /// 最大缩放（像素 / 秒）。
 pub const MAX_PX_PER_SECOND: f32 = 2000.0;
+/// 缩放滑块的位置（0–100，按对数均匀）→ 像素 / 秒。
+#[must_use]
+pub fn px_for_zoom_level(level: f32) -> f32 {
+    let t = (level / 100.0).clamp(0.0, 1.0);
+    MIN_PX_PER_SECOND * (MAX_PX_PER_SECOND / MIN_PX_PER_SECOND).powf(t)
+}
+
+/// 像素 / 秒 → 缩放滑块的位置（0–100）。
+#[must_use]
+pub fn zoom_level(px_per_second: f32) -> f32 {
+    let px = px_per_second.clamp(MIN_PX_PER_SECOND, MAX_PX_PER_SECOND);
+    100.0 * (px / MIN_PX_PER_SECOND).ln() / (MAX_PX_PER_SECOND / MIN_PX_PER_SECOND).ln()
+}
+
+/// 刚好放下整条时间线的缩放（剪映「全局预览缩放」Shift+Z）：总长占轨道区的九成。
+/// 空时间轴返回 `None`。
+#[must_use]
+pub fn fit_px_per_second(duration: Time, lane_width: f32) -> Option<f32> {
+    let secs = duration.as_secs_f64();
+    if secs <= 0.0 || lane_width <= 0.0 {
+        return None;
+    }
+    #[expect(clippy::cast_possible_truncation, reason = "缩放值很小")]
+    let px = (f64::from(lane_width) * 0.9 / secs) as f32;
+    Some(px.clamp(MIN_PX_PER_SECOND, MAX_PX_PER_SECOND))
+}
+
 /// 片段边缘可拖动修剪的宽度（像素）。
 pub const EDGE_PX: f32 = 6.0;
 
@@ -84,7 +111,7 @@ impl Default for TimelineGeometry {
             scroll_y: 0.0,
             track_height: 56.0,
             ruler_height: 28.0,
-            header_width: 72.0,
+            header_width: 132.0,
         }
     }
 }
@@ -462,16 +489,35 @@ mod tests {
     }
 
     #[test]
+    fn zoom_slider_is_logarithmic_and_fit_fills_ninety_percent() {
+        assert!((px_for_zoom_level(0.0) - MIN_PX_PER_SECOND).abs() < 1e-3);
+        assert!((px_for_zoom_level(100.0) - MAX_PX_PER_SECOND).abs() < 1e-1);
+        // 中间是几何平均：2 × 1000^0.5 ≈ 63.2
+        assert!((px_for_zoom_level(50.0) - 63.245).abs() < 1e-2);
+        for level in [0.0, 13.0, 50.0, 99.0] {
+            assert!((zoom_level(px_for_zoom_level(level)) - level).abs() < 1e-3);
+        }
+        assert!((zoom_level(1e9) - 100.0).abs() < 1e-3, "越界夹住");
+        // 20 秒放进 1000 像素：900 / 20 = 45
+        let fit = fit_px_per_second(Time::from_secs(20), 1000.0).unwrap();
+        assert!((fit - 45.0).abs() < 1e-3);
+        assert_eq!(fit_px_per_second(Time::ZERO, 1000.0), None);
+        // 很短的也夹在最大缩放以内
+        let short = fit_px_per_second(Time::from_millis(10), 1000.0).unwrap();
+        assert!((short - MAX_PX_PER_SECOND).abs() < 1e-3);
+    }
+
+    #[test]
     fn scrollbar_thumb_tracks_the_visible_part() {
         let mut g = geo();
-        let (secs, width) = (Time::from_secs, 1072.0);
+        let (secs, width) = (Time::from_secs, 1132.0);
         // 能滚 2000：总长 3000，滑块占 1000 / 3000
         let thumb = g.h_scrollbar(secs(20), width).unwrap();
-        assert!((thumb.x - 72.0).abs() < 1e-3 && (thumb.width - 1000.0 / 3.0).abs() < 1e-2);
+        assert!((thumb.x - 132.0).abs() < 1e-3 && (thumb.width - 1000.0 / 3.0).abs() < 1e-2);
         g.scroll_x = 2000.0;
         let thumb = g.h_scrollbar(secs(20), width).unwrap();
         assert!(
-            (thumb.x + thumb.width - 1072.0).abs() < 1e-2,
+            (thumb.x + thumb.width - 1132.0).abs() < 1e-2,
             "滚到头滑块贴右边：{thumb:?}"
         );
         // 滑块拖 1 像素 = 内容滚 2000 / (1000 − 333.3) = 3 像素

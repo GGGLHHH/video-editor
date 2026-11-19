@@ -297,11 +297,13 @@ impl Worker<'_> {
     }
 
     /// 时间轴时刻 `t` 的画面（缓存优先）；没有视频或解码失败返回 `None`。
-    /// 合成时间点 `t` 的预览画面；没有任何画面（空隙或全都解不出）时返回 `None`。
+    /// 合成时间点 `t` 的预览画面；没有任何画面（空隙或全都解不出）、也没有调节片段把黑底调色时
+    /// 返回 `None`。
     fn render(&mut self, project: &Project, t: Time) -> Option<Arc<VideoFrame>> {
-        let layers = resolve_layers(project, t);
+        let ve_core::compose::Composition { layers, background } =
+            ve_core::compose::resolve_frame(project, t);
         let frames = self.layer_frames(project, &layers);
-        if frames.iter().all(Option::is_none) {
+        if frames.iter().all(Option::is_none) && background.is_identity() {
             return None;
         }
         let canvas = preview_canvas(&project.settings, self.shared.preview_max);
@@ -340,10 +342,11 @@ impl Worker<'_> {
                     },
                     geometry: ve_core::layer_geometry(canvas, source, &l.transform),
                     opacity: l.transform.opacity,
-                    adjust: l.adjust,
+                    color: l.color,
                 })
             })
             .collect();
+        compositor.set_background(&background);
         let mut data = Vec::new();
         match compositor.compose_bgra(canvas, &gpu_layers, &mut data) {
             Ok(()) => Some(Arc::new(VideoFrame {

@@ -2,7 +2,7 @@
 
 use crate::chrome;
 use crate::theme::palette;
-use crate::workspace::Workspace;
+use crate::workspace::{Popup, Workspace};
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{
@@ -108,12 +108,12 @@ impl Workspace {
                     .compact()
                     .label("布局 ▾")
                     .tooltip("切换布局")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.layout_menu = !this.layout_menu;
+                    .on_click(cx.listener(|this, e: &gpui_kit::ClickEvent, _, cx| {
+                        this.click_popup_button(Popup::Layout, e);
                         cx.notify();
                     })),
             )
-            .children(self.layout_menu.then(|| {
+            .children(self.popup_open(Popup::Layout).then(|| {
                 let items = LayoutMode::ALL.map(|(id, label, mode)| {
                     h_flex()
                         .id(id)
@@ -127,7 +127,7 @@ impl Workspace {
                         .hover(|s| s.bg(palette::menu_hover()))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.layout = mode;
-                            this.layout_menu = false;
+                            this.popup = None;
                             cx.notify();
                         }))
                         .child(
@@ -152,10 +152,12 @@ impl Workspace {
                         .border_color(cx.theme().border)
                         .rounded(px(chrome::CARD_RADIUS))
                         .shadow_lg()
-                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                            this.layout_menu = false;
-                            cx.notify();
-                        }))
+                        .on_mouse_down_out(cx.listener(
+                            |this, e: &gpui_kit::MouseDownEvent, _, cx| {
+                                this.dismiss_popup(e.position);
+                                cx.notify();
+                            },
+                        ))
                         .children(items),
                 )
                 .with_priority(1)

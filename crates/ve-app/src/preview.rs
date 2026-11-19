@@ -9,7 +9,8 @@ use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{Disableable as _, Icon, IconName, h_flex, v_flex};
+use gpui_kit::component::{Icon, IconName, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Bounds, Context, InteractiveElement as _, IntoElement, MouseButton, MouseUpEvent,
     ParentElement as _, Pixels, RenderImage, SharedString, Styled as _, Window, canvas, div, img,
@@ -45,6 +46,8 @@ pub struct PreviewState {
     pub(crate) cursor: gpui_kit::CursorStyle,
     /// 底栏「比例」菜单是否展开。
     pub(crate) ratio_menu: bool,
+    /// 全屏预览（剪映的 ⤢）：整个窗口只显示画面，没有控件。
+    pub(crate) fullscreen: bool,
 }
 
 /// BGRA 帧 → 可直接上传的图片（GPUI 的 `RenderImage` 内部就是 BGRA）。
@@ -129,19 +132,23 @@ impl Workspace {
     }
 
     pub(crate) fn render_preview(&self, cx: &Context<'_, Self>) -> impl IntoElement {
-        let settings = self.doc.project.settings;
-        let video = fit_rect(self.preview.bounds, settings.width, settings.height);
-        let local = |b: Bounds<Pixels>| {
-            (
-                b.origin.x - self.preview.bounds.origin.x,
-                b.origin.y - self.preview.bounds.origin.y,
-            )
-        };
-        let (vx, vy) = local(video);
+        v_flex()
+            .size_full()
+            .child(chrome::panel_header("播放器", cx))
+            .child(self.render_preview_frame(cx))
+            .child(self.render_transport(cx))
+    }
+
+    /// 画面上的字幕（导出烧进去的那些，预览里用文字画）：字号、描边、离底距离按画面实际显示高度换算，
+    /// 和导出一致；入场 / 出场动画按这一刻的样子画。
+    fn subtitle_layers(&self, video: Bounds<Pixels>) -> Vec<gpui_kit::AnyElement> {
+        let (vx, vy) = (
+            video.origin.x - self.preview.bounds.origin.x,
+            video.origin.y - self.preview.bounds.origin.y,
+        );
         let project = Arc::clone(&self.project);
-        let subtitles = ve_engine::resolve_subtitles(&project, self.playhead);
+        let subtitles = ve_engine::resolve_subtitle_poses(&project, self.playhead);
         let style = self.doc.project.subtitle_style.clone();
-        // 预览里的字号、描边按画面实际显示高度换算，和导出一致
         let shown_h = f32::from(video.size.height);
         #[expect(
             clippy::cast_possible_truncation,
@@ -162,9 +169,42 @@ impl Workspace {
         };
         #[expect(clippy::cast_possible_truncation, reason = "边距很小")]
         let margin = px(style.margin_px(shown_h_px) as f32);
+        let bottom = self.preview.bounds.size.height - (vy + video.size.height) + margin;
+        subtitles
+            .into_iter()
+            .map(|(text, pose)| {
+                // 入场 / 出场动画：缩放以底边中点为中心（和 ASS 的 \an2 + \fscx 一致）、往下偏移、透明度
+                subtitle_overlay(
+                    text,
+                    font * pose.scale,
+                    line * pose.scale,
+                    outline * pose.scale,
+                    &style,
+                )
+                .absolute()
+                .left(vx)
+                .w(video.size.width)
+                .opacity(pose.alpha)
+                // 底边对齐、向上长（和 libass 一致），多行时不会掉出画面
+                .bottom(bottom - px(pose.dy * shown_h))
+                .into_any_element()
+            })
+            .collect()
+    }
 
+    /// 画面区：画面、字幕、选中框。全屏时只画它（不能拖改画面、没有选中框，和剪映一样）。
+    pub(crate) fn render_preview_frame(&self, cx: &Context<'_, Self>) -> impl IntoElement {
+        let settings = self.doc.project.settings;
+        let video = fit_rect(self.preview.bounds, settings.width, settings.height);
+        let local = |b: Bounds<Pixels>| {
+            (
+                b.origin.x - self.preview.bounds.origin.x,
+                b.origin.y - self.preview.bounds.origin.y,
+            )
+        };
+        let (vx, vy) = local(video);
         let this = cx.entity();
-        let frame = div()
+        div()
             .id("preview")
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| this.preview_hover(*hovered, cx)))
             .test_support()
@@ -172,17 +212,20 @@ impl Workspace {
             .relative()
             .overflow_hidden()
             .bg(palette::preview_bg())
-            .cursor(self.preview.cursor)
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::preview_mouse_down))
-            .on_mouse_move(cx.listener(Self::preview_mouse_move))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, cx| this.preview_mouse_up(cx)),
-            )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, cx| this.preview_mouse_up(cx)),
-            )
+            .when(!self.preview.fullscreen, |frame| {
+                frame
+                    .cursor(self.preview.cursor)
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::preview_mouse_down))
+                    .on_mouse_move(cx.listener(Self::preview_mouse_move))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseUpEvent, _, cx| this.preview_mouse_up(cx)),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseUpEvent, _, cx| this.preview_mouse_up(cx)),
+                    )
+            })
             .child(
                 canvas(
                     move |bounds, window, cx| {
@@ -215,21 +258,10 @@ impl Workspace {
                             .map(|image| img(image).size_full()),
                     ),
             )
-            .children(subtitles.into_iter().map(|text| {
-                subtitle_overlay(text, font, line, outline, &style)
-                    .absolute()
-                    .left(vx)
-                    .w(video.size.width)
-                    // 底边对齐、向上长（和 libass 一致），多行时不会掉出画面
-                    .bottom(self.preview.bounds.size.height - (vy + video.size.height) + margin)
-            }))
-            .children(self.render_selection_box(cx));
-
-        v_flex()
-            .size_full()
-            .child(chrome::panel_header("播放器", cx))
-            .child(frame)
-            .child(self.render_transport(cx))
+            .children(self.subtitle_layers(video))
+            .when(!self.preview.fullscreen, |frame| {
+                frame.children(self.render_selection_box(cx))
+            })
     }
 
     /// 播放器底栏（剪映式）：左边当前时间（青）/ 总长，中间播放键，右边比例和全屏。
@@ -301,8 +333,10 @@ impl Workspace {
                     .ghost()
                     .compact()
                     .icon(Icon::new(Lucide::Maximize))
-                    .tooltip("全屏预览（后续支持）")
-                    .disabled(true),
+                    .tooltip("全屏预览（Ctrl+Shift+F，Esc 退出）")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.set_fullscreen(true, window, cx);
+                    })),
             )
     }
 }

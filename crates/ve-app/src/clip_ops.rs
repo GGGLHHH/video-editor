@@ -93,6 +93,88 @@ impl Workspace {
         self.after_change(window, cx);
     }
 
+    /// 选中的视频轨片段（含调节片段）：能调色、套滤镜的。
+    pub(crate) fn selected_picture_clips(&self) -> Vec<ve_core::ClipId> {
+        let tl = &self.doc.project.timeline;
+        self.doc
+            .selection()
+            .iter()
+            .copied()
+            .filter(|&c| {
+                tl.find_clip(c)
+                    .and_then(|(t, _)| tl.track(t))
+                    .is_some_and(|t| t.kind == ve_core::TrackKind::Video)
+            })
+            .collect()
+    }
+
+    /// 选中的视频素材片段（不含调节片段）：能定格、镜像、旋转的。
+    pub(crate) fn selected_video_clips(&self) -> Vec<ve_core::ClipId> {
+        let tl = &self.doc.project.timeline;
+        self.selected_picture_clips()
+            .into_iter()
+            .filter(|&c| {
+                tl.find_clip(c)
+                    .is_some_and(|(_, clip)| clip.asset().is_some())
+            })
+            .collect()
+    }
+
+    /// 镜像（工具栏）：选中的视频片段都镜像了就全部取消，否则全部镜像。
+    pub(crate) fn mirror(
+        &mut self,
+        _: &act::Mirror,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let clips = self.selected_video_clips();
+        if clips.is_empty() {
+            return;
+        }
+        let all_on = clips.iter().all(|&c| {
+            self.doc
+                .project
+                .timeline
+                .find_clip(c)
+                .is_some_and(|(_, clip)| clip.transform.mirror)
+        });
+        self.apply(window, cx, |p| {
+            ve_core::edit::set_mirror(p, &clips, !all_on)
+        });
+        self.inspector.unbind();
+        self.after_change(window, cx);
+    }
+
+    /// 旋转（工具栏）：选中的视频片段各自顺时针转 90°（一步撤销）；有旋转关键帧的在播放头处打帧。
+    pub(crate) fn rotate_90(
+        &mut self,
+        _: &act::Rotate90,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let clips = self.selected_video_clips();
+        if clips.is_empty() {
+            return;
+        }
+        let at = self.engine.position();
+        self.apply(window, cx, |p| {
+            for &c in &clips {
+                let (start, len) = p
+                    .timeline
+                    .find_clip(c)
+                    .map_or((at, ve_core::Time::ZERO), |(_, clip)| {
+                        (clip.start, clip.duration)
+                    });
+                // 播放头不在片段上时按离它近的一头算
+                let offset = (at - start).clamp(ve_core::Time::ZERO, len);
+                ve_core::edit::rotate_quarter(p, c, offset)?;
+            }
+            Ok(())
+        });
+        self.inspector.unbind();
+        self.after_change(window, cx);
+    }
+
     /// V：选中的都停用了就全部启用，否则全部停用。
     pub(crate) fn toggle_disabled(
         &mut self,

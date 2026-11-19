@@ -167,7 +167,7 @@ pub fn export_srt(project: &Project) -> Vec<Cue> {
         .timeline
         .tracks
         .iter()
-        .filter(|t| t.kind == TrackKind::Subtitle)
+        .filter(|t| t.kind == TrackKind::Subtitle && t.shows())
         .flat_map(|t| t.clips.iter())
         .filter(|c| c.enabled())
         .filter_map(|c| {

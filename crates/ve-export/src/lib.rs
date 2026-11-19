@@ -11,5 +11,5 @@ pub use graph::{
     recommended_kbps,
 };
 pub use render::{frame_count, output_size};
-pub use run::{default_settings, export};
+pub use run::{default_settings, export, grab_frame};
 pub use ve_render::RenderConfig;

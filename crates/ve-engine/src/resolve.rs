@@ -72,7 +72,7 @@ pub fn resolve_audio(project: &Project, from: Time, len: Time) -> Vec<AudioSegme
     let to = from + len;
     let mut out = Vec::new();
     for track in &project.timeline.tracks {
-        if !matches!(track.kind, TrackKind::Video | TrackKind::Audio) {
+        if !matches!(track.kind, TrackKind::Video | TrackKind::Audio) || !track.sounds() {
             continue;
         }
         // 转场处声音会越过片段边界，但最多伸进相邻片段的一半：从前一个片段看起，
@@ -122,15 +122,25 @@ pub fn resolve_audio(project: &Project, from: Time, len: Time) -> Vec<AudioSegme
 /// 时刻 `t` 要显示的字幕文字。
 #[must_use]
 pub fn resolve_subtitles(project: &Project, t: Time) -> Vec<&str> {
+    resolve_subtitle_poses(project, t)
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect()
+}
+
+/// 时刻 `t` 要显示的字幕：文字和这一刻的样子（入场 / 出场动画）。
+#[must_use]
+pub fn resolve_subtitle_poses(project: &Project, t: Time) -> Vec<(&str, ve_core::TextPose)> {
     project
         .timeline
         .tracks
         .iter()
-        .filter(|tr| tr.kind == TrackKind::Subtitle)
+        .filter(|tr| tr.kind == TrackKind::Subtitle && tr.shows())
         .filter_map(|tr| {
-            tr.clip_at(t)
-                .filter(|c| c.enabled())
-                .and_then(|c| c.subtitle_text())
+            let c = tr.clip_at(t).filter(|c| c.enabled())?;
+            let text = c.subtitle_text()?;
+            let motion = c.text_motion().unwrap_or_default();
+            Some((text, ve_core::text_pose(motion, t - c.start, c.duration)))
         })
         .collect()
 }
@@ -266,6 +276,27 @@ mod tests {
     }
 
     #[test]
+    fn muted_tracks_are_silent_and_hidden_tracks_show_no_subtitles() {
+        use ve_core::edit::{TrackFlag, set_track_flag};
+        let (mut p, ids) = sample_project();
+        set_track_flag(&mut p, ids.audio_track, TrackFlag::Muted, true).unwrap();
+        set_track_flag(&mut p, ids.subtitle_track, TrackFlag::Hidden, true).unwrap();
+        let segs = resolve_audio(&p, Time::ZERO, secs(8));
+        assert!(
+            segs.iter().all(|s| s.clip != ids.a1),
+            "静音轨的背景音乐不播"
+        );
+        assert!(segs.iter().any(|s| s.clip == ids.v1), "视频轨的原声照常");
+        assert_eq!(
+            resolve_subtitles(&p, Time::from_millis(1500)),
+            Vec::<&str>::new()
+        );
+        set_track_flag(&mut p, ids.video_track, TrackFlag::Muted, true).unwrap();
+        let all_muted = resolve_audio(&p, Time::ZERO, secs(8));
+        assert_eq!(all_muted.len(), 0, "{all_muted:?}");
+    }
+
+    #[test]
     fn disabled_clips_are_silent_and_hidden() {
         let (mut p, ids) = sample_project();
         ve_core::edit::set_disabled(&mut p, &[ids.a1, ids.s1], true).unwrap();
@@ -275,6 +306,24 @@ mod tests {
         assert_eq!(
             resolve_subtitles(&p, Time::from_millis(1500)),
             Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn subtitle_poses_follow_the_motion() {
+        let (mut p, ids) = sample_project();
+        let m = ve_core::TextMotion {
+            intro: ve_core::TextIn::FadeIn,
+            outro: ve_core::TextOut::None,
+        };
+        ve_core::edit::set_text_motion(&mut p, &[ids.s1], m).unwrap();
+        // s1 在 1–3 秒：1.25 秒时渐显到一半
+        let poses = resolve_subtitle_poses(&p, Time::from_millis(1250));
+        assert_eq!(poses.len(), 1);
+        assert!((poses[0].1.alpha - 0.5).abs() < 1e-4, "{poses:?}");
+        assert_eq!(
+            resolve_subtitle_poses(&p, Time::from_secs(2))[0].1,
+            ve_core::TextPose::STILL
         );
     }
 

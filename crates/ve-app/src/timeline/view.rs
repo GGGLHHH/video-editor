@@ -588,6 +588,29 @@ fn ruler_label(t: Time, step: Time) -> String {
     }
 }
 
+/// 空工程：主轨那一行提示把素材拖进来（剪映「素材拖拽到这里，开始你的大作吧~」）。
+fn paint_empty_hint(snap: &Snapshot, ox: f32, oy: f32, window: &mut Window, cx: &mut App) {
+    let (geo, timeline) = (snap.geo, &snap.project.timeline);
+    if timeline.tracks.iter().any(|t| !t.clips.is_empty()) {
+        return;
+    }
+    let Some(main) = ve_core::magnet::main_track(timeline) else {
+        return;
+    };
+    let Some(i) = timeline.tracks.iter().position(|t| t.id == main) else {
+        return;
+    };
+    paint_text(
+        window,
+        cx,
+        "素材拖拽到这里，开始你的大作吧~",
+        ox + geo.header_width + 16.0,
+        oy + geo.track_top(i) + geo.track_height / 2.0 - 8.0,
+        12.0,
+        palette::tick(),
+    );
+}
+
 fn paint(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
     let geo = snap.geo;
     let (ox, oy) = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
@@ -596,7 +619,7 @@ fn paint(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut 
 
     // 轨道底色和轨道头
     let names = super::tracks::track_names(&snap.project.timeline);
-    for (i, (track, label)) in snap.project.timeline.tracks.iter().zip(&names).enumerate() {
+    for (i, label) in names.iter().enumerate() {
         let y = oy + geo.track_top(i);
         window.paint_quad(fill(
             rect(ox, y, w, geo.track_height - 1.0),
@@ -606,15 +629,11 @@ fn paint(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut 
             rect(ox, y, geo.header_width, geo.track_height - 1.0),
             palette::ruler_bg(),
         ));
-        let kind = match track.kind {
-            TrackKind::Video => "视频",
-            TrackKind::Audio => "音频",
-            TrackKind::Subtitle => "字幕",
-        };
         let ty = y + geo.track_height / 2.0 - 8.0;
         paint_text(window, cx, label, ox + 10.0, ty, 12.0, palette::text());
-        paint_text(window, cx, kind, ox + 34.0, ty, 11.0, palette::tick());
     }
+
+    paint_empty_hint(snap, ox, oy, window, cx);
 
     // 片段（裁掉轨道头区域）
     let area = rect(ox + geo.header_width, oy, w - geo.header_width, h);
@@ -630,6 +649,13 @@ fn paint(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut 
                 }
                 let r = rect(x0, y, x1 - x0, geo.track_height - 5.0);
                 paint_clip(snap, clip, track.kind, r, ox, window, cx);
+                // 整条轨不起作用（隐藏的画面 / 字幕轨、静音的音频轨）或锁着：片段压暗
+                let silent = track.kind == TrackKind::Audio && track.muted;
+                if track.hidden || silent {
+                    window.paint_quad(fill(r, palette::disabled_veil()));
+                } else if track.locked {
+                    window.paint_quad(fill(r, palette::locked_veil()));
+                }
             }
         }
         // 播放头和吸附线
@@ -814,6 +840,7 @@ fn paint_clip(
     let (x0, y0) = (f32::from(r.origin.x), f32::from(r.origin.y));
     let selected = snap.selection.contains(&clip.id);
     let color = match kind {
+        TrackKind::Video if clip.is_adjustment() => palette::adjustment_clip(),
         TrackKind::Video => palette::video_clip(),
         TrackKind::Audio => palette::audio_clip(),
         TrackKind::Subtitle => palette::subtitle_clip(),
@@ -823,8 +850,9 @@ fn paint_clip(
         let asset = clip.asset().and_then(|a| snap.project.assets.get(&a));
         let media = clip.asset().and_then(|a| snap.media.get(&a));
         match (&clip.content, asset, media) {
+            // 音频轨上只画波形（视频文件的声音放到音频轨时也一样）
             (ClipContent::Media { source_in, .. }, Some(asset), Some(m))
-                if !m.thumbnails.is_empty() =>
+                if !m.thumbnails.is_empty() && kind != TrackKind::Audio =>
             {
                 paint_thumbnails(&geo, clip, *source_in, asset.duration, m, r, ox, window);
             }
@@ -836,7 +864,11 @@ fn paint_clip(
         // 剪映式标题：字幕显示全文；媒体片段显示「名字  精确到帧的时长」
         let label = clip.subtitle_text().map_or_else(
             || {
-                let name = asset.map(|a| a.name.clone()).unwrap_or_default();
+                let name = if clip.is_adjustment() {
+                    "调节".to_owned()
+                } else {
+                    asset.map(|a| a.name.clone()).unwrap_or_default()
+                };
                 let rate = snap.project.settings.frame_rate;
                 let time = ve_core::format_timecode(clip.duration, rate);
                 // 变过速的片段标出倍数（剪映在片段上显示「2.0x」）

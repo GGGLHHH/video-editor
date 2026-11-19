@@ -19,12 +19,13 @@ pub mod srt;
 pub mod subtitle_style;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+pub mod text_motion;
 pub mod time;
 pub mod timeline;
 pub mod transform;
 pub mod transition;
 
-pub use adjust::{AdjustItem, ColorAdjust};
+pub use adjust::{AdjustItem, ColorAdjust, ColorMatrix, FILTERS, Filter};
 pub use asset::{Asset, AudioInfo, VideoInfo};
 pub use edit::EditError;
 pub use history::History;
@@ -33,6 +34,7 @@ pub use keyframe::{Animation, Easing, Key, KeyGroup, Prop};
 pub use project::{Project, ProjectSettings};
 pub use project_file::{LoadedProject, ProjectFileError, load_project, save_project};
 pub use subtitle_style::SubtitleStyle;
+pub use text_motion::{TextIn, TextMotion, TextOut, TextPose, text_pose};
 pub use time::{FLICKS_PER_SECOND, FrameRate, Time, format_timecode};
 pub use timeline::{Clip, ClipContent, InvariantError, Timeline, Track, TrackKind};
 pub use transform::{Crop, LayerGeometry, Rect, Transform, layer_geometry, wrap_degrees};

@@ -135,7 +135,7 @@ fn media_clips(project: &Project, kind: TrackKind) -> Vec<&Clip> {
         .timeline
         .tracks
         .iter()
-        .filter(|t| t.kind == kind)
+        .filter(|t| t.kind == kind && t.sounds())
         .flat_map(|t| t.clips.iter().map(AsRef::as_ref))
         .filter(|c| c.asset().is_some() && c.enabled())
         .collect();
@@ -529,6 +529,20 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    #[test]
+    fn muted_tracks_are_left_out_of_the_mix() {
+        use ve_core::edit::{TrackFlag, set_track_flag};
+        let (mut p, ids) = sample_project();
+        set_track_flag(&mut p, ids.audio_track, TrackFlag::Muted, true).unwrap();
+        let args = args_text(&build_job(&p, &settings(), true).unwrap());
+        assert!(!args.contains("bgm.mp3"), "{args}");
+        assert!(args.contains("clip.mp4"), "{args}");
+        // 隐藏视频轨不影响它的声音（声音只看静音）
+        set_track_flag(&mut p, ids.video_track, TrackFlag::Hidden, true).unwrap();
+        let hidden = args_text(&build_job(&p, &settings(), true).unwrap());
+        assert!(hidden.contains("clip.mp4"), "{hidden}");
     }
 
     #[test]

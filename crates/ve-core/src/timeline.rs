@@ -31,7 +31,13 @@ pub enum ClipContent {
     Subtitle {
         /// 文字，可含换行。
         text: String,
+        /// 入场 / 出场动画（第 6 版工程文件加的；没有时不写）。
+        #[serde(default, skip_serializing_if = "crate::TextMotion::is_none")]
+        motion: crate::TextMotion,
     },
+    /// 调节（剪映素材面板「调节」的「自定义调节」）：放在视频轨上，用片段的调色参数给它下面所有轨道的
+    /// 画面调色（调节层）。没有素材，长度随意。第 6 版工程文件加的。
+    Adjustment,
 }
 
 /// 时间轴上的一个片段。
@@ -138,7 +144,7 @@ impl Clip {
     pub const fn asset(&self) -> Option<AssetId> {
         match &self.content {
             ClipContent::Media { asset, .. } => Some(*asset),
-            ClipContent::Subtitle { .. } => None,
+            ClipContent::Subtitle { .. } | ClipContent::Adjustment => None,
         }
     }
 
@@ -147,7 +153,7 @@ impl Clip {
     pub const fn source_in(&self) -> Time {
         match &self.content {
             ClipContent::Media { source_in, .. } => *source_in,
-            ClipContent::Subtitle { .. } => Time::ZERO,
+            ClipContent::Subtitle { .. } | ClipContent::Adjustment => Time::ZERO,
         }
     }
 
@@ -155,9 +161,24 @@ impl Clip {
     #[must_use]
     pub fn subtitle_text(&self) -> Option<&str> {
         match &self.content {
-            ClipContent::Subtitle { text } => Some(text),
-            ClipContent::Media { .. } => None,
+            ClipContent::Subtitle { text, .. } => Some(text),
+            ClipContent::Media { .. } | ClipContent::Adjustment => None,
         }
+    }
+
+    /// 字幕的入场 / 出场动画（不是字幕时没有）。
+    #[must_use]
+    pub const fn text_motion(&self) -> Option<crate::TextMotion> {
+        match &self.content {
+            ClipContent::Subtitle { motion, .. } => Some(*motion),
+            _ => None,
+        }
+    }
+
+    /// 是不是调节片段。
+    #[must_use]
+    pub const fn is_adjustment(&self) -> bool {
+        matches!(self.content, ClipContent::Adjustment)
     }
 }
 
@@ -170,6 +191,15 @@ pub struct Track {
     pub kind: TrackKind,
     /// 片段。
     pub clips: Vec<Arc<Clip>>,
+    /// 隐藏（剪映轨道头的 👁）：画面、字幕不进预览和导出。没有时不写进文件。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
+    /// 静音（轨道头的 🔊）：声音不进预览和导出。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub muted: bool,
+    /// 锁定（轨道头的 🔒）：片段不能选中、不能改。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
 }
 
 impl Track {
@@ -180,7 +210,22 @@ impl Track {
             id,
             kind,
             clips: Vec::new(),
+            hidden: false,
+            muted: false,
+            locked: false,
         }
+    }
+
+    /// 画面 / 字幕是否进预览和导出（没隐藏）。
+    #[must_use]
+    pub const fn shows(&self) -> bool {
+        !self.hidden
+    }
+
+    /// 声音是否进预览和导出（没静音）。
+    #[must_use]
+    pub const fn sounds(&self) -> bool {
+        !self.muted
     }
 
     /// 轨道终点（最后一个片段的终点）。
@@ -463,7 +508,8 @@ fn check_clip(
         return Err(InvariantError::BadFade { clip: id });
     }
     match (&clip.content, kind) {
-        (ClipContent::Subtitle { .. }, TrackKind::Subtitle) => Ok(()),
+        (ClipContent::Subtitle { .. }, TrackKind::Subtitle)
+        | (ClipContent::Adjustment, TrackKind::Video) => Ok(()),
         (ClipContent::Media { asset, source_in }, TrackKind::Video | TrackKind::Audio) => {
             let a = assets.get(asset).ok_or(InvariantError::MissingAsset {
                 clip: id,

@@ -52,6 +52,11 @@ mod generated {
             ToggleMarker,
             NextMarker,
             PrevMarker,
+            ToggleFullscreen,
+            Mirror,
+            Rotate90,
+            ZoomToFit,
+            Freeze,
         ]
     );
 }
@@ -73,6 +78,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-s", SaveAs, Some(CONTEXT)),
         KeyBinding::new("ctrl-i", Import, Some(CONTEXT)),
         KeyBinding::new("ctrl-e", Export, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-f", ToggleFullscreen, Some(CONTEXT)),
         KeyBinding::new("ctrl-z", Undo, Some(NO_INPUT)),
         KeyBinding::new("ctrl-y", Redo, Some(NO_INPUT)),
         KeyBinding::new("ctrl-shift-z", Redo, Some(NO_INPUT)),
@@ -98,6 +104,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-delete", RippleDelete, Some(NO_INPUT)),
         KeyBinding::new("ctrl-=", ZoomIn, Some(NO_INPUT)),
         KeyBinding::new("ctrl--", ZoomOut, Some(NO_INPUT)),
+        KeyBinding::new("shift-z", ZoomToFit, Some(NO_INPUT)),
         KeyBinding::new("t", AddSubtitle, Some(NO_INPUT)),
         // Esc：拖到一半先取消拖动（回到原位），否则取消选择
         KeyBinding::new("escape", Cancel, Some(NO_INPUT)),

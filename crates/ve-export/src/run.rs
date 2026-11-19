@@ -6,9 +6,64 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use ve_core::Project;
 
-/// ffmpeg 可执行文件：环境变量 `VE_FFMPEG` 优先，否则 PATH 上的 `ffmpeg`。
+/// ffmpeg 可执行文件：环境变量 `VE_FFMPEG` 优先，否则 PATH 上的 `ffmpeg`
+/// （Windows 上先找程序自己所在的目录，打包时 ffmpeg.exe 就放在那里）。
 fn ffmpeg_program() -> std::ffi::OsString {
     std::env::var_os("VE_FFMPEG").unwrap_or_else(|| "ffmpeg".into())
+}
+
+/// 启动 ffmpeg 的命令：Windows 上不弹命令行窗口（发布版是图形程序，没有自己的控制台，
+/// 不加这个标志每次导出都会冒出一个黑窗口）。
+fn ffmpeg_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        /// `CREATE_NO_WINDOW`
+        const NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(NO_WINDOW);
+    }
+    cmd
+}
+
+/// 取素材 `input` 在 `at`（素材时间）那一帧，存成 PNG `out`（定格用）。
+///
+/// # Errors
+/// 找不到 ffmpeg、ffmpeg 失败（错误信息取它的输出）、没写出文件。
+pub fn grab_frame(
+    input: &std::path::Path,
+    at: ve_core::Time,
+    out: &std::path::Path,
+) -> Result<(), String> {
+    let secs = format!("{:.6}", at.as_secs_f64().max(0.0));
+    let output = ffmpeg_command(ffmpeg_program())
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            &secs,
+            "-i",
+        ])
+        .arg(input)
+        .args(["-frames:v", "1", "-update", "1"])
+        .arg(out)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => "找不到 ffmpeg".to_owned(),
+            _ => e.to_string(),
+        })?;
+    if !output.status.success() || !out.is_file() {
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if err.is_empty() {
+            "ffmpeg 没有取出画面".to_owned()
+        } else {
+            err
+        });
+    }
+    Ok(())
 }
 
 /// 导出前检查并准备：路径转绝对（ffmpeg 在临时目录里运行），素材都在，输出不是素材本身。
@@ -148,7 +203,7 @@ fn run_once(
     if cancel.load(Ordering::Acquire) {
         return Err(ExportError::Cancelled);
     }
-    let mut child = Command::new(program)
+    let mut child = ffmpeg_command(program)
         .args(&job.args)
         .current_dir(dir.path())
         .stdin(Stdio::piped())
@@ -515,6 +570,38 @@ mod tests {
             center(&preview),
             center(&exported)
         );
+    }
+
+    #[test]
+    fn grab_frame_saves_the_exact_frame_as_png() {
+        use ve_media::testing::frame_index_from_gray;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("freeze.png");
+        grab_frame(&fixture(Fixture::FrameIndexed30), Time::from_secs(1), &out).unwrap();
+        let probed = ve_media::probe(&out).unwrap();
+        let video = probed.video.unwrap();
+        assert!(
+            video.still && (video.width, video.height) == (64, 36),
+            "{video:?}"
+        );
+        let target = ve_media::ScaleTarget {
+            max_width: 64,
+            max_height: 36,
+        };
+        let frame = ve_media::VideoDecoder::open(&out, target)
+            .unwrap()
+            .next_frame()
+            .unwrap()
+            .unwrap();
+        let i = ((18 * frame.width + 32) * 4) as usize;
+        assert_eq!(
+            frame_index_from_gray(f64::from(frame.data[i])),
+            30,
+            "第 1 秒是第 30 帧"
+        );
+        // 素材不存在：带上 ffmpeg 的报错
+        let err = grab_frame(&dir.path().join("nope.mp4"), Time::ZERO, &out).unwrap_err();
+        assert_ne!(err, "");
     }
 
     #[test]

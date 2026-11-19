@@ -1,6 +1,5 @@
 //! 属性面板（剪映式）：顶部一级标签，视频片段「画面 / 音频 / 变速 / 动画 / 调整」，
 //! 音频片段「音频 / 变速」，字幕「文本 / 动画」，什么都没选时显示「草稿参数」。
-//! 变速、动画、调整先占位，后续补功能。
 
 use crate::chrome;
 use crate::theme::palette;
@@ -274,10 +273,11 @@ impl Workspace {
         };
         let current = (**current).clone();
         let edited = match &current.content {
-            ClipContent::Subtitle { text } => {
+            ClipContent::Subtitle { text, .. } => {
                 let typed = self.inspector.text.read(cx).value().to_string();
                 (typed != *text).then(|| self.doc.edit(|p| set_subtitle_text(p, clip, typed)))
             }
+            ClipContent::Adjustment => None,
             ClipContent::Media { .. } => {
                 let fade_in =
                     parse_secs(&self.inspector.fade_in.read(cx).value()).unwrap_or(current.fade_in);
@@ -326,12 +326,13 @@ impl Workspace {
                     self.fill_adjust(&clip.adjust, window, cx);
                 }
             }
-            ClipContent::Subtitle { text } => {
+            ClipContent::Subtitle { text, .. } => {
                 let text = text.clone();
                 self.inspector
                     .text
                     .update(cx, |s, cx| s.set_value(text, window, cx));
             }
+            ClipContent::Adjustment => self.fill_adjust(&clip.adjust, window, cx),
         }
     }
 
@@ -434,7 +435,11 @@ impl Workspace {
         };
         let video = self.bound_video_clip().is_some();
         let subtitle = matches!(c.content, ClipContent::Subtitle { .. });
-        let available = InspectorTab::for_clip(video, subtitle);
+        let available = if c.is_adjustment() {
+            &[InspectorTab::Adjust][..]
+        } else {
+            InspectorTab::for_clip(video, subtitle)
+        };
         let current = self.inspector.tab.effective(available);
         let tabs = h_flex().children(available.iter().map(|&tab| {
             chrome::text_tab(tab.id(), tab.label(), Some(tab) == current, cx).on_click(cx.listener(
@@ -490,8 +495,8 @@ impl Workspace {
             (Some(InspectorTab::Animation), ClipContent::Media { .. }) if video => {
                 self.render_motion_tab(cx).into_any_element()
             }
-            (Some(InspectorTab::Animation), _) => {
-                chrome::coming_soon("文字动画：入场、出场、循环", cx).into_any_element()
+            (Some(InspectorTab::Animation), ClipContent::Subtitle { motion, .. }) => {
+                Self::render_text_motion_tab(*motion, cx).into_any_element()
             }
             (Some(InspectorTab::Adjust), _) => self.render_adjust_tab(cx).into_any_element(),
             _ => div().into_any_element(),

@@ -1,14 +1,17 @@
-//! 属性面板「动画」标签：入场 / 出场预设（剪映的动画），用关键帧实现。
+//! 属性面板「动画」标签：视频片段的入场 / 出场预设（剪映的动画，用关键帧实现），
+//! 字幕的入场 / 出场动画（渐显、滑入、放大……）。
 
 use crate::chrome;
 use crate::workspace::Workspace;
+use gpui_kit::component::button::Button;
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::{
     Context, InteractiveElement as _, IntoElement, ParentElement as _,
     StatefulInteractiveElement as _, Styled as _, div,
 };
-use ve_core::Time;
+use gpui_kit::{SharedString, Window};
 use ve_core::motion::{Motion, Phase, apply_motion};
+use ve_core::{ClipId, TextIn, TextMotion, TextOut, Time, TrackKind};
 
 /// 时长选项（秒）。
 const DURATIONS: [(&str, f64); 4] = [("0.3s", 0.3), ("0.5s", 0.5), ("1s", 1.0), ("2s", 2.0)];
@@ -103,5 +106,98 @@ impl Workspace {
                     .text_color(muted)
                     .child("动画是用关键帧做的：套用后可以在「画面」里接着改关键帧"),
             )
+    }
+
+    /// 字幕的「动画」标签：入场、出场各一排，点一下就换；「应用到全部字幕」。
+    pub(crate) fn render_text_motion_tab(
+        motion: TextMotion,
+        cx: &Context<'_, Self>,
+    ) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let intro = h_flex()
+            .flex_wrap()
+            .gap_1()
+            .children(TextIn::ALL.iter().enumerate().map(|(i, &v)| {
+                chrome::chip(
+                    SharedString::from(format!("text-in-{i}")),
+                    v.label(),
+                    motion.intro == v,
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.set_bound_text_motion(TextMotion { intro: v, ..motion }, window, cx);
+                }))
+            }));
+        let outro = h_flex()
+            .flex_wrap()
+            .gap_1()
+            .children(TextOut::ALL.iter().enumerate().map(|(i, &v)| {
+                chrome::chip(
+                    SharedString::from(format!("text-out-{i}")),
+                    v.label(),
+                    motion.outro == v,
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.set_bound_text_motion(TextMotion { outro: v, ..motion }, window, cx);
+                }))
+            }));
+        v_flex()
+            .id("insp-text-motion")
+            .gap_3()
+            .child(div().text_sm().text_color(muted).child("入场"))
+            .child(intro)
+            .child(div().text_sm().text_color(muted).child("出场"))
+            .child(outro)
+            .child(
+                Button::new("text-motion-all")
+                    .compact()
+                    .outline()
+                    .label("应用到全部字幕")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_all_text_motion(motion, window, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("入场、出场各 0.5 秒（字幕太短时各占一半）；预览和导出一样"),
+            )
+    }
+
+    /// 改属性面板绑定的那条字幕的动画。
+    fn set_bound_text_motion(
+        &mut self,
+        motion: TextMotion,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some(clip) = self.inspector.bound {
+            self.apply(window, cx, |p| {
+                ve_core::edit::set_text_motion(p, &[clip], motion)
+            });
+        }
+    }
+
+    /// 所有字幕都用这个动画（一步撤销）。
+    fn set_all_text_motion(
+        &mut self,
+        motion: TextMotion,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let all: Vec<ClipId> = self
+            .doc
+            .project
+            .timeline
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Subtitle)
+            .flat_map(|t| t.clips.iter().map(|c| c.id))
+            .collect();
+        self.apply(window, cx, |p| {
+            ve_core::edit::set_text_motion(p, &all, motion)
+        });
     }
 }

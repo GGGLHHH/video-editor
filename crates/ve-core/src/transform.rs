@@ -34,6 +34,9 @@ pub struct Transform {
     pub opacity: f32,
     /// 旋转角度（度，顺时针为正），绕整幅画面（未裁剪）的中心转。
     pub rotation: f32,
+    /// 左右镜像（剪映工具栏的「镜像」）。裁剪按镜像后看到的左右算。不做关键帧。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub mirror: bool,
 }
 
 impl Default for Transform {
@@ -56,6 +59,7 @@ impl Transform {
         },
         opacity: 1.0,
         rotation: 0.0,
+        mirror: false,
     };
 
     /// `scale` 的取值范围。
@@ -245,7 +249,12 @@ pub fn layer_geometry(canvas: (u32, u32), source: (u32, u32), t: &Transform) -> 
             full_w * keep_w,
             full_h * keep_h,
         ),
-        uv: make(cut_l, cut_t, keep_w, keep_h),
+        // 镜像：纹理横向倒着取（从右往左），显示的位置和裁剪都不变
+        uv: if t.mirror {
+            make(1.0 - cut_l, cut_t, -keep_w, keep_h)
+        } else {
+            make(cut_l, cut_t, keep_w, keep_h)
+        },
         center: (to_f32(left + full_w / 2.0), to_f32(top + full_h / 2.0)),
         angle: t.rotation.to_radians(),
     }
@@ -289,6 +298,29 @@ mod tests {
         let g = layer_geometry((1000, 500), (1000, 500), &t);
         // 中心 (500 + 250, 250 - 50) = (750, 200)，尺寸 500×250
         assert!(close(g.full, rect(500.0, 75.0, 500.0, 250.0)), "{g:?}");
+    }
+
+    #[test]
+    fn mirror_reads_the_texture_right_to_left() {
+        let t = Transform {
+            mirror: true,
+            crop: Crop {
+                left: 0.1,
+                right: 0.2,
+                ..Crop::default()
+            },
+            ..Transform::default()
+        };
+        let plain = layer_geometry(
+            (1920, 1080),
+            (1920, 1080),
+            &Transform { mirror: false, ..t },
+        );
+        let g = layer_geometry((1920, 1080), (1920, 1080), &t);
+        assert_eq!(g.shown, plain.shown, "位置、大小不变");
+        // 看到的左边裁掉 10%：最左边显示的是源画面 90% 处，往左读到 20% 处
+        assert!(close(g.uv, rect(0.9, 0.0, -0.7, 1.0)), "{g:?}");
+        assert!(close(plain.uv, rect(0.1, 0.0, 0.7, 1.0)), "{plain:?}");
     }
 
     #[test]
@@ -441,7 +473,7 @@ mod tests {
             x in -2.0f32..2.0, y in -2.0f32..2.0, scale in 0.01f32..10.0,
             l in 0.0f32..0.49, r in 0.0f32..0.49, t in 0.0f32..0.49, b in 0.0f32..0.49,
         ) {
-            let tf = Transform { x, y, scale, crop: Crop { left: l, top: t, right: r, bottom: b }, opacity: 1.0, rotation: 0.0 };
+            let tf = Transform { x, y, scale, crop: Crop { left: l, top: t, right: r, bottom: b }, opacity: 1.0, rotation: 0.0, mirror: false };
             prop_assert!(tf.is_valid());
             let geom = layer_geometry((cw, ch), (sw, sh), &tf);
             let (full, shown) = (geom.full, geom.shown);

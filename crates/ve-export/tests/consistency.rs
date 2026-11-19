@@ -264,3 +264,41 @@ fn export_matches_preview_mid_transition() {
     let score = psnr(&preview, &exported);
     assert!(score >= 35.0, "PSNR {score:.1} dB");
 }
+
+#[test]
+fn export_matches_preview_under_an_adjustment_layer() {
+    // 三层工程最上面加一段调节：提亮 + 去色，三层画面和画面外的黑边都被调
+    let mut p = three_layers(640, 360);
+    // 灰底缩小一半：四周留黑，看底色有没有被调
+    let gray = p.timeline.video_tracks_bottom_up().next().unwrap().clips[0].id;
+    set_transform(
+        &mut p,
+        gray,
+        Transform {
+            scale: 0.5,
+            ..Transform::default()
+        },
+    )
+    .unwrap();
+    let adj = ve_core::edit::add_adjustment(&mut p, Time::ZERO, Time::from_secs(2)).unwrap();
+    let lift = ve_core::ColorAdjust {
+        brightness: 0.4,
+        saturation: -1.0,
+        ..ve_core::ColorAdjust::NONE
+    };
+    ve_core::edit::set_adjust(&mut p, adj, lift).unwrap();
+    let t = RATE.time_of_frame(30);
+    let preview = preview_frame(&p, t);
+    let exported = exported_frame(&p, 640, 360, t);
+    let score = psnr(&preview, &exported);
+    assert!(score >= 35.0, "PSNR {score:.1} dB");
+    // 左上角原来是黑边：现在是提亮后的灰（亮度 +0.4 → 0.1，约 26）
+    let corner = |f: &VideoFrame| f.data[(4 * (4 * f.width + 4)) as usize];
+    let lifted = (lift.matrix().apply([0.0; 3])[0] * 255.0).round();
+    assert!(
+        (f64::from(corner(&preview)) - f64::from(lifted)).abs() <= 3.0,
+        "预览底色 {} vs {lifted}",
+        corner(&preview)
+    );
+    assert!((f64::from(corner(&exported)) - f64::from(lifted)).abs() <= 4.0);
+}

@@ -121,11 +121,200 @@ impl ColorAdjust {
         ]
         .map(|c| c.clamp(0.0, 1.0))
     }
+
+    /// 同一个调色写成颜色矩阵（不含最后的截断）。调节层要把几次调色连起来做，矩阵才能相乘。
+    #[must_use]
+    pub fn matrix(&self) -> ColorMatrix {
+        // 提亮、对比度对每个通道一样：g·c + k；饱和度是 S = s·I + (1−s)·1·Lᵀ（S·1 = 1，常数项不变）；
+        // 最后加色温、色调的偏移
+        const LUMA: [f32; 3] = [0.2126, 0.7152, 0.0722];
+        let g = 1.0 + self.contrast;
+        let s = 1.0 + self.saturation;
+        let k = (self.brightness * 0.25 - 0.5).mul_add(g, 0.5);
+        let shift = [
+            self.temperature * 0.1 + self.tint * 0.05,
+            -self.tint * 0.1,
+            self.tint.mul_add(0.05, -self.temperature * 0.1),
+        ];
+        let row = |i: usize| {
+            let m = |j: usize| g * (1.0 - s).mul_add(LUMA[j], if i == j { s } else { 0.0 });
+            [m(0), m(1), m(2), k + shift[i]]
+        };
+        ColorMatrix([row(0), row(1), row(2)])
+    }
 }
+
+/// 颜色的仿射变换：输出 = M·rgb + 常数（每行 `[r 系数, g 系数, b 系数, 常数]`），sRGB 0–1、不预乘。
+/// 合成器按它给每层调色；调节层把自己的矩阵接在下面各层的后面。
+///
+/// 仿射变换和透明叠加可以交换次序（`f(a·x + (1−a)·y) = a·f(x) + (1−a)·f(y)`），所以「先叠好再整体调色」
+/// 等于「每层先调色再叠」，只要底色也调。差别只在中途超出 0–1 被截断的地方。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColorMatrix(pub [[f32; 4]; 3]);
+
+impl Default for ColorMatrix {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+impl ColorMatrix {
+    /// 不调色。
+    pub const IDENTITY: Self = Self([
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ]);
+
+    /// 是不是不调色（合成时跳过，免得反预乘再预乘带来误差）。
+    #[must_use]
+    pub fn is_identity(&self) -> bool {
+        *self == Self::IDENTITY
+    }
+
+    /// 对一个颜色做变换，再截断到 0–1（和着色器一样）。
+    #[must_use]
+    pub fn apply(&self, rgb: [f32; 3]) -> [f32; 3] {
+        self.0.map(|[r, g, b, c]| {
+            r.mul_add(rgb[0], g.mul_add(rgb[1], b.mul_add(rgb[2], c)))
+                .clamp(0.0, 1.0)
+        })
+    }
+
+    /// 先做 `self` 再做 `next`。
+    #[must_use]
+    pub fn then(&self, next: &Self) -> Self {
+        let (a, b) = (&self.0, &next.0);
+        Self(std::array::from_fn(|i| {
+            let mut row = [0.0f32; 4];
+            for (j, out) in row.iter_mut().enumerate() {
+                let carry = if j == 3 { b[i][3] } else { 0.0 };
+                *out = (0..3).fold(carry, |acc, k| b[i][k].mul_add(a[k][j], acc));
+            }
+            row
+        }))
+    }
+}
+
+/// 一个滤镜预设（剪映素材面板「滤镜」的本地版）：名字和一组调色参数。套用就是把片段的调色换成它，
+/// 之后还能在「调整」里接着改。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Filter {
+    /// 名字。
+    pub name: &'static str,
+    /// 调色参数。
+    pub adjust: ColorAdjust,
+}
+
+const fn filter(
+    name: &'static str,
+    brightness: f32,
+    contrast: f32,
+    saturation: f32,
+    temperature: f32,
+    tint: f32,
+) -> Filter {
+    Filter {
+        name,
+        adjust: ColorAdjust {
+            brightness,
+            contrast,
+            saturation,
+            temperature,
+            tint,
+        },
+    }
+}
+
+/// 滤镜预设，第一个「原图」是去掉调色。
+pub const FILTERS: [Filter; 12] = [
+    filter("原图", 0.0, 0.0, 0.0, 0.0, 0.0),
+    filter("鲜艳", 0.0, 0.15, 0.45, 0.0, 0.0),
+    filter("清新", 0.15, -0.1, 0.1, -0.15, 0.0),
+    filter("暖阳", 0.05, 0.05, 0.1, 0.5, 0.0),
+    filter("冷调", 0.0, 0.05, -0.05, -0.5, 0.0),
+    filter("复古", 0.05, -0.1, -0.35, 0.35, 0.0),
+    filter("胶片", 0.0, 0.15, -0.15, 0.15, 0.1),
+    filter("青橙", 0.0, 0.2, 0.2, 0.25, -0.2),
+    filter("粉调", 0.08, 0.0, 0.05, 0.05, 0.35),
+    filter("暗调", -0.2, 0.25, -0.1, 0.0, 0.0),
+    filter("淡雅", 0.1, -0.25, -0.3, 0.0, 0.0),
+    filter("黑白", 0.0, 0.1, -1.0, 0.0, 0.0),
+];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matrix_matches_the_step_by_step_formula() {
+        let adjust = ColorAdjust {
+            brightness: 0.3,
+            contrast: -0.4,
+            saturation: 0.6,
+            temperature: -0.2,
+            tint: 0.5,
+        };
+        let m = adjust.matrix();
+        for rgb in [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.5, 0.25],
+            [0.3, 0.9, 0.6],
+            [0.5, 0.5, 0.5],
+        ] {
+            let (want, got) = (adjust.apply(rgb), m.apply(rgb));
+            for k in 0..3 {
+                assert!(
+                    (want[k] - got[k]).abs() < 1e-5,
+                    "{rgb:?}: {want:?} vs {got:?}"
+                );
+            }
+        }
+        assert!(ColorAdjust::NONE.matrix().is_identity());
+    }
+
+    #[test]
+    fn chained_matrices_equal_doing_both_in_turn() {
+        let first = ColorAdjust {
+            saturation: -1.0,
+            ..ColorAdjust::NONE
+        }
+        .matrix();
+        let second = ColorAdjust {
+            temperature: 0.5,
+            contrast: 0.2,
+            ..ColorAdjust::NONE
+        }
+        .matrix();
+        let both = first.then(&second);
+        for rgb in [[0.9, 0.2, 0.1], [0.1, 0.4, 0.7]] {
+            let want = second.apply(first.apply(rgb));
+            let got = both.apply(rgb);
+            for k in 0..3 {
+                assert!((want[k] - got[k]).abs() < 1e-5, "{want:?} vs {got:?}");
+            }
+        }
+        assert_eq!(ColorMatrix::IDENTITY.then(&second), second);
+        assert_eq!(second.then(&ColorMatrix::IDENTITY), second);
+    }
+
+    #[test]
+    fn filters_are_valid_distinct_and_start_with_the_original() {
+        assert!(FILTERS[0].adjust.is_identity());
+        for (i, f) in FILTERS.iter().enumerate() {
+            assert!(f.adjust.is_valid(), "{}", f.name);
+            assert!(
+                FILTERS[..i]
+                    .iter()
+                    .all(|g| g.name != f.name && g.adjust != f.adjust),
+                "{} 重复",
+                f.name
+            );
+        }
+        // 黑白：彩色变成灰
+        let [r, g, b] = FILTERS[11].adjust.apply([0.9, 0.2, 0.1]);
+        assert!((r - g).abs() < 1e-6 && (g - b).abs() < 1e-6);
+    }
 
     #[test]
     fn identity_leaves_colors_alone() {

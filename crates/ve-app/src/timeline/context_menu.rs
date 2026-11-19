@@ -36,7 +36,8 @@ impl Workspace {
         let (x, y) = (f32::from(e.position.x - o.x), f32::from(e.position.y - o.y));
         let geo = self.timeline.geometry;
         self.timeline.context_menu = match geo.hit_test(x, y, &self.doc.project.timeline) {
-            Hit::Clip { clip, .. } => {
+            // 锁定轨道上的片段：不弹菜单（选不中，菜单会作用到别的选择上）
+            Hit::Clip { clip, .. } if self.doc.selectable(clip) => {
                 if !self.doc.is_selected(clip) {
                     self.doc.select(clip, false);
                 }

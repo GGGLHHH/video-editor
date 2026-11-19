@@ -9,7 +9,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use ve_core::compose::resolve_layers;
+use ve_core::compose::resolve_frame;
 use ve_core::{ClipId, FrameRate, Project, Time, TrackId, Transform, layer_geometry};
 use ve_media::{MediaError, ScaleTarget, VideoDecoder, VideoFrame};
 use ve_render::{Compositor, FramePixels, Layer, MappedNv12};
@@ -43,8 +43,11 @@ struct LayerFrame {
     frame: Arc<VideoFrame>,
     source: (u32, u32),
     transform: Transform,
-    adjust: ve_core::ColorAdjust,
+    color: ve_core::ColorMatrix,
 }
+
+/// 一帧要合成的东西：各层画面（从下往上）和底色的调色。
+type FrameLayers = (Vec<LayerFrame>, ve_core::ColorMatrix);
 
 /// 按顺序读一个片段的画面：第一次定位，之后一直往后读。
 struct Stepper {
@@ -109,7 +112,7 @@ fn decode_frames(
     canvas: (u32, u32),
     max_texture: u32,
     total: u64,
-    tx: &SyncSender<Result<Vec<LayerFrame>, ExportError>>,
+    tx: &SyncSender<Result<FrameLayers, ExportError>>,
     cancel: &AtomicBool,
 ) {
     let mut steppers: HashMap<Key, Stepper> = HashMap::new();
@@ -133,8 +136,8 @@ fn layer_frames(
     max_texture: u32,
     t: Time,
     steppers: &mut HashMap<Key, Stepper>,
-) -> Result<Vec<LayerFrame>, ExportError> {
-    let layers = resolve_layers(project, t);
+) -> Result<FrameLayers, ExportError> {
+    let ve_core::compose::Composition { layers, background } = resolve_frame(project, t);
     steppers.retain(|key, _| layers.iter().any(|l| (l.track, l.clip) == *key));
     let mut jobs = Vec::with_capacity(layers.len());
     for l in &layers {
@@ -167,16 +170,16 @@ fn layer_frames(
             stepper,
             l.source_time,
             source,
-            (l.transform, l.adjust),
+            (l.transform, l.color),
             asset.name.clone(),
         ));
     }
-    let step = |(key, mut stepper, time, source, (transform, adjust), name): (
+    let step = |(key, mut stepper, time, source, (transform, color), name): (
         Key,
         Stepper,
         Time,
         (u32, u32),
-        (Transform, ve_core::ColorAdjust),
+        (Transform, ve_core::ColorMatrix),
         String,
     )| {
         let r = stepper.frame_at(time).map_err(|e| render_error(&name, &e));
@@ -187,7 +190,7 @@ fn layer_frames(
                 frame,
                 source,
                 transform,
-                adjust,
+                color,
             }),
         )
     };
@@ -213,7 +216,7 @@ fn layer_frames(
         steppers.insert(key, stepper);
         frames.push(r?);
     }
-    Ok(frames)
+    Ok((frames, background))
 }
 
 fn render_error(name: &str, e: &MediaError) -> ExportError {
@@ -282,7 +285,7 @@ pub fn render_video(
                 });
                 break;
             };
-            let layers = match layers {
+            let (layers, background) = match layers {
                 Ok(l) => l,
                 Err(e) => {
                     outcome = Err(e);
@@ -302,9 +305,10 @@ pub fn render_video(
                     },
                     geometry: layer_geometry(size, l.source, &l.transform),
                     opacity: l.transform.opacity,
-                    adjust: l.adjust,
+                    color: l.color,
                 })
                 .collect();
+            compositor.set_background(&background);
             if let Err(e) = compositor.submit_nv12(size, &gpu) {
                 outcome = Err(ExportError::Render(e.to_string()));
                 break;

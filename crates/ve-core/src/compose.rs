@@ -19,18 +19,39 @@ pub struct LayerSource {
     pub transform: Transform,
     /// 整个片段里最大的缩放（导出按它决定解码尺寸，放大时画面不糊）。
     pub max_scale: f32,
-    /// 调色。
-    pub adjust: crate::ColorAdjust,
+    /// 调色：片段自己的调色，再接上压在它上面的调节片段（[`crate::ColorMatrix`]）。
+    pub color: crate::ColorMatrix,
     /// 同一条轨上相邻的片段交替用 0 / 1：转场时前后两段同时出现，各用各的解码器。
     pub lane: u8,
+}
+
+/// 时间点 `t` 上要合成的东西：各层画面和底色的调色。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Composition {
+    /// 画面图层，从最下层到最上层。
+    pub layers: Vec<LayerSource>,
+    /// 黑底要做的调色（调节片段会把没有画面的地方也调了）。
+    pub background: crate::ColorMatrix,
 }
 
 /// 时间点 `t` 上所有视频轨的画面，从最下层到最上层（合成顺序）。
 #[must_use]
 pub fn resolve_layers(project: &Project, t: Time) -> Vec<LayerSource> {
+    resolve_frame(project, t).layers
+}
+
+/// 时间点 `t` 上的合成：从下往上一条条视频轨看，素材片段是一层画面；调节片段不出画面，
+/// 而是把它的调色接在下面已有的每一层和黑底后面（调节层）。
+#[must_use]
+pub fn resolve_frame(project: &Project, t: Time) -> Composition {
     let frame = project.settings.frame_rate.frame_duration();
-    let mut out = Vec::new();
-    for tr in project.timeline.video_tracks_bottom_up() {
+    let mut out: Vec<LayerSource> = Vec::new();
+    let mut background = crate::ColorMatrix::IDENTITY;
+    for tr in project
+        .timeline
+        .video_tracks_bottom_up()
+        .filter(|tr| tr.shows())
+    {
         if let Some(pair) = transition_layers(tr, t, frame) {
             out.extend(pair);
             continue;
@@ -42,11 +63,24 @@ pub fn resolve_layers(project: &Project, t: Time) -> Vec<LayerSource> {
         if !clip.enabled() {
             continue;
         }
+        if clip.is_adjustment() {
+            let m = clip.adjust.matrix();
+            if !m.is_identity() {
+                for l in &mut out {
+                    l.color = l.color.then(&m);
+                }
+                background = background.then(&m);
+            }
+            continue;
+        }
         if let Some(layer) = layer_of(tr.id, clip, i, t - clip.start, None) {
             out.push(layer);
         }
     }
-    out
+    Composition {
+        layers: out,
+        background,
+    }
 }
 
 /// 片段内 `offset` 时刻的图层；`transform` 给了就用它（转场时改过的属性）。
@@ -67,7 +101,7 @@ fn layer_of(
             .animation
             .max_value(crate::Prop::Scale)
             .map_or(clip.transform.scale, |m| m.max(clip.transform.scale)),
-        adjust: clip.adjust,
+        color: clip.adjust.matrix(),
         lane: u8::from(index % 2 == 1),
     })
 }
@@ -114,7 +148,13 @@ fn transition_layers(track: &Track, t: Time, frame: Time) -> Option<[LayerSource
 /// 都没停用，时长不超过任何一段。
 fn transition_between(prev: &Clip, incoming: &Clip) -> Option<(crate::Transition, Time)> {
     let tr = incoming.transition_in?;
-    if prev.end() != incoming.start || !prev.enabled() || !incoming.enabled() {
+    // 两段都得是素材片段（调节片段没有画面，做不了转场）
+    if prev.end() != incoming.start
+        || !prev.enabled()
+        || !incoming.enabled()
+        || prev.asset().is_none()
+        || incoming.asset().is_none()
+    {
         return None;
     }
     let span = tr.duration.min(prev.duration).min(incoming.duration);
@@ -246,6 +286,62 @@ mod tests {
         assert_eq!(before[1].source_time, Time::from_secs(5), "v2 的素材起点");
         assert_eq!(resolve_layers(&p, Time::from_secs(6)).len(), 1, "转场之后");
         assert!(p.timeline.check_invariants(&p.assets).is_ok());
+    }
+
+    #[test]
+    fn adjustments_color_everything_below_them_and_the_background() {
+        use crate::edit::{
+            ADJUSTMENT_LENGTH, TrackFlag, add_adjustment, add_track, insert_asset_at, set_adjust,
+            set_disabled, set_track_flag,
+        };
+        let (mut p, ids) = sample_project();
+        let adj = add_adjustment(&mut p, Time::ZERO, ADJUSTMENT_LENGTH).unwrap();
+        let bw = crate::FILTERS[11].adjust;
+        set_adjust(&mut p, adj, bw).unwrap();
+        // 调节上面再叠一层画中画：它不受调节影响
+        let top = add_track(&mut p, crate::TrackKind::Video).unwrap();
+        insert_asset_at(&mut p, ids.video_asset, top, Time::ZERO).unwrap();
+        let frame = resolve_frame(&p, Time::from_secs(1));
+        assert_eq!(frame.layers.len(), 2, "调节片段本身不出画面");
+        assert_eq!(frame.layers[0].color, bw.matrix(), "主轨被调了");
+        assert!(frame.layers[1].color.is_identity(), "上面那层没被调");
+        assert_eq!(frame.background, bw.matrix());
+        // 片段自己的调色在前，调节层在后
+        let warm = crate::FILTERS[3].adjust;
+        set_adjust(&mut p, ids.v1, warm).unwrap();
+        let both = resolve_frame(&p, Time::from_secs(1)).layers[0].color;
+        assert_eq!(both, warm.matrix().then(&bw.matrix()));
+        // 调节片段之外、停用、所在轨隐藏：都不起作用
+        assert!(
+            resolve_frame(&p, Time::from_secs(4))
+                .background
+                .is_identity()
+        );
+        set_disabled(&mut p, &[adj], true).unwrap();
+        assert!(
+            resolve_frame(&p, Time::from_secs(1))
+                .background
+                .is_identity()
+        );
+        set_disabled(&mut p, &[adj], false).unwrap();
+        let track = p.timeline.find_clip(adj).unwrap().0;
+        set_track_flag(&mut p, track, TrackFlag::Hidden, true).unwrap();
+        assert!(
+            resolve_frame(&p, Time::from_secs(1))
+                .background
+                .is_identity()
+        );
+    }
+
+    #[test]
+    fn hidden_video_tracks_are_not_composited() {
+        use crate::edit::{TrackFlag, set_track_flag};
+        let (mut p, ids) = sample_project();
+        assert_eq!(resolve_layers(&p, Time::from_secs(1)).len(), 1);
+        set_track_flag(&mut p, ids.video_track, TrackFlag::Hidden, true).unwrap();
+        assert_eq!(resolve_layers(&p, Time::from_secs(1)).len(), 0);
+        set_track_flag(&mut p, ids.video_track, TrackFlag::Hidden, false).unwrap();
+        assert_eq!(resolve_layers(&p, Time::from_secs(1)).len(), 1);
     }
 
     #[test]
