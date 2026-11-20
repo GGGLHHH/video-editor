@@ -83,21 +83,24 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let rx = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("导入 OpenTimelineIO".into()),
+        // 导入会换掉当前工程：和打开一样先问要不要保存
+        self.confirm_discard(window, cx, |this, window, cx| {
+            let rx = cx.prompt_for_paths(PathPromptOptions {
+                files: true,
+                directories: false,
+                multiple: false,
+                prompt: Some("导入 OpenTimelineIO".into()),
+            });
+            this.tasks.push(cx.spawn_in(window, async move |this, cx| {
+                if let Ok(Ok(Some(paths))) = rx.await
+                    && let Some(path) = paths.into_iter().next()
+                {
+                    let _ignored = this.update_in(cx, |this, window, cx| {
+                        this.import_otio_path(path, window, cx);
+                    });
+                }
+            }));
         });
-        self.tasks.push(cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = rx.await
-                && let Some(path) = paths.into_iter().next()
-            {
-                let _ignored = this.update_in(cx, |this, window, cx| {
-                    this.import_otio_path(path, window, cx);
-                });
-            }
-        }));
     }
 
     /// 读 OTIO 文件 `path`，素材在后台探测，做成一个新草稿打开。
@@ -125,7 +128,10 @@ impl Workspace {
             let built = work.await;
             let _ignored = this.update_in(cx, |this, window, cx| match built {
                 Ok((project, skipped)) => {
-                    this.replace_document(Document::from_project(project, None), window, cx);
+                    // 新工程还没存过：标成未保存，自动保存会存它，关窗口会提示
+                    let mut doc = Document::from_project(project, None);
+                    doc.mark_unsaved();
+                    this.replace_document(doc, window, cx);
                     let note = if skipped == 0 {
                         Notification::success("已导入")
                     } else {

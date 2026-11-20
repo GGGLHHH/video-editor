@@ -211,6 +211,24 @@ fn import_paths_adds_assets_and_rejects_unsupported(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn dragging_files_onto_the_window_imports_them(cx: &mut TestAppContext) {
+    use gpui_kit::{ExternalPaths, FileDropEvent, InputEvent as _};
+    let ui = open(cx);
+    let position = point(px(400.), px(300.));
+    let paths = ExternalPaths(vec![fixture(Fixture::VideoWithAudio)].into_iter().collect());
+    cx.update_window(ui.win, |_, window, cx| {
+        window.dispatch_event(
+            FileDropEvent::Entered { position, paths }.to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+        window.dispatch_event(FileDropEvent::Submit { position }.to_platform_input(), cx);
+    })
+    .unwrap();
+    wait(&mut *cx, &ui, |w| w.document().project.assets.len() == 1);
+}
+
+#[gpui_kit::test]
 fn double_click_appends_to_timeline(cx: &mut TestAppContext) {
     let ui = open(cx);
     import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], false);
@@ -3865,7 +3883,7 @@ fn a_crashed_session_reopens_its_project(cx: &mut TestAppContext) {
     });
     assert_eq!(opened, Some(project.clone()));
     // 旧记录删了，本进程记着现在的工程
-    let left = sessions.crashed(|_| false);
+    let left = sessions.crashed(|_, _| false);
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].pid, me);
     assert_eq!(left[0].session.project, Some(project));
@@ -4222,6 +4240,10 @@ fn otio_export_and_import_round_trip_the_timeline(cx: &mut TestAppContext) {
             .map(std::path::Path::to_path_buf)),
         None,
         "导入成新草稿"
+    );
+    assert!(
+        ui.view.read_with(cx, |w, _| w.document().is_dirty()),
+        "还没存过：算未保存，自动保存和关窗口提示都管它"
     );
 }
 

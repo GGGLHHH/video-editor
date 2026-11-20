@@ -32,14 +32,14 @@ pub fn missing_assets(project: &Project, exists: impl Fn(&Path) -> bool) -> Vec<
         .collect()
 }
 
-/// 时间轴上用到素材 `asset` 的最远位置（素材内时间）；没用到时为零。倒放片段的原素材也算。
+/// 时间轴上用到素材 `asset` 的最远位置（素材内时间）；没用到时为零。倒放片段的原素材、
+/// 复合片段里面的片段也算。
 #[must_use]
 pub fn used_until(project: &Project, asset: AssetId) -> Time {
-    project
-        .timeline
-        .tracks
-        .iter()
-        .flat_map(|t| t.clips.iter())
+    let mut clips = Vec::new();
+    crate::compound::for_each_clip(&project.timeline.tracks, &mut |c| clips.push(c));
+    clips
+        .into_iter()
         .filter_map(|c| {
             let span = c.source_span();
             let direct = match c.content {
@@ -49,32 +49,18 @@ pub fn used_until(project: &Project, asset: AssetId) -> Time {
                 } if a == asset => Some(source_in + span),
                 _ => None,
             };
-            let reversed = c
-                .reversed
+            // 倒放 / 防抖过的：关掉后要用回原素材的这一段
+            let original = crate::edit::original_range(project, c)
                 .filter(|&(a, _)| a == asset)
                 .map(|(_, source_in)| source_in + span);
-            let stabilized = c
-                .stabilized
-                .filter(|&(a, ..)| a == asset)
-                .map(|(_, source_in, _)| source_in + span);
-            direct.max(reversed).max(stabilized)
+            direct.max(original)
         })
         .max()
         .unwrap_or(Time::ZERO)
 }
 
-/// 把素材 `asset` 换成探测好的文件 `found`（路径、时长、流信息用新的，id 和名字不变），
-/// 再到 `found` 所在目录里按原文件名找回别的丢失素材（只改路径）。
-/// 返回所有重新链接上的素材，`asset` 排第一。
-///
-/// # Errors
-/// 素材不存在；新文件少了原来的画面或声音；新文件比时间轴上用到的部分短。
-pub fn relink(
-    project: &mut Project,
-    asset: AssetId,
-    found: &Asset,
-    exists: impl Fn(&Path) -> bool,
-) -> Result<Vec<AssetId>, RelinkError> {
+/// 文件 `found` 能不能顶替素材 `asset`：原来有的画面、声音它都要有，长度要够时间轴上用到的。
+fn check_fits(project: &Project, asset: AssetId, found: &Asset) -> Result<(), RelinkError> {
     let old = project
         .assets
         .get(&asset)
@@ -88,28 +74,57 @@ pub fn relink(
     if used_until(project, asset) > found.source_limit() {
         return Err(RelinkError::TooShort);
     }
-    let dir = found.path.parent().map(Path::to_path_buf);
-    let mut done = vec![asset];
+    Ok(())
+}
+
+/// 素材 `asset` 换成文件 `found`（路径、时长、流信息用新的，id 和名字不变）。
+fn take(project: &mut Project, asset: AssetId, found: &Asset) {
     if let Some(slot) = project.assets.get_mut(&asset) {
         slot.path.clone_from(&found.path);
         slot.duration = found.duration;
         slot.video = found.video;
         slot.audio = found.audio;
     }
-    let Some(dir) = dir else {
+}
+
+/// 把素材 `asset` 换成探测好的文件 `found`，再到 `found` 所在目录里按原文件名找回别的丢失素材：
+/// 同名文件用 `probe` 探测，和选的文件一样要有原来的画面、声音、长度够才换（重名但内容不对的不换）。
+/// 返回所有重新链接上的素材，`asset` 排第一。
+///
+/// # Errors
+/// 素材不存在；新文件少了原来的画面或声音；新文件比时间轴上用到的部分短。
+pub fn relink(
+    project: &mut Project,
+    asset: AssetId,
+    found: &Asset,
+    exists: impl Fn(&Path) -> bool,
+    probe: impl Fn(&Path) -> Option<Asset>,
+) -> Result<Vec<AssetId>, RelinkError> {
+    check_fits(project, asset, found)?;
+    take(project, asset, found);
+    let mut done = vec![asset];
+    let Some(dir) = found.path.parent().map(Path::to_path_buf) else {
         return Ok(done);
     };
-    for other in project.assets.values_mut() {
-        if other.id == asset || exists(&other.path) {
-            continue;
-        }
-        let Some(name) = other.path.file_name() else {
+    let others: Vec<AssetId> = project
+        .assets
+        .values()
+        .filter(|a| a.id != asset && !exists(&a.path))
+        .map(|a| a.id)
+        .collect();
+    for other in others {
+        let Some(name) = project.assets[&other].path.file_name() else {
             continue;
         };
         let candidate = dir.join(name);
-        if exists(&candidate) {
-            other.path = candidate;
-            done.push(other.id);
+        if !exists(&candidate) {
+            continue;
+        }
+        if let Some(probed) = probe(&candidate)
+            && check_fits(project, other, &probed).is_ok()
+        {
+            take(project, other, &probed);
+            done.push(other);
         }
     }
     Ok(done)
@@ -147,7 +162,10 @@ mod tests {
         let on_disk = [PathBuf::from("新/clip.mp4"), PathBuf::from("新/bgm.mp3")];
         let exists = |path: &Path| on_disk.iter().any(|d| d == path);
         let found = probed("新/clip.mp4", 10, true, true);
-        let done = relink(&mut p, ids.video_asset, &found, exists).unwrap();
+        let done = relink(&mut p, ids.video_asset, &found, exists, |path| {
+            Some(probed(path.to_str()?, 20, false, true))
+        })
+        .unwrap();
         assert_eq!(done, vec![ids.video_asset, ids.audio_asset]);
         assert_eq!(p.assets[&ids.audio_asset].path, PathBuf::from("新/bgm.mp3"));
         assert_eq!(p.assets[&ids.video_asset].name, "clip.mp4", "名字不变");
@@ -155,10 +173,40 @@ mod tests {
     }
 
     #[test]
+    fn a_same_name_file_that_does_not_fit_is_left_missing() {
+        let (mut p, ids) = sample_project();
+        let exists = |path: &Path| path.starts_with("新");
+        let found = probed("新/clip.mp4", 10, true, true);
+        // 同名的 bgm.mp3 只有 1 秒，时间轴用到 8 秒：不换
+        let done = relink(&mut p, ids.video_asset, &found, exists, |path| {
+            Some(probed(path.to_str()?, 1, false, true))
+        })
+        .unwrap();
+        assert_eq!(done, vec![ids.video_asset]);
+        assert_eq!(p.assets[&ids.audio_asset].path, PathBuf::from("bgm.mp3"));
+        // 探测不了的也不换
+        let (mut q, fresh) = sample_project();
+        let unprobed = relink(&mut q, fresh.video_asset, &found, exists, |_| None).unwrap();
+        assert_eq!(unprobed, vec![fresh.video_asset]);
+    }
+
+    #[test]
+    fn clips_inside_compounds_count_toward_the_use() {
+        let (mut p, ids) = sample_project();
+        crate::compound::make_compound(&mut p, &[ids.v1, ids.v2]).unwrap();
+        assert_eq!(used_until(&p, ids.video_asset), Time::from_secs(8));
+        let short = probed("x.mp4", 7, true, true);
+        assert_eq!(
+            relink(&mut p, ids.video_asset, &short, |_| false, |_| None),
+            Err(RelinkError::TooShort)
+        );
+    }
+
+    #[test]
     fn relinking_takes_the_new_file_info_and_skips_files_still_missing() {
         let (mut p, ids) = sample_project();
         let found = probed("别处/改名了.mp4", 12, true, true);
-        let done = relink(&mut p, ids.video_asset, &found, |_| false).unwrap();
+        let done = relink(&mut p, ids.video_asset, &found, |_| false, |_| None).unwrap();
         assert_eq!(done, vec![ids.video_asset]);
         assert_eq!(p.assets[&ids.video_asset].duration, Time::from_secs(12));
         assert_eq!(p.assets[&ids.audio_asset].path, PathBuf::from("bgm.mp3"));
@@ -170,23 +218,23 @@ mod tests {
         let before = p.clone();
         let no_video = probed("x.mp3", 10, false, true);
         assert_eq!(
-            relink(&mut p, ids.video_asset, &no_video, |_| false),
+            relink(&mut p, ids.video_asset, &no_video, |_| false, |_| None),
             Err(RelinkError::KindMismatch("画面"))
         );
         let no_audio = probed("x.mp4", 10, true, false);
         assert_eq!(
-            relink(&mut p, ids.video_asset, &no_audio, |_| false),
+            relink(&mut p, ids.video_asset, &no_audio, |_| false, |_| None),
             Err(RelinkError::KindMismatch("声音"))
         );
         // 第二段用到素材 5–8 秒
         assert_eq!(used_until(&p, ids.video_asset), Time::from_secs(8));
         let short = probed("x.mp4", 7, true, true);
         assert_eq!(
-            relink(&mut p, ids.video_asset, &short, |_| false),
+            relink(&mut p, ids.video_asset, &short, |_| false, |_| None),
             Err(RelinkError::TooShort)
         );
         assert_eq!(
-            relink(&mut p, AssetId(999), &short, |_| false),
+            relink(&mut p, AssetId(999), &short, |_| false, |_| None),
             Err(RelinkError::AssetNotFound(AssetId(999)))
         );
         assert_eq!(p, before, "失败时工程不变");

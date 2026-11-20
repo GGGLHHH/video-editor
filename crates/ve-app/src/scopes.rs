@@ -163,6 +163,8 @@ pub(crate) struct ScopeState {
     pub(crate) on: bool,
     /// 画好的三张图。
     images: Option<[Arc<RenderImage>; 3]>,
+    /// 上一组：这一帧可能还在屏幕上，等下一次换图再从图集里删（和预览画面一样）。
+    retired: Option<[Arc<RenderImage>; 3]>,
 }
 
 impl Workspace {
@@ -192,11 +194,12 @@ impl Workspace {
         } else {
             None
         };
-        if let Some(old) = std::mem::replace(&mut self.scopes.images, next) {
+        if let Some(old) = self.scopes.retired.take() {
             for image in old {
                 cx.drop_image(image, Some(window));
             }
         }
+        self.scopes.retired = std::mem::replace(&mut self.scopes.images, next);
         cx.notify();
     }
 

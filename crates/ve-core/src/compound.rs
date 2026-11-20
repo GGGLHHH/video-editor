@@ -42,6 +42,27 @@ impl Compound {
     }
 }
 
+/// 复合片段能不能放在 `kind` 轨道上：有画面的只能放视频轨（放音频轨摊开后画面会跑到最底下），
+/// 只有声音的视频轨、音频轨都行。
+#[must_use]
+pub fn fits_track(inner: &Compound, kind: TrackKind) -> bool {
+    match kind {
+        TrackKind::Video => true,
+        TrackKind::Audio => !inner.has_picture(),
+        TrackKind::Subtitle => false,
+    }
+}
+
+/// 对 `tracks` 里的每一段（包括复合片段里面的，一层层往下）调用 `f`。
+pub fn for_each_clip<'a>(tracks: &'a [Track], f: &mut dyn FnMut(&'a Clip)) {
+    for c in tracks.iter().flat_map(|t| t.clips.iter()) {
+        f(c);
+        if let Some((inner, _)) = c.compound() {
+            for_each_clip(&inner.tracks, f);
+        }
+    }
+}
+
 /// 一段新建的复合片段（默认属性）。
 fn compound_clip(id: ClipId, start: Time, inner: Arc<Compound>) -> Clip {
     let duration = inner.duration();
@@ -134,6 +155,9 @@ pub fn make_compound(project: &mut Project, clips: &[ClipId]) -> Result<ClipId, 
         }
         let mut track = Track::new(next.ids.track(), t.kind);
         track.clips = mine;
+        // 隐藏 / 静音跟着走（不然从静音轨上打包后就有声音了）
+        track.hidden = t.hidden;
+        track.muted = t.muted;
         inner_tracks.push(track);
     }
     for t in &mut next.timeline.tracks {
@@ -261,12 +285,18 @@ pub fn break_compound(project: &mut Project, clip: ClipId) -> Result<Vec<ClipId>
     if project.timeline.track(track_id).is_some_and(|t| t.locked) {
         return Err(EditError::TrackLocked);
     }
+    let (host_hidden, host_muted) = project
+        .timeline
+        .track(track_id)
+        .map_or((false, false), |t| (t.hidden, t.muted));
     let mut next = project.clone();
     for t in &mut next.timeline.tracks {
         t.clips.retain(|x| x.id != clip);
     }
     let mut placed = Vec::new();
-    for it in &inner.tracks {
+    // 每类轨道上一条（更靠下的）放到了哪条轨道：从下往上放，上下顺序才不会乱
+    let mut below: Vec<(TrackKind, TrackId)> = Vec::new();
+    for it in inner.tracks.iter().rev() {
         let mut ids = next.ids.clone();
         let pieces = window(
             it,
@@ -279,22 +309,48 @@ pub fn break_compound(project: &mut Project, clip: ClipId) -> Result<Vec<ClipId>
         if pieces.is_empty() {
             continue;
         }
+        // 放回去后还是原来的样子：所在轨道的隐藏 / 静音要和它在里面时一样
+        let (hidden, muted) = (it.hidden || host_hidden, it.muted || host_muted);
         let fits = |t: &Track| {
             t.kind == it.kind
                 && !t.locked
+                && t.hidden == hidden
+                && t.muted == muted
                 && pieces.iter().all(|p| t.is_free(p.start, p.end(), &[]))
         };
-        // 原来那条（复合片段所在的）优先，再从上往下找
-        let found = next
-            .timeline
-            .tracks
+        let tracks = &next.timeline.tracks;
+        let floor = below
             .iter()
-            .position(|t| t.id == track_id && fits(t))
-            .or_else(|| next.timeline.tracks.iter().position(fits));
-        let ti = index_or_add(&mut next, found, it.kind)?;
+            .find(|(k, _)| *k == it.kind)
+            .and_then(|(_, id)| tracks.iter().position(|t| t.id == *id));
+        let ti = if let Some(floor) = floor {
+            // 在下面那条的上方找最近的；没有就紧贴着它上面新建一条
+            match (0..floor).rev().find(|&i| fits(&tracks[i])) {
+                Some(i) => i,
+                None if it.kind == TrackKind::Subtitle => return Err(EditError::WrongTrackKind),
+                None => {
+                    let id = next.ids.track();
+                    next.timeline.tracks.insert(floor, Track::new(id, it.kind));
+                    floor
+                }
+            }
+        } else {
+            // 最下面一条：原来那条（复合片段所在的）优先，再往上找最近的，再找别的
+            let host = tracks.iter().position(|t| t.id == track_id);
+            let found = host
+                .filter(|&h| fits(&tracks[h]))
+                .or_else(|| host.and_then(|h| (0..h).rev().find(|&i| fits(&tracks[i]))))
+                .or_else(|| tracks.iter().position(fits));
+            index_or_add(&mut next, found, it.kind)?
+        };
+        let target = &mut next.timeline.tracks[ti];
+        target.hidden = hidden;
+        target.muted = muted;
+        below.retain(|(k, _)| *k != it.kind);
+        below.push((it.kind, target.id));
         for p in pieces {
             placed.push(p.id);
-            next.timeline.tracks[ti].insert_sorted(p);
+            target.insert_sorted(p);
         }
     }
     *project = next;
@@ -478,6 +534,89 @@ mod tests {
         // 摊开后 id 稳定（解码器按它缓存）
         let again = flatten(&p).unwrap();
         assert_eq!(again, flat);
+    }
+
+    #[test]
+    fn breaking_keeps_the_inner_video_tracks_in_order() {
+        let (mut p, ids) = sample_project();
+        // 上面一条视频轨放画中画 pip（0–4），和主轨 v1（0–5）一起打包
+        let top = crate::edit::add_track(&mut p, TrackKind::Video).unwrap();
+        let pip = p.ids.clip();
+        let clip = crate::testing::media_clip(pip, ids.video_asset, Time::ZERO, secs(4));
+        p.timeline
+            .track_mut(top)
+            .unwrap()
+            .insert_sorted(Arc::new(clip));
+        let cc = make_compound(&mut p, &[pip, ids.v1]).unwrap();
+        // 复合片段挪回主轨：上面那条空了
+        crate::edit::move_clip(&mut p, cc, ids.video_track, Time::ZERO).unwrap();
+        break_compound(&mut p, cc).unwrap();
+        // 从下往上：全屏那段（5 秒）在下，画中画（4 秒）在上
+        let order: Vec<Time> = p
+            .timeline
+            .video_tracks_bottom_up()
+            .filter_map(|t| {
+                t.clips
+                    .iter()
+                    .find(|c| c.start == Time::ZERO)
+                    .map(|c| c.duration)
+            })
+            .collect();
+        assert_eq!(order, [secs(5), secs(4)], "画中画还在全屏画面上面");
+        p.timeline.check_invariants(&p.assets).unwrap();
+    }
+
+    #[test]
+    fn hidden_and_muted_tracks_stay_that_way() {
+        let (mut p, ids) = sample_project();
+        crate::edit::set_track_flag(&mut p, ids.audio_track, crate::edit::TrackFlag::Muted, true)
+            .unwrap();
+        let cc = make_compound(&mut p, &[ids.v1, ids.a1]).unwrap();
+        let (_, c) = p.timeline.find_clip(cc).unwrap();
+        let inner = c.compound().unwrap().0;
+        assert!(
+            inner
+                .tracks
+                .iter()
+                .any(|t| t.kind == TrackKind::Audio && t.muted)
+        );
+        let flat = flatten(&p).unwrap();
+        assert!(
+            flat.timeline
+                .tracks
+                .iter()
+                .filter(|t| t.kind == TrackKind::Audio && !t.clips.is_empty())
+                .all(|t| t.muted),
+            "摊开后还是静音"
+        );
+        break_compound(&mut p, cc).unwrap();
+        let audio = p
+            .timeline
+            .tracks
+            .iter()
+            .find(|t| t.kind == TrackKind::Audio && !t.clips.is_empty())
+            .unwrap();
+        assert!(audio.muted, "解除后还在静音轨上");
+    }
+
+    #[test]
+    fn a_compound_with_picture_stays_on_video_tracks_and_its_inside_is_checked() {
+        let (mut p, ids) = sample_project();
+        let cc = make_compound(&mut p, &[ids.v1, ids.v2]).unwrap();
+        assert_eq!(
+            crate::edit::move_clip(&mut p, cc, ids.audio_track, secs(20)),
+            Err(EditError::WrongTrackKind)
+        );
+        // 里面坏了：整个工程不合法
+        let (track, _) = p.timeline.find_clip(cc).unwrap();
+        let t = p.timeline.track_mut(track).unwrap();
+        let i = t.index_of(cc).unwrap();
+        let outer = Arc::make_mut(&mut t.clips[i]);
+        let ClipContent::Compound { inner, .. } = &mut outer.content else {
+            panic!("不是复合片段");
+        };
+        Arc::make_mut(&mut Arc::make_mut(inner).tracks[0].clips[0]).gain_db = f32::NAN;
+        assert!(p.timeline.check_invariants(&p.assets).is_err());
     }
 
     #[test]

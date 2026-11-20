@@ -196,6 +196,9 @@ pub fn stabilize_segment(
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    // ffmpeg 在临时目录里跑（t.trf 用相对路径，避开盘符冒号）：输入输出都要换成绝对路径
+    let input = std::path::absolute(input).map_err(|e| e.to_string())?;
+    let out_abs = std::path::absolute(out).map_err(|e| e.to_string())?;
     let secs = |t: ve_core::Time| format!("{:.6}", t.as_secs_f64().max(0.0));
     let range = |args: &mut Vec<std::ffi::OsString>| {
         args.extend([
@@ -234,12 +237,12 @@ pub fn stabilize_segment(
         ]
         .map(std::ffi::OsString::from),
     );
-    transform.push(
-        std::path::absolute(out)
-            .map_err(|e| e.to_string())?
-            .into_os_string(),
-    );
-    run_ffmpeg_in(Some(dir.path()), &transform)?;
+    transform.push(out_abs.clone().into_os_string());
+    if let Err(e) = run_ffmpeg_in(Some(dir.path()), &transform) {
+        // 写了一半的文件留着没用
+        drop(std::fs::remove_file(&out_abs));
+        return Err(e);
+    }
     if out.is_file() {
         Ok(())
     } else {

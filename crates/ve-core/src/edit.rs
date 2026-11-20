@@ -83,7 +83,7 @@ fn fits(project: &Project, content: &ClipContent, kind: TrackKind) -> bool {
     match content {
         ClipContent::Subtitle { .. } => kind == TrackKind::Subtitle,
         ClipContent::Adjustment | ClipContent::Effect(_) => kind == TrackKind::Video,
-        ClipContent::Compound { .. } => kind != TrackKind::Subtitle,
+        ClipContent::Compound { inner, .. } => crate::compound::fits_track(inner, kind),
         ClipContent::Media { asset, .. } => project.assets.get(asset).is_some_and(|a| match kind {
             TrackKind::Video => a.video.is_some(),
             TrackKind::Audio => a.audio.is_some(),
@@ -1667,14 +1667,41 @@ pub fn reverse_clip(
     })
 }
 
+/// 倒放 / 防抖过的片段现在用的这一段，在原素材里是哪一段：返回（原素材，原素材内起点）。
+///
+/// 生成的文件对应原素材从记下的起点 `o` 开始、长 `L` 的一段（`L` 是生成文件的长度）。片段在
+/// 生成文件里用 `[s, s + 长度)`：防抖是同向的，对应原素材 `o + s` 起；倒放是反的，对应
+/// `o + L - s - 长度` 起。裁剪、分割、滑移之后也对。没倒放也没防抖时返回 `None`。
+#[must_use]
+pub fn original_range(project: &Project, clip: &Clip) -> Option<(AssetId, Time)> {
+    let s = clip.source_in();
+    if let Some((asset, o, _)) = clip.stabilized {
+        return Some((asset, o + s));
+    }
+    let (asset, o) = clip.reversed?;
+    let made = clip
+        .asset()
+        .and_then(|a| project.assets.get(&a))
+        .map_or_else(|| s + clip.source_span(), crate::Asset::source_limit);
+    Some((asset, (o + made - s - clip.source_span()).max(o)))
+}
+
 /// 取消倒放：换回原来的素材和素材内起点。
 ///
 /// # Errors
 /// 片段不存在、没有倒放过。
 pub fn unreverse_clip(project: &mut Project, clip: ClipId) -> Result<(), EditError> {
-    update_clip(project, clip, |c| {
-        let (asset, source_in) = c.reversed.take().ok_or(EditError::InvalidValue)?;
-        c.content = ClipContent::Media { asset, source_in };
+    let (_, c) = project
+        .timeline
+        .find_clip(clip)
+        .ok_or(EditError::ClipNotFound(clip))?;
+    if c.reversed.is_none() {
+        return Err(EditError::InvalidValue);
+    }
+    let (asset, source_in) = original_range(project, c).ok_or(EditError::InvalidValue)?;
+    update_clip(project, clip, |slot| {
+        slot.reversed = None;
+        slot.content = ClipContent::Media { asset, source_in };
         Ok(())
     })
 }

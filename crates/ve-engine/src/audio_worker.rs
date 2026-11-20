@@ -24,6 +24,10 @@ struct ClipAudio {
     stretch: Option<crate::stretch::Stretcher>,
     /// 声音处理（降噪、均衡、压缩）的滤镜和已经处理好、还没用掉的样本。
     fx: Option<FxState>,
+    /// 建不起来的声音处理（比如 ffmpeg 没编进那个滤镜）：记下来，不每块都重建、重新定位。
+    fx_failed: Option<ve_core::AudioFx>,
+    /// 变调变速按块读素材时，每块该读的样本数的小数部分攒在这里（不然每块多读一点，越放越超前）。
+    carry: f64,
 }
 
 /// 片段声音处理的状态：滤镜有记忆，跳着放、改了参数都要重建。
@@ -121,6 +125,8 @@ impl Mixer {
                             next: Time::ZERO,
                             stretch: None,
                             fx: None,
+                            fx_failed: None,
+                            carry: 0.0,
                         })
                         .into_mut(),
                     Err(e) => {
@@ -140,8 +146,8 @@ impl Mixer {
                 .stretch
                 .as_ref()
                 .is_some_and(|s| !stretching || (s.speed() - seg.speed).abs() > 1e-6);
-            let fx_changed =
-                entry.fx.as_ref().map(|f| f.fx) != (!seg.fx.is_none()).then_some(seg.fx);
+            let fx_now = entry.fx.as_ref().map(|f| f.fx).or(entry.fx_failed);
+            let fx_changed = fx_now != (!seg.fx.is_none()).then_some(seg.fx);
             if jumped || stale || fx_changed || (stretching && entry.stretch.is_none()) {
                 // 跳了、换了倍数或开关：从这块该放的地方重新开始（拉伸器开着时解码器读在前面）
                 entry.stretch = None;
@@ -151,6 +157,8 @@ impl Mixer {
                 }
                 entry.stretch = stretching.then(|| crate::stretch::Stretcher::new(seg.speed));
                 entry.fx = FxState::new(seg.fx, rate);
+                entry.fx_failed = (entry.fx.is_none() && !seg.fx.is_none()).then_some(seg.fx);
+                entry.carry = 0.0;
             }
             let frames = usize::try_from(seg.duration.to_samples(rate))
                 .unwrap_or(0)
@@ -208,6 +216,22 @@ impl Mixer {
     }
 }
 
+/// 吐 [`CHUNK`] 帧要读多少素材样本：小数部分攒在 `carry` 里留给下一块，
+/// 长期下来读的正好是 CHUNK × 倍数（每块向上取整的话会越放越超前）。
+fn source_frames(carry: &mut f64, speed: f64) -> usize {
+    #[expect(clippy::cast_precision_loss, reason = "CHUNK 是一千来帧")]
+    let exact = CHUNK as f64 * speed + *carry;
+    let n = exact.round().max(1.0);
+    *carry = exact - n;
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "一块只有一千来帧"
+    )]
+    let frames = n as usize;
+    frames
+}
+
 /// 按时间轴速度取最多 [`CHUNK`] 帧原始声音（变速不变调走拉伸器，变调走线性重采样）；
 /// 读完了返回空。
 fn raw_chunk(
@@ -226,13 +250,7 @@ fn raw_chunk(
         return stretch.pop(CHUNK);
     }
     let speed = f64::from(seg.speed);
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss,
-        reason = "一块只有一千来帧"
-    )]
-    let src_frames = (CHUNK as f64 * speed).ceil() as usize;
+    let src_frames = source_frames(&mut entry.carry, speed);
     tmp.resize(src_frames * 2, 0.0);
     let got = entry.decoder.read(tmp).unwrap_or(0);
     #[expect(clippy::float_cmp, reason = "原速是精确的 1.0")]
@@ -245,7 +263,12 @@ fn raw_chunk(
         clippy::cast_precision_loss,
         reason = "一块只有一千来帧"
     )]
-    let out_frames = (got as f64 / speed).round() as usize;
+    let out_frames = if got == src_frames {
+        CHUNK
+    } else {
+        // 读到结尾了：按比例
+        (got as f64 / speed).round() as usize
+    };
     crate::resample_linear(&tmp[..got * 2], out_frames)
 }
 
@@ -453,6 +476,19 @@ pub(crate) fn run(shared: &Shared, mut producer: Producer<f32>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chunked_reading_at_odd_speeds_does_not_drift() {
+        for speed in [0.7_f64, 1.3, 0.37, 2.5] {
+            let mut carry = 0.0;
+            let total: usize = (0..10_000).map(|_| source_frames(&mut carry, speed)).sum();
+            #[expect(clippy::cast_precision_loss, reason = "测试里的小数")]
+            let want = 10_000.0 * CHUNK as f64 * speed;
+            #[expect(clippy::cast_precision_loss, reason = "测试里的小数")]
+            let off = (total as f64 - want).abs();
+            assert!(off <= 1.0, "{speed}: 差 {off} 帧");
+        }
+    }
+
     use super::*;
     use ve_core::{Asset, edit};
     use ve_media::testing::{Fixture, fixture};

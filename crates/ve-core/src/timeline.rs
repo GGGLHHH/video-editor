@@ -741,9 +741,18 @@ fn check_clip(
         | (ClipContent::Adjustment, TrackKind::Video) => Ok(()),
         (ClipContent::Effect(e), TrackKind::Video) if e.is_valid() => Ok(()),
         (ClipContent::Compound { inner, source_in }, TrackKind::Video | TrackKind::Audio)
-            if *source_in >= Time::ZERO && *source_in + clip.duration <= inner.duration() =>
+            if *source_in >= Time::ZERO
+                && *source_in + clip.duration <= inner.duration()
+                && crate::compound::fits_track(inner, kind) =>
         {
-            Ok(())
+            // 里面的轨道照样检查（摊开后原样交给播放和导出）
+            Timeline {
+                tracks: inner.tracks.clone(),
+                markers: Vec::new(),
+                range: None,
+                cover: None,
+            }
+            .check_invariants(assets)
         }
         (ClipContent::Media { asset, source_in }, TrackKind::Video | TrackKind::Audio) => {
             let a = assets.get(asset).ok_or(InvariantError::MissingAsset {

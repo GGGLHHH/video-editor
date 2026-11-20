@@ -4,6 +4,7 @@
 use crate::workspace::{Workspace, notify};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::{AppContext as _, Context, PathPromptOptions, Window};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use ve_core::AssetId;
 use ve_core::relink::relink;
@@ -54,11 +55,29 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let probing = cx.background_spawn(async move { crate::import::probe_asset(&path) });
+        // 同一文件夹里和别的丢失素材同名的文件：一起在后台探测（换不换由 relink 判断）
+        let siblings: Vec<PathBuf> = path.parent().map_or_else(Vec::new, |dir| {
+            self.doc
+                .project
+                .assets
+                .values()
+                .filter(|a| a.id != asset && !a.path.exists())
+                .filter_map(|a| Some(dir.join(a.path.file_name()?)))
+                .collect()
+        });
+        let probing = cx.background_spawn(async move {
+            let found = crate::import::probe_asset(&path)?;
+            let others: HashMap<PathBuf, ve_core::Asset> = siblings
+                .into_iter()
+                .filter(|p| p.exists())
+                .filter_map(|p| Some((p.clone(), crate::import::probe_asset(&p).ok()?)))
+                .collect();
+            Ok::<_, String>((found, others))
+        });
         self.tasks.push(cx.spawn_in(window, async move |this, cx| {
             let probed = probing.await;
             let _ignored = this.update_in(cx, |this, window, cx| match probed {
-                Ok(found) => this.finish_relink(asset, &found, window, cx),
+                Ok((found, others)) => this.finish_relink(asset, &found, &others, window, cx),
                 Err(message) => notify(Notification::warning(message), window, cx),
             });
         }));
@@ -68,17 +87,20 @@ impl Workspace {
         &mut self,
         asset: AssetId,
         found: &ve_core::Asset,
+        others: &HashMap<PathBuf, ve_core::Asset>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let probe = |p: &Path| others.get(p).cloned();
         // 先在副本上试，换不上时说清原因
         let mut trial = self.doc.project.clone();
-        if let Err(e) = relink(&mut trial, asset, found, Path::exists) {
+        if let Err(e) = relink(&mut trial, asset, found, Path::exists, probe) {
             notify(Notification::warning(e.to_string()), window, cx);
             return;
         }
         let Some(done) = self.apply(window, cx, |p| {
-            relink(p, asset, found, Path::exists).map_err(|_| ve_core::EditError::InvalidValue)
+            relink(p, asset, found, Path::exists, probe)
+                .map_err(|_| ve_core::EditError::InvalidValue)
         }) else {
             return;
         };

@@ -127,6 +127,11 @@ impl Worker<'_> {
                     project.timeline.duration() - project.settings.frame_rate.frame_duration(),
                 );
                 let frame = self.render(&project, shown.max(Time::ZERO));
+                // 画的时候预览尺寸改了（切画质）：这帧尺寸不对，不交；改尺寸时已经排了重画。
+                // 只看尺寸：拖动、连续改属性时每次都丢的话会一直出不了画面
+                if self.shared.control().preview_max != preview_max {
+                    return;
+                }
                 let mut q = lock(&self.shared.frames);
                 q.items.clear();
                 q.push(t, frame);

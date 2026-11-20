@@ -68,11 +68,13 @@ impl Workspace {
         let Some((_, c)) = p.timeline.find_clip(clip) else {
             return;
         };
-        // 从原片做（已经防抖过的话是记下的那个素材）
-        let (asset, from) = c
-            .stabilized
-            .map_or_else(|| (c.asset(), c.source_in()), |(a, s, _)| (Some(a), s));
+        // 从原片做（已经防抖过的话换算回原素材里现在用的这一段）
+        let (asset, from) = ve_core::edit::original_range(p, c)
+            .map_or_else(|| (c.asset(), c.source_in()), |(a, s)| (Some(a), s));
         let Some(source) = asset.and_then(|a| p.assets.get(&a)) else {
+            return;
+        };
+        let Some(key) = self.source_key(clip) else {
             return;
         };
         let (path, name, len) = (source.path.clone(), source.name.clone(), c.source_span());
@@ -94,6 +96,18 @@ impl Workspace {
             let _ignored = this.update_in(cx, |this, window, cx| {
                 this.stabilizing = false;
                 match made {
+                    // 处理期间换了工程、片段被裁剪或撤销过：结果对不上，不套用
+                    Ok(stale) if this.source_key(clip).as_ref() != Some(&key) => {
+                        // 生成的文件用不上了
+                        drop(std::fs::remove_file(&stale.path));
+                        notify(
+                            Notification::warning(
+                                "片段在处理期间改动了，防抖结果没有套用，请重新选一次",
+                            ),
+                            window,
+                            cx,
+                        );
+                    }
                     Ok(asset) => {
                         let added = this.apply(window, cx, |p| {
                             if current.is_some() {

@@ -13,7 +13,14 @@ use std::path::{Path, PathBuf};
 pub struct Session {
     /// 当时开着的工程（还没保存过的新工程为空）。
     pub project: Option<PathBuf>,
+    /// 那个进程的启动时刻（系统给的数，只用来比相等）：进程号会被别的进程重新用上，
+    /// 号对上、启动时刻也对上才算「还在运行」。
+    #[serde(default)]
+    pub started: Option<u64>,
 }
+
+/// 超过这么久的记录不再恢复（直接删掉）。
+const STALE: std::time::Duration = std::time::Duration::from_hours(7 * 24);
 
 /// 没有正常结束的一次会话。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +66,7 @@ impl Sessions {
         std::fs::create_dir_all(&self.dir)?;
         let s = Session {
             project: project.map(Path::to_path_buf),
+            started: process_started(pid),
         };
         let json = serde_json::to_vec(&s).map_err(std::io::Error::other)?;
         std::fs::write(self.file(pid), json)
@@ -70,8 +78,9 @@ impl Sessions {
     }
 
     /// 没有正常结束的会话（记录在、进程不在），最近的排前面。读不懂的记录当作没有工程。
+    /// `alive(进程号, 记下的启动时刻)` 判断那个进程还在不在。
     #[must_use]
-    pub fn crashed(&self, alive: impl Fn(u32) -> bool) -> Vec<Crashed> {
+    pub fn crashed(&self, alive: impl Fn(u32, Option<u64>) -> bool) -> Vec<Crashed> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Vec::new();
         };
@@ -83,13 +92,13 @@ impl Sessions {
                     .extension()
                     .is_some_and(|x| x == "json")
                     .then(|| path.file_stem()?.to_str()?.parse().ok())??;
-                if alive(pid) {
-                    return None;
-                }
-                let session = std::fs::read(&path)
+                let session: Session = std::fs::read(&path)
                     .ok()
                     .and_then(|b| serde_json::from_slice(&b).ok())
                     .unwrap_or_default();
+                if alive(pid, session.started) {
+                    return None;
+                }
                 let modified = e
                     .metadata()
                     .and_then(|m| m.modified())
@@ -106,19 +115,51 @@ impl Sessions {
     }
 }
 
-/// 进程 `pid` 还在不在。
+/// 进程 `pid` 还在不在；给了 `started` 时还要启动时刻对得上（不是后来用上这个号的别的进程）。
 #[must_use]
-pub fn process_alive(pid: u32) -> bool {
-    imp::process_alive(pid)
+pub fn process_alive(pid: u32, started: Option<u64>) -> bool {
+    imp::process_alive(pid) && started.is_none_or(|s| imp::process_started(pid) == Some(s))
+}
+
+/// 进程 `pid` 的启动时刻（查不到为 `None`）。
+#[must_use]
+pub fn process_started(pid: u32) -> Option<u64> {
+    imp::process_started(pid)
 }
 
 #[cfg(windows)]
 #[expect(unsafe_code, reason = "查进程是否还在：标准库没有这个接口")]
 mod imp {
-    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, STILL_ACTIVE};
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
+
+    pub(super) fn process_started(pid: u32) -> Option<u64> {
+        // SAFETY: OpenProcess 只读参数；拿到的句柄下面一定关掉。
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return None;
+        }
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        // SAFETY: handle 有效；四个出参都是可写的局部变量。
+        let ok = unsafe {
+            GetProcessTimes(
+                handle,
+                &raw mut created,
+                &raw mut exited,
+                &raw mut kernel,
+                &raw mut user,
+            )
+        } != 0;
+        // SAFETY: handle 有效且之后不再使用。
+        unsafe { CloseHandle(handle) };
+        ok.then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    }
 
     pub(super) fn process_alive(pid: u32) -> bool {
         // SAFETY: OpenProcess 只读参数；拿到的句柄下面一定关掉。
@@ -140,6 +181,10 @@ mod imp {
     /// 别的系统上不判断：都当作还在（不做恢复）。
     pub(super) const fn process_alive(_pid: u32) -> bool {
         true
+    }
+
+    pub(super) const fn process_started(_pid: u32) -> Option<u64> {
+        None
     }
 }
 
@@ -171,18 +216,26 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let crashed = sessions.crashed(process_alive);
-        for c in &crashed {
-            sessions.clear(c.pid);
-        }
+        let now = std::time::SystemTime::now();
+        let mut crashed = sessions.crashed(process_alive);
+        // 恢复不了的（太旧、没存过、文件没了）直接删掉
+        crashed.retain(|c| {
+            let fresh = now.duration_since(c.modified).is_ok_and(|age| age < STALE);
+            let usable = fresh && c.session.project.as_deref().is_some_and(Path::exists);
+            if !usable {
+                sessions.clear(c.pid);
+            }
+            usable
+        });
+        // 这次没指定工程：重新打开最近那个，只删它的记录；别的留着下次再恢复
+        // （两个窗口一起崩了，一次开一个）。这次指定了工程就都留着。
         let reopen = crashed
-            .into_iter()
-            .filter_map(|c| c.session.project)
-            .find(|p| p.exists());
-        if let Some(path) = reopen
-            && self.doc.path().is_none()
-            && !self.doc.is_dirty()
+            .first()
+            .filter(|_| self.doc.path().is_none() && !self.doc.is_dirty());
+        if let Some(c) = reopen
+            && let Some(path) = c.session.project.clone()
         {
+            sessions.clear(c.pid);
             self.open_path(&path, window, cx);
             let name = path
                 .file_stem()
@@ -233,13 +286,13 @@ mod tests {
     fn crashed_sessions_are_the_recorded_ones_whose_process_is_gone() {
         let dir = tempfile::tempdir().unwrap();
         let s = Sessions::new(dir.path().join("sessions"));
-        assert_eq!(s.crashed(|_| false), [], "没有目录也没事");
+        assert_eq!(s.crashed(|_, _| false), [], "没有目录也没事");
         s.record(11, Some(Path::new("甲.vep"))).unwrap();
         s.record(22, None).unwrap();
         std::fs::write(dir.path().join("sessions").join("不是进程号.json"), "{}").unwrap();
         std::fs::write(dir.path().join("sessions").join("33.json"), "坏了").unwrap();
         // 22 还在运行
-        let gone = s.crashed(|pid| pid == 22);
+        let gone = s.crashed(|pid, _| pid == 22);
         let mut pids: Vec<u32> = gone.iter().map(|c| c.pid).collect();
         pids.sort_unstable();
         assert_eq!(pids, [11, 33]);
@@ -248,14 +301,37 @@ mod tests {
         let broken = gone.iter().find(|c| c.pid == 33).unwrap();
         assert_eq!(broken.session, Session::default(), "读不懂当作没有工程");
         s.clear(11);
-        assert_eq!(s.crashed(|pid| pid == 22).len(), 1);
+        assert_eq!(s.crashed(|pid, _| pid == 22).len(), 1);
     }
 
     #[test]
     fn this_process_is_alive_and_a_made_up_one_is_not() {
-        assert!(process_alive(std::process::id()));
+        let me = std::process::id();
+        assert!(process_alive(me, None));
+        assert!(process_alive(me, process_started(me)));
         if cfg!(windows) {
-            assert!(!process_alive(u32::MAX - 1));
+            assert!(!process_alive(u32::MAX - 1, None));
+            // 号对上、启动时刻对不上：是后来用上这个号的别的进程
+            let other = process_started(me).map(|t| t + 1);
+            assert!(!process_alive(me, other));
+        }
+    }
+
+    #[test]
+    fn a_reused_process_number_still_counts_as_crashed() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Sessions::new(dir.path().to_path_buf());
+        let me = std::process::id();
+        s.record(me, Some(Path::new("甲.vep"))).unwrap();
+        assert_eq!(s.crashed(process_alive), [], "记的就是本进程");
+        if cfg!(windows) {
+            // 记录里的启动时刻换成别的：当年那个进程已经没了，号被本进程用上了
+            let file = dir.path().join(format!("{me}.json"));
+            let mut session: Session =
+                serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+            session.started = session.started.map(|t| t ^ 1);
+            std::fs::write(&file, serde_json::to_vec(&session).unwrap()).unwrap();
+            assert_eq!(s.crashed(process_alive).len(), 1);
         }
     }
 }

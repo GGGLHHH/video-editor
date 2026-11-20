@@ -82,6 +82,8 @@ impl Workspace {
         match project_io::save(&mut self.doc, path) {
             Ok(saved) => {
                 self.remember_recent(saved);
+                // 新草稿第一次保存、另存为：崩溃恢复记录换成新路径
+                self.sync_session();
                 cx.notify();
                 true
             }

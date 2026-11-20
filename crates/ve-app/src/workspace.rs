@@ -156,6 +156,8 @@ pub struct Workspace {
     pub(crate) stabilize_dir: std::path::PathBuf,
     /// 正在做视频防抖。
     pub(crate) stabilizing: bool,
+    /// 换过几次文档（新建、打开、导入）：后台任务做完时据此判断工程是不是已经换了。
+    pub(crate) doc_epoch: u64,
     /// 正在录音：录音器和从时间轴哪里开始录的。
     pub(crate) recording: Option<(ve_engine::Recorder, Time)>,
     /// 录音文件的目录。
@@ -283,6 +285,7 @@ impl Workspace {
             reversing: false,
             stabilize_dir: crate::stabilize_ui::default_dir(),
             stabilizing: false,
+            doc_epoch: 0,
             recording: None,
             record_dir: crate::record::default_dir(),
             _subscriptions: subscriptions,
@@ -335,6 +338,7 @@ impl Workspace {
     ) {
         self.engine.pause();
         self.doc = doc;
+        self.doc_epoch += 1;
         self.engine_revision = None;
         for thumbs in std::mem::take(&mut self.media).into_values() {
             for image in thumbs.thumbnails {
@@ -347,6 +351,20 @@ impl Workspace {
         self.after_change(window, cx);
         let assets: Vec<_> = self.doc.project.assets.values().cloned().collect();
         self.analyze_assets(assets, window, cx);
+    }
+
+    /// 片段 `clip` 现在用的素材（工程编号 + 内容 + 长度 + 变速 + 倒放 / 防抖记录）。后台按片段生成
+    /// 文件（倒放、防抖）前记一份，做完再比：变了（换了工程、片段被裁剪、撤销……）就不套用。
+    pub(crate) fn source_key(&self, clip: ve_core::ClipId) -> Option<SourceKey> {
+        let (_, c) = self.doc.project.timeline.find_clip(clip)?;
+        Some(SourceKey {
+            epoch: self.doc_epoch,
+            content: c.content.clone(),
+            duration: c.duration,
+            speed: c.speed.to_bits(),
+            reversed: c.reversed,
+            stabilized: c.stabilized,
+        })
     }
 
     /// 执行一次编辑；失败时弹提示。
@@ -906,4 +924,15 @@ pub fn build(engine: Engine, window: &mut Window, cx: &mut App) -> Entity<Worksp
     // 旋转光标要直接调系统（GPUI 没有自定义光标）；装不上（无界面测试、非 Windows）就退回手指光标
     crate::platform_cursor::install(window);
     cx.new(|cx| Workspace::new(engine, window, cx))
+}
+
+/// 见 [`Workspace::source_key`]。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SourceKey {
+    epoch: u64,
+    content: ve_core::ClipContent,
+    duration: Time,
+    speed: u32,
+    reversed: Option<(AssetId, Time)>,
+    stabilized: Option<(AssetId, Time, u8)>,
 }

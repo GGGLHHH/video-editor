@@ -60,11 +60,15 @@ fn range(start: Time, duration: Time, rate: f64) -> Value {
     })
 }
 
-/// 文件路径 → `file:///` 网址（斜杠统一、空格和 % 转义）。
+/// 文件路径 → `file:///` 网址（斜杠统一；`%`、空格、`#`、`?` 转义，中文等原样）。
 #[must_use]
 pub fn file_url(path: &Path) -> String {
     let s = path.to_string_lossy().replace('\\', "/");
-    let s = s.replace('%', "%25").replace(' ', "%20");
+    let s = s
+        .replace('%', "%25")
+        .replace(' ', "%20")
+        .replace('#', "%23")
+        .replace('?', "%3F");
     if s.starts_with('/') {
         format!("file://{s}")
     } else if s.get(1..2) == Some(":") {
@@ -75,19 +79,41 @@ pub fn file_url(path: &Path) -> String {
     }
 }
 
-/// `file:///` 网址 → 文件路径（[`file_url`] 的反过来）。
+/// 百分号转义还原（`%E7%B4%A0` 这类按 UTF-8 拼回去；不成对的 `%` 原样留着）。
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let hex = |c: u8| char::from(c).to_digit(16);
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let pair = (b[i] == b'%')
+            .then(|| Some((hex(*b.get(i + 1)?)?, hex(*b.get(i + 2)?)?)))
+            .flatten();
+        if let Some((h, l)) = pair {
+            out.extend(u8::try_from(h * 16 + l).ok());
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `file:///` 网址 → 文件路径（[`file_url`] 的反过来；也认 `file://localhost/…`）。
 #[must_use]
 pub fn url_path(url: &str) -> PathBuf {
     let Some(s) = url.strip_prefix("file://") else {
-        return PathBuf::from(url.replace("%20", " ").replace("%25", "%"));
+        return PathBuf::from(percent_decode(url));
     };
+    let s = percent_decode(s.strip_prefix("localhost").unwrap_or(s));
     // Windows：`/C:/…` 去掉开头的斜杠
-    let s = if s.len() > 2 && s.as_bytes()[0] == b'/' && s.as_bytes()[2] == b':' {
-        &s[1..]
+    let b = s.as_bytes();
+    if b.len() > 2 && b[0] == b'/' && b[2] == b':' {
+        PathBuf::from(&s[1..])
     } else {
-        s
-    };
-    PathBuf::from(s.replace("%20", " ").replace("%25", "%"))
+        PathBuf::from(s)
+    }
 }
 
 fn track_json(
@@ -116,7 +142,8 @@ fn track_json(
         let mut clip = json!({
             "OTIO_SCHEMA": "Clip.2",
             "name": a.name,
-            "source_range": range(source_in, c.source_span(), rate),
+            // OTIO：片段占轨道的长度就是 source_range 的长度，变速（LinearTimeWarp）不改它
+            "source_range": range(source_in, c.duration, rate),
             "media_references": {
                 "DEFAULT_MEDIA": {
                     "OTIO_SCHEMA": "ExternalReference.1",
@@ -205,9 +232,16 @@ pub fn to_otio(project: &Project, name: &str) -> String {
     serde_json::to_string_pretty(&timeline).unwrap_or_default()
 }
 
+/// 读一个 `RationalTime`：读不懂当 0，夹到 ±10 万小时以内（别让后面的加法溢出）。
 fn time_of(v: &Value) -> Time {
+    const LIMIT: f64 = 360_000_000.0;
     let rate = v["rate"].as_f64().filter(|r| *r > 0.0).unwrap_or(1.0);
-    Time::from_secs_f64(v["value"].as_f64().unwrap_or(0.0) / rate)
+    let secs = v["value"].as_f64().unwrap_or(0.0) / rate;
+    Time::from_secs_f64(if secs.is_finite() {
+        secs.clamp(-LIMIT, LIMIT)
+    } else {
+        0.0
+    })
 }
 
 /// 读 `OpenTimelineIO`：只认视频 / 音频轨上的外部素材片段（和空隙），变速按 `LinearTimeWarp`。
@@ -241,7 +275,8 @@ pub fn from_otio(text: &str) -> Result<Vec<ExTrack>, InterchangeError> {
             let kind_of = c["OTIO_SCHEMA"].as_str().unwrap_or_default();
             let src = &c["source_range"];
             let source_in = time_of(&src["start_time"]);
-            let span = time_of(&src["duration"]);
+            // 片段占轨道的长度（负数当 0）
+            let duration = time_of(&src["duration"]).max(Time::ZERO);
             #[expect(clippy::cast_possible_truncation, reason = "倍数 0.1–10")]
             let speed = c["effects"]
                 .as_array()
@@ -255,7 +290,6 @@ pub fn from_otio(text: &str) -> Result<Vec<ExTrack>, InterchangeError> {
                 .and_then(|e| e["time_scalar"].as_f64())
                 .filter(|s| *s > 0.0)
                 .unwrap_or(1.0) as f32;
-            let duration = span.scaled(1.0 / f64::from(speed));
             if kind_of.starts_with("Clip.") {
                 let key = c["active_media_reference_key"]
                     .as_str()
@@ -266,11 +300,13 @@ pub fn from_otio(text: &str) -> Result<Vec<ExTrack>, InterchangeError> {
                     &c["media_reference"]
                 };
                 if let Some(url) = reference["target_url"].as_str() {
+                    // 别家常按素材时间码记起点（比如 01:00:00:00）：减掉素材自己的起点
+                    let media_start = time_of(&reference["available_range"]["start_time"]);
                     clips.push(ExClip {
                         path: url_path(url),
                         start: at,
                         duration,
-                        source_in,
+                        source_in: source_in - media_start,
                         speed,
                     });
                 }
@@ -364,6 +400,25 @@ pub fn build_project(
     (p, skipped)
 }
 
+/// 让导入的片段落在素材范围内：素材起点不早于 0，用到的素材不超过结尾（超出就截短）。
+/// 截完没有长度了返回 `None`。
+fn fit_to_media(mut clip: Clip, limit: Time) -> Option<Clip> {
+    let ClipContent::Media { source_in, .. } = &mut clip.content else {
+        return None;
+    };
+    *source_in = (*source_in).max(Time::ZERO);
+    let room = limit - *source_in;
+    if room <= Time::ZERO || clip.start < Time::ZERO {
+        return None;
+    }
+    clip.duration = clip.duration.min(room.scaled(1.0 / f64::from(clip.speed)));
+    // 两次取整可能多出一点
+    while clip.duration > Time::ZERO && clip.source_in() + clip.source_span() > limit {
+        clip.duration -= Time(1);
+    }
+    (clip.duration > Time::ZERO).then_some(clip)
+}
+
 /// 把一条导入的轨道放进 `track`；返回跳过的片段数。
 fn fill(
     p: &mut Project,
@@ -377,19 +432,20 @@ fn fill(
     };
     let mut skipped = 0;
     for c in &t.clips {
-        let usable = assets.get(&c.path).is_some_and(|a| match t.kind {
+        let usable = |a: &&Asset| match t.kind {
             TrackKind::Video => a.video.is_some(),
             _ => a.audio.is_some(),
-        });
-        let Some(&asset) = ids
-            .get(&c.path)
-            .filter(|_| usable && c.duration > Time::ZERO)
-        else {
+        };
+        let Some((&asset, a)) = ids.get(&c.path).zip(assets.get(&c.path).filter(usable)) else {
             skipped += 1;
             continue;
         };
         let id = p.ids.clip();
-        let clip = std::sync::Arc::new(media_clip(id, asset, c));
+        let Some(clip) = fit_to_media(media_clip(id, asset, c), a.source_limit()) else {
+            skipped += 1;
+            continue;
+        };
+        let clip = std::sync::Arc::new(clip);
         let Some(tr) = p.timeline.track_mut(track) else {
             skipped += 1;
             continue;
@@ -528,6 +584,114 @@ mod tests {
         assert_eq!(missing, 3);
         assert!(from_otio("{}").is_err());
         assert!(from_otio("不是 json").is_err());
+    }
+
+    #[test]
+    fn urls_from_other_apps_decode_utf8_and_localhost() {
+        assert_eq!(
+            url_path("file:///C:/%E7%B4%A0%E6%9D%90/a%23b%20c.mp4"),
+            PathBuf::from("C:/素材/a#b c.mp4")
+        );
+        assert_eq!(
+            url_path("file://localhost/C:/v/a.mp4"),
+            PathBuf::from("C:/v/a.mp4")
+        );
+        assert_eq!(
+            url_path("file://localhost/home/u/a.mp4"),
+            PathBuf::from("/home/u/a.mp4")
+        );
+        assert_eq!(
+            url_path("a%2.mp4"),
+            PathBuf::from("a%2.mp4"),
+            "不成对的 % 原样"
+        );
+        assert_eq!(
+            url_path(&file_url(Path::new("C:/a#1?.mp4"))),
+            PathBuf::from("C:/a#1?.mp4")
+        );
+    }
+
+    #[test]
+    fn speed_keeps_the_otio_duration_as_the_length_on_the_track() {
+        let (mut p, ids) = sample_project();
+        crate::edit::set_speed(&mut p, ids.v2, 2.0).unwrap();
+        let v: Value = serde_json::from_str(&to_otio(&p, "x")).unwrap();
+        let clip = &v["tracks"]["children"][0]["children"][1];
+        let rate = clip["source_range"]["duration"]["rate"].as_f64().unwrap();
+        let frames = clip["source_range"]["duration"]["value"].as_f64().unwrap();
+        // 3 秒素材 2 倍速：轨道上 1.5 秒
+        assert!((frames / rate - 1.5).abs() < 1e-6, "{frames}/{rate}");
+    }
+
+    /// 一段别家软件写的 OTIO：一条视频轨，`children` 原样放进去。
+    fn foreign(children: &Value) -> String {
+        json!({
+            "OTIO_SCHEMA": "Timeline.1",
+            "tracks": {"OTIO_SCHEMA": "Stack.1", "children": [
+                {"OTIO_SCHEMA": "Track.1", "kind": "Video", "children": children}
+            ]}
+        })
+        .to_string()
+    }
+
+    fn foreign_clip(start: f64, duration: f64, media_start: f64, speed: f64) -> Value {
+        let t = |v: f64| json!({"OTIO_SCHEMA": "RationalTime.1", "rate": 25.0, "value": v});
+        json!({
+            "OTIO_SCHEMA": "Clip.1",
+            "source_range": {"start_time": t(start), "duration": t(duration)},
+            "media_reference": {
+                "OTIO_SCHEMA": "ExternalReference.1",
+                "target_url": "clip.mp4",
+                "available_range": {"start_time": t(media_start), "duration": t(1e6)}
+            },
+            "effects": [{"OTIO_SCHEMA": "LinearTimeWarp.1", "time_scalar": speed}]
+        })
+    }
+
+    #[test]
+    fn foreign_timelines_import_into_a_valid_project() {
+        let (p, _) = sample_project();
+        let assets: BTreeMap<PathBuf, Asset> = p
+            .assets
+            .values()
+            .map(|a| (a.path.clone(), a.clone()))
+            .collect();
+        let gap = |d: f64| {
+            json!({"OTIO_SCHEMA": "Gap.1", "source_range": {
+                "start_time": {"rate": 25.0, "value": 0.0},
+                "duration": {"rate": 25.0, "value": d}}})
+        };
+        let text = foreign(&json!([
+            // 按时间码记的起点：素材自己从 01:00:00:00 开始，片段从素材第 1 秒用 2 秒
+            foreign_clip(90_025.0, 50.0, 90_000.0, 1.0),
+            // 负数空隙当 0
+            gap(-500.0),
+            // 用到素材结尾之后：截短
+            foreign_clip(225.0, 100.0, 0.0, 1.0),
+            // 0.05 倍速被夹到 0.1：素材不够用，截短
+            foreign_clip(0.0, 100.0, 0.0, 0.05),
+            // 起点在素材之后：跳过
+            foreign_clip(1000.0, 10.0, 0.0, 1.0),
+            // 大得离谱的空隙不溢出
+            gap(1e300),
+        ]));
+        let tracks = from_otio(&text).unwrap();
+        let c = &tracks[0].clips;
+        assert_eq!(c[0].source_in, Time::from_secs(1), "减掉了素材起点");
+        assert_eq!(c[1].start, Time::from_secs(2), "负数空隙不往回走");
+        let (q, skipped) = build_project(&tracks, &assets, p.settings.frame_rate);
+        q.timeline.check_invariants(&q.assets).unwrap();
+        assert_eq!(skipped, 1);
+        let main = crate::magnet::main_track(&q.timeline).unwrap();
+        let clips = &q.timeline.track(main).unwrap().clips;
+        assert_eq!(clips.len(), 3);
+        assert_eq!(
+            clips[1].duration,
+            Time::from_secs(1),
+            "素材 10 秒，从第 9 秒起只剩 1 秒"
+        );
+        assert!((clips[2].speed - 0.1).abs() < 1e-6);
+        assert_eq!(clips[2].start, Time::from_secs(6));
     }
 
     #[test]

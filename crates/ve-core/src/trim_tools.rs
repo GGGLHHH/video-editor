@@ -62,8 +62,17 @@ pub fn slip(project: &mut Project, clip: ClipId, delta: Time) -> Result<Time, Ed
         return Ok(Time::ZERO);
     }
     let mut next = c;
+    let (speed, span) = (f64::from(next.speed), next.source_span());
     match &mut next.content {
-        ClipContent::Media { source_in, .. } => *source_in += d.scaled(f64::from(next.speed)),
+        ClipContent::Media { source_in, asset } => {
+            // 变速时两次取整可能差一两个单位：夹回素材范围里
+            let limit = project
+                .assets
+                .get(asset)
+                .map_or(Time(i64::MAX / 4), crate::Asset::source_limit);
+            *source_in =
+                (*source_in + d.scaled(speed)).clamp(Time::ZERO, (limit - span).max(Time::ZERO));
+        }
         ClipContent::Compound { source_in, .. } => *source_in += d,
         _ => {}
     }
@@ -197,6 +206,20 @@ mod tests {
             Err(EditError::WrongTrackKind)
         );
         p.timeline.check_invariants(&p.assets).unwrap();
+    }
+
+    #[test]
+    fn slipping_a_sped_up_clip_to_either_end_stays_inside_the_media() {
+        for speed in [2.5_f32, 0.3, 1.7, 3.3, 0.7] {
+            let (mut p, ids) = sample_project();
+            crate::edit::set_speed(&mut p, ids.v2, speed).unwrap();
+            for delta in [-100, 100, -100] {
+                slip(&mut p, ids.v2, Time::from_secs(delta)).unwrap();
+                p.timeline.check_invariants(&p.assets).unwrap();
+            }
+            let (_, c) = p.timeline.find_clip(ids.v2).unwrap();
+            assert_eq!(c.source_in(), Time::ZERO, "{speed}");
+        }
     }
 
     #[test]

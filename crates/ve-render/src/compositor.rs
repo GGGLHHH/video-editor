@@ -376,6 +376,10 @@ fn create_device(software: bool) -> Result<DeviceParts, RenderError> {
         ..Default::default()
     }))
     .map_err(|e| RenderError::Device(e.to_string()))?;
+    // 没被错误范围接住的错误：记日志，不 panic（默认处理会让整个程序崩掉）
+    device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| {
+        log::error!("显卡错误：{e}");
+    }));
     Ok((
         device,
         queue,
@@ -383,6 +387,9 @@ fn create_device(software: bool) -> Result<DeviceParts, RenderError> {
         info.device_type == wgpu::DeviceType::Cpu,
     ))
 }
+
+/// 等显卡最多这么久（正常一帧远用不了这么久）；超时报错，别让预览、导出永远挂住。
+const GPU_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 整个进程共用的显卡设备和管线（硬件一套、软件一套）：建一次要几百毫秒，
 /// 而且几十个线程同时建 DX12 设备实测偶尔会让整个进程卡死（测试里）。
@@ -404,6 +411,8 @@ struct Gpu {
     plugins: PluginCache,
     adapter: String,
     software: bool,
+    /// 设备丢了（驱动重置等）：之后再要设备时重建一套。
+    lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// 插件管线缓存：（插件名，源码散列）→ 管线。
@@ -411,30 +420,80 @@ type PluginCache = std::sync::Arc<
     std::sync::Mutex<std::collections::HashMap<(String, u64), Option<wgpu::RenderPipeline>>>,
 >;
 
+/// 共用的一套现在的状态。
+enum Shared {
+    /// 还没建，或者上次建失败了 / 设备丢了（下次再建）。
+    None,
+    Gpu(Gpu),
+    /// 要硬件显卡却只有软件显卡：用软件那一套。
+    FellBack,
+}
+
 /// 取共用的那一套；第一次时创建。`software` 为假但机器上只有软件显卡时，用软件那一套。
+/// 建失败不记住（下次再试）；设备丢了（驱动重置）下次重建。
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "建设备时要一直拿着锁：别的线程等这一套建好，不同时建"
+)]
 fn shared_gpu(software: bool) -> Result<Gpu, RenderError> {
-    static HARDWARE: std::sync::OnceLock<Result<Gpu, String>> = std::sync::OnceLock::new();
-    static SOFTWARE: std::sync::OnceLock<Result<Gpu, String>> = std::sync::OnceLock::new();
-    let make = |cpu: bool| {
-        let _serial = software_guard(cpu);
-        create_device(cpu).map(build_gpu).map_err(|e| e.to_string())
+    static HARDWARE: std::sync::Mutex<Shared> = std::sync::Mutex::new(Shared::None);
+    static SOFTWARE: std::sync::Mutex<Shared> = std::sync::Mutex::new(Shared::None);
+    let lock = |m: &'static std::sync::Mutex<Shared>| {
+        m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     };
+    let alive = |g: &Gpu| !g.lost.load(std::sync::atomic::Ordering::Acquire);
     if !software {
-        match HARDWARE.get_or_init(|| make(false)) {
-            Ok(g) if !g.software => return Ok(g.clone()),
-            // 退回了软件显卡：和软件模式共用（多个 WARP 设备并行会崩）
-            Ok(_) => {}
-            Err(e) => return Err(RenderError::Device(e.clone())),
+        let mut hw = lock(&HARDWARE);
+        match &*hw {
+            Shared::Gpu(g) if alive(g) => return Ok(g.clone()),
+            Shared::FellBack => {}
+            _ => {
+                // 建设备也串行（几十个线程同时建 DX12 设备会卡死；万一选到的是 WARP 也不并行）
+                let made = {
+                    let _serial = software_guard(true);
+                    create_device(false).map(build_gpu)
+                };
+                match made {
+                    Ok(g) if !g.software => {
+                        *hw = Shared::Gpu(g.clone());
+                        return Ok(g);
+                    }
+                    // 退回了软件显卡：丢掉这一个，和软件模式共用一套
+                    Ok(_) => *hw = Shared::FellBack,
+                    Err(e) => {
+                        *hw = Shared::None;
+                        return Err(e);
+                    }
+                }
+            }
         }
     }
-    SOFTWARE
-        .get_or_init(|| make(true))
-        .clone()
-        .map_err(RenderError::Device)
+    let mut sw = lock(&SOFTWARE);
+    if let Shared::Gpu(g) = &*sw
+        && alive(g)
+    {
+        return Ok(g.clone());
+    }
+    let made = {
+        let _serial = software_guard(true);
+        create_device(true).map(build_gpu)
+    };
+    *sw = made
+        .as_ref()
+        .map_or(Shared::None, |g| Shared::Gpu(g.clone()));
+    made
 }
 
 /// 在设备上建好合成要用的管线、绑定布局和采样器。
 fn build_gpu((device, queue, adapter, cpu): DeviceParts) -> Gpu {
+    let lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    device.set_device_lost_callback({
+        let lost = std::sync::Arc::clone(&lost);
+        move |reason, message| {
+            log::error!("显卡设备丢失（{reason:?}）：{message}");
+            lost.store(true, std::sync::atomic::Ordering::Release);
+        }
+    });
     let layout = layer_bind_layout(&device);
     let backdrop_layout = backdrop_bind_layout(&device);
     let lut_layout = lut_bind_layout(&device);
@@ -503,6 +562,7 @@ fn build_gpu((device, queue, adapter, cpu): DeviceParts) -> Gpu {
         plugins: PluginCache::default(),
         adapter,
         software: cpu,
+        lost,
     }
 }
 
@@ -773,6 +833,7 @@ impl Compositor {
             plugins,
             adapter,
             software,
+            lost: _,
         } = shared_gpu(config.software)?;
         Ok(Self {
             device,
@@ -1248,7 +1309,9 @@ impl Compositor {
         cache
             .entry(key)
             .or_insert_with(|| {
-                // 登记时已经检查过；这里再兜一层，编译出错不让整个程序崩
+                // 登记时已经检查过；这里再兜一层，编译出错不让整个程序崩。naga 检查通过、
+                // 显卡后端（DX12 的着色器编译器）编不过的算内部错误，也要接住
+                let internal = self.device.push_error_scope(wgpu::ErrorFilter::Internal);
                 let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
                 let layouts = [&self.layout, &self.backdrop_layout, &self.lut_layout];
                 let full = crate::plugin::full_source(&source);
@@ -1259,7 +1322,9 @@ impl Compositor {
                     crate::plugin::ENTRY_POINT,
                     false,
                 );
-                pollster::block_on(scope.pop()).map_or(Some(pipeline), |e| {
+                let failed = pollster::block_on(scope.pop());
+                let failed = failed.or_else(|| pollster::block_on(internal.pop()));
+                failed.map_or(Some(pipeline), |e| {
                     log::warn!("插件特效 {name} 编译失败：{e}");
                     None
                 })
@@ -1475,7 +1540,7 @@ impl Compositor {
         self.device
             .poll(wgpu::PollType::Wait {
                 submission_index: Some(frame.submission),
-                timeout: None,
+                timeout: Some(GPU_WAIT),
             })
             .map_err(|e| RenderError::Device(e.to_string()))?;
         for _ in 0..2 {
@@ -1687,7 +1752,10 @@ fn read_back(
         let _ = tx.send(r);
     });
     device
-        .poll(wgpu::PollType::wait_indefinitely())
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(GPU_WAIT),
+        })
         .map_err(|e| RenderError::Device(e.to_string()))?;
     rx.recv()
         .map_err(|e| RenderError::Device(e.to_string()))?
@@ -2413,6 +2481,13 @@ mod tests {
         // 马赛克：同一个方块里颜色一样
         run(&mut c, pass(1, K::Mosaic, 1.0, 0.0), &mut out);
         assert_eq!(px(&out, 0, 0), px(&out, 1, 1));
+        // 强度 0 的马赛克：和不加一样
+        run(&mut c, pass(1, K::Mosaic, 0.0, 0.0), &mut out);
+        let mosaic_off = out.clone();
+        c.set_effects(&[]);
+        c.compose_bgra(SIZE, &[layer(&tex, 64, 36, FULL, 1.0)], &mut out)
+            .unwrap();
+        assert_eq!(mosaic_off, out);
         // 发光：纯红纯蓝都不到发光阈值以上的白，颜色只会更亮不会变暗
         run(&mut c, pass(1, K::Glow, 1.0, 0.0), &mut out);
         assert!(px(&out, 10, 18)[2] >= 250);

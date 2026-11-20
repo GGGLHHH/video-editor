@@ -109,12 +109,25 @@ impl Workspace {
         self.reversing = true;
         crate::workspace::notify(Notification::info("倒放中…"), window, cx);
         cx.notify();
+        let key = self.source_key(clip);
         let work = cx.background_spawn(async move { (job.clip, make(&job, &out)) });
         self.tasks.push(cx.spawn_in(window, async move |this, cx| {
             let (clip, result) = work.await;
             let _ignored = this.update_in(cx, |this, window, cx| {
                 this.reversing = false;
                 match result {
+                    // 处理期间换了工程、片段被裁剪或撤销过：结果对不上，不套用
+                    Ok(stale) if this.source_key(clip) != key => {
+                        // 生成的文件用不上了
+                        drop(std::fs::remove_file(&stale.path));
+                        crate::workspace::notify(
+                            Notification::warning(
+                                "片段在处理期间改动了，倒放结果没有套用，请重新倒放",
+                            ),
+                            window,
+                            cx,
+                        );
+                    }
                     Ok(asset) => {
                         let added = this.apply(window, cx, |p| {
                             let id = p.add_asset(asset);

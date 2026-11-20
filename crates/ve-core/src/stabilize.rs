@@ -68,9 +68,19 @@ pub fn stabilize_clip(
 /// # Errors
 /// 片段不存在、没有防抖过。
 pub fn unstabilize_clip(project: &mut Project, clip: ClipId) -> Result<(), EditError> {
-    update_clip(project, clip, |c| {
-        let (asset, source_in, _) = c.stabilized.take().ok_or(EditError::InvalidValue)?;
-        c.content = ClipContent::Media { asset, source_in };
+    let (_, c) = project
+        .timeline
+        .find_clip(clip)
+        .ok_or(EditError::ClipNotFound(clip))?;
+    if c.stabilized.is_none() {
+        return Err(EditError::InvalidValue);
+    }
+    // 裁剪、分割过也对：按现在用的这一段换算回原素材
+    let (asset, source_in) =
+        crate::edit::original_range(project, c).ok_or(EditError::InvalidValue)?;
+    update_clip(project, clip, |slot| {
+        slot.stabilized = None;
+        slot.content = ClipContent::Media { asset, source_in };
         Ok(())
     })
 }
@@ -138,5 +148,51 @@ mod tests {
         assert_eq!(smoothing(0), 6);
         assert_eq!(smoothing(2), 24);
         assert_eq!(smoothing(9), 24);
+    }
+
+    fn made(p: &mut Project, secs: i64) -> AssetId {
+        p.add_asset(crate::Asset {
+            id: AssetId(0),
+            path: "生成.mp4".into(),
+            name: "生成".into(),
+            duration: Time::from_secs(secs),
+            video: Some(crate::testing::video_info()),
+            audio: Some(crate::testing::audio_info()),
+        })
+    }
+
+    fn source_in(p: &Project, clip: ClipId) -> (AssetId, Time) {
+        let (_, c) = p.timeline.find_clip(clip).unwrap();
+        (c.asset().unwrap(), c.source_in())
+    }
+
+    #[test]
+    fn turning_off_after_a_split_maps_each_half_back_to_its_own_part() {
+        let ms = Time::from_millis;
+        // v2 在时间轴 5–8 秒、用素材 5–8 秒
+        let (mut p, ids) = sample_project();
+        let stable = made(&mut p, 3);
+        stabilize_clip(&mut p, ids.v2, stable, 1).unwrap();
+        let right = crate::edit::split_at(&mut p, ids.v2, ms(6500)).unwrap();
+        unstabilize_clip(&mut p, right).unwrap();
+        unstabilize_clip(&mut p, ids.v2).unwrap();
+        assert_eq!(source_in(&p, ids.v2), (ids.video_asset, ms(5000)));
+        assert_eq!(
+            source_in(&p, right),
+            (ids.video_asset, ms(6500)),
+            "右半段接着左半段"
+        );
+        p.timeline.check_invariants(&p.assets).unwrap();
+
+        // 倒放是反的：左半段放的是原素材的后半截
+        let (mut q, rv) = sample_project();
+        let reversed_asset = made(&mut q, 3);
+        crate::edit::reverse_clip(&mut q, rv.v2, reversed_asset).unwrap();
+        let right_half = crate::edit::split_at(&mut q, rv.v2, ms(6500)).unwrap();
+        crate::edit::unreverse_clip(&mut q, right_half).unwrap();
+        crate::edit::unreverse_clip(&mut q, rv.v2).unwrap();
+        assert_eq!(source_in(&q, rv.v2), (rv.video_asset, ms(6500)));
+        assert_eq!(source_in(&q, right_half), (rv.video_asset, ms(5000)));
+        q.timeline.check_invariants(&q.assets).unwrap();
     }
 }

@@ -6,7 +6,7 @@
 use crate::workspace::{Workspace, notify};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::{AppContext as _, Context, Window};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash as _, Hasher as _};
 use std::path::{Path, PathBuf};
 use ve_core::{Asset, AssetId, Project};
@@ -25,8 +25,14 @@ pub(crate) struct Proxies {
     min_short: u32,
     /// 做好的：原文件 → 副本。
     ready: HashMap<PathBuf, PathBuf>,
-    /// 正在做的原文件。
+    /// 排着队和正在做的原文件。
     pending: HashSet<PathBuf>,
+    /// 排队等着做的（一次只做一个：几十个 4K 素材同时编码会把机器和后台线程池都占满）。
+    queue: VecDeque<PathBuf>,
+    /// 有一个正在做。
+    running: bool,
+    /// 做失败过的（这次开着代理模式时不再重试、不再反复提示）。
+    failed: HashSet<PathBuf>,
 }
 
 impl Proxies {
@@ -37,6 +43,9 @@ impl Proxies {
             min_short: DEFAULT_MIN_SHORT_SIDE,
             ready: HashMap::new(),
             pending: HashSet::new(),
+            queue: VecDeque::new(),
+            running: false,
+            failed: HashSet::new(),
         }
     }
 }
@@ -102,6 +111,8 @@ impl Workspace {
     pub fn set_proxy_mode(&mut self, on: bool, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.proxies.on = on;
         if on {
+            // 重新打开代理模式：之前失败的再试一次
+            self.proxies.failed.clear();
             self.ensure_proxies(window, cx);
         }
         self.engine_revision = None;
@@ -109,61 +120,90 @@ impl Workspace {
         cx.notify();
     }
 
-    /// 给要做代理、还没有副本的素材做副本（后台，一个一个来）；已经在目录里的直接用。
+    /// 给要做代理、还没有副本的素材排队做副本（后台，一个一个来）；已经在目录里的直接用。
     pub(crate) fn ensure_proxies(&mut self, window: &Window, cx: &Context<'_, Self>) {
         if !self.proxies.on {
             return;
         }
+        let px = &self.proxies;
         let todo: Vec<PathBuf> = self
             .doc
             .project
             .assets
             .values()
-            .filter(|a| wants_proxy(a, self.proxies.min_short))
+            .filter(|a| wants_proxy(a, px.min_short))
             .map(|a| a.path.clone())
-            .filter(|p| !self.proxies.ready.contains_key(p) && !self.proxies.pending.contains(p))
+            .filter(|p| {
+                !px.ready.contains_key(p) && !px.pending.contains(p) && !px.failed.contains(p)
+            })
             .collect();
         for source in todo {
             let out = proxy_path(&self.proxies.dir, &source);
             if out.is_file() {
                 self.proxies.ready.insert(source, out);
-                continue;
+            } else {
+                self.proxies.pending.insert(source.clone());
+                self.proxies.queue.push_back(source);
             }
-            self.proxies.pending.insert(source.clone());
-            let job = cx.background_spawn({
-                let (source, out) = (source.clone(), out.clone());
-                async move { ve_export::make_proxy(&source, &out) }
-            });
-            self.tasks.push(cx.spawn_in(window, async move |this, cx| {
-                let made = job.await;
-                let _ignored = this.update_in(cx, |this, window, cx| {
-                    this.proxies.pending.remove(&source);
-                    match made {
-                        Ok(()) => {
-                            this.proxies.ready.insert(source, out);
-                            this.engine_revision = None;
-                            this.sync_engine();
-                            if this.proxies.pending.is_empty() {
-                                notify(Notification::success("代理文件已生成"), window, cx);
-                            }
-                        }
-                        Err(e) => {
-                            let name = source
-                                .file_name()
-                                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-                            notify(
-                                Notification::warning(format!("{name} 的代理没做成：{e}")),
-                                window,
-                                cx,
-                            );
-                        }
-                    }
-                    cx.notify();
-                });
-            }));
         }
+        self.next_proxy(window, cx);
         self.engine_revision = None;
         self.sync_engine();
+    }
+
+    /// 没有在做的就开始做队列里的下一个。先写到临时文件，做完整了才改成正式名字
+    /// （做到一半失败、程序退出时，不会留下一个会被当成「做好了」的残缺文件）。
+    fn next_proxy(&mut self, window: &Window, cx: &Context<'_, Self>) {
+        if self.proxies.running {
+            return;
+        }
+        let Some(source) = self.proxies.queue.pop_front() else {
+            return;
+        };
+        self.proxies.running = true;
+        let out = proxy_path(&self.proxies.dir, &source);
+        let job = cx.background_spawn({
+            let (source, out) = (source.clone(), out.clone());
+            async move {
+                let part = out.with_extension("part.mp4");
+                let made = ve_export::make_proxy(&source, &part)
+                    .and_then(|()| std::fs::rename(&part, &out).map_err(|e| e.to_string()));
+                if made.is_err() {
+                    drop(std::fs::remove_file(&part));
+                }
+                made
+            }
+        });
+        self.tasks.push(cx.spawn_in(window, async move |this, cx| {
+            let made = job.await;
+            let _ignored = this.update_in(cx, |this, window, cx| {
+                this.proxies.running = false;
+                this.proxies.pending.remove(&source);
+                match made {
+                    Ok(()) => {
+                        this.proxies.ready.insert(source, out);
+                        this.engine_revision = None;
+                        this.sync_engine();
+                        if this.proxies.pending.is_empty() {
+                            notify(Notification::success("代理文件已生成"), window, cx);
+                        }
+                    }
+                    Err(e) => {
+                        let name = source
+                            .file_name()
+                            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                        this.proxies.failed.insert(source);
+                        notify(
+                            Notification::warning(format!("{name} 的代理没做成：{e}")),
+                            window,
+                            cx,
+                        );
+                    }
+                }
+                this.next_proxy(window, cx);
+                cx.notify();
+            });
+        }));
     }
 
     /// 播放引擎现在读的素材文件（代理模式下可能是副本）。

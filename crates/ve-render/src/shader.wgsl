@@ -352,9 +352,11 @@ fn fs_effect(v: VOut) -> @location(0) vec4<f32> {
         let n = hash21(p + floor(t * 30.0) * vec2(17.31, 91.73)) - 0.5;
         out = c + vec3(n * amount * 0.35);
     } else if kind < 4.5 {
-        // 马赛克：方块边长最大为短边的 1/24，取方块中心的颜色
-        let b = max(round(amount * short / 24.0), 2.0);
-        out = bd(vec2<i32>((floor(p / b) + 0.5) * b));
+        // 马赛克：方块边长最大为短边的 1/24，取方块中心的颜色（不到 2 像素就是原样）
+        let b = round(amount * short / 24.0);
+        if b >= 2.0 {
+            out = bd(vec2<i32>((floor(p / b) + 0.5) * b));
+        }
     } else if kind < 5.5 {
         // RGB 色差：红往右、蓝往左
         // 最少错开 1 像素（小画面上也看得出）
