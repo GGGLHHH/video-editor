@@ -751,7 +751,9 @@ mod tests {
             .take_frame()
             .is_some_and(|u| u.frame.is_none())));
         assert!(e.is_playing());
-        assert!(e.position() > before);
+        // 时钟跟着声卡实际放出去的量走（回调之间只插值一小段）：机器忙时要等下一次回调才往前，
+        // 所以等它走，不要求黑场帧一到就已经走过去
+        assert!(wait_until(2000, || e.position() > before), "播放继续往前走");
     }
 
     #[test]

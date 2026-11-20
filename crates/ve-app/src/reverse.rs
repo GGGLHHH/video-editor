@@ -138,11 +138,14 @@ impl Workspace {
                             this.analyze_assets(a.into_iter().collect(), window, cx);
                         }
                     }
-                    Err(e) => crate::workspace::notify(
-                        Notification::warning(format!("倒放失败：{e}")),
-                        window,
-                        cx,
-                    ),
+                    Err(e) => {
+                        log::warn!("倒放失败：{e}");
+                        crate::workspace::notify(
+                            Notification::warning(format!("倒放失败：{e}")),
+                            window,
+                            cx,
+                        );
+                    }
                 }
                 cx.notify();
             });

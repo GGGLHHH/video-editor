@@ -121,11 +121,14 @@ impl Workspace {
                             this.analyze_assets(a.into_iter().collect(), window, cx);
                         }
                     }
-                    Err(e) => notify(
-                        Notification::warning(format!("视频防抖失败：{e}")),
-                        window,
-                        cx,
-                    ),
+                    Err(e) => {
+                        log::warn!("视频防抖失败：{e}");
+                        notify(
+                            Notification::warning(format!("视频防抖失败：{e}")),
+                            window,
+                            cx,
+                        );
+                    }
                 }
                 cx.notify();
             });

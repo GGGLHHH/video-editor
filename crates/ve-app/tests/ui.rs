@@ -85,6 +85,13 @@ impl Drop for Watchdog {
 }
 
 fn open(cx: &mut TestAppContext) -> Ui {
+    // 警告以上的日志：测试失败时和失败信息一起打出来（后台任务失败的原因，比如 ffmpeg 的退出码）
+    drop(
+        env_logger::builder()
+            .is_test(true)
+            .filter_level(log::LevelFilter::Warn)
+            .try_init(),
+    );
     let watchdog = Watchdog::start();
     cx.update(ve_app::app::init);
     let (win, view) = cx.update(|cx| {
