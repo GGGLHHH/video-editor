@@ -192,6 +192,7 @@ impl Workspace {
                         let name = source
                             .file_name()
                             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                        log::warn!("{name} 的代理没做成：{e}");
                         this.proxies.failed.insert(source);
                         notify(
                             Notification::warning(format!("{name} 的代理没做成：{e}")),
