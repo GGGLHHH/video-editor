@@ -99,7 +99,8 @@ cargo run --release -p ve-app -- a.mp4 bgm.m4a        # 导入素材并依次放
 
 GitHub Actions 自动做（只打 Windows x64）：
 - 推到 main、提 PR：跑全量检查（`.github/workflows/ci.yml`）。
-- 推 `v*` 标签：先跑全量检查，再打压缩包，建 GitHub Release（`.github/workflows/release.yml`）。
+- 推 `v*` 标签：先跑全量检查，再打压缩包，建 GitHub Release（`.github/workflows/release.yml`）。Release 说明取自 `CHANGELOG.md` 里这一版，没写会直接失败。
+- 发版步骤：把 `CHANGELOG.md` 的「未发布」整理成 `## [x.y.z] - 日期`、改 `Cargo.toml` 的版本号，合进 main 后打 `vx.y.z` 标签推上去。
 - 在 Actions 页面手动运行 Release：只生成压缩包，作为运行产物保留 14 天。
 
 压缩包解压即用：`video-editor.exe` + FFmpeg 的 DLL 和 `ffmpeg.exe` + `licenses/`。
@@ -183,6 +184,7 @@ crates/
 | [docs/superpowers/plans/2026-11-17-multitrack-compositing.md](docs/superpowers/plans/2026-11-17-multitrack-compositing.md) | 多轨合成实现计划 |
 | [spikes/gpu-compositor/README.md](spikes/gpu-compositor/README.md) | 显卡合成实验 |
 | [docs/plugins.md](docs/plugins.md) | 特效插件（`.wgsl`）怎么写 |
+| [CHANGELOG.md](CHANGELOG.md) | 更新日志：每个版本改了什么（Keep a Changelog 格式） |
 | [docs/decisions.md](docs/decisions.md) | 决策记录 |
 | [docs/plan.md](docs/plan.md) | 进度 |
 

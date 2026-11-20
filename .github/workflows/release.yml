@@ -1,4 +1,4 @@
-# 打包：推 v* 标签时先跑全量检查，再打 Windows 压缩包并建 GitHub Release；
+# 打包：推 v* 标签时先跑全量检查，再打 Windows 压缩包并建 GitHub Release（说明取自 CHANGELOG.md 里这一版）；
 # 也可以在 Actions 页面手动运行（只生成压缩包，作为运行产物保留 14 天，不建 Release）。
 name: Release
 
@@ -26,6 +26,11 @@ jobs:
       RUSTFLAGS: -C target-feature=+crt-static
     steps:
       - uses: actions/checkout@v4
+
+      # 先取发版说明：CHANGELOG.md 里没有这一版就马上失败，不用等编译完
+      - name: 发版说明（取自 CHANGELOG.md）
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: pwsh scripts/release-notes.ps1 -Version $env:GITHUB_REF_NAME -Out "$env:RUNNER_TEMP/release-notes.md"
 
       - name: Rust 工具链（按 rust-toolchain.toml）
         run: rustup toolchain install
@@ -61,4 +66,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $zip = (Get-ChildItem dist\*.zip).FullName
-          gh release create $env:GITHUB_REF_NAME $zip --title "视频剪辑器 $env:GITHUB_REF_NAME" --generate-notes
+          gh release create $env:GITHUB_REF_NAME $zip --title "视频剪辑器 $env:GITHUB_REF_NAME" --notes-file "$env:RUNNER_TEMP/release-notes.md"
