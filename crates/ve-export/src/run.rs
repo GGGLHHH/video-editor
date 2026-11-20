@@ -93,8 +93,21 @@ fn run_ffmpeg_in(dir: Option<&std::path::Path>, args: &[std::ffi::OsString]) -> 
     if output.status.success() {
         Ok(())
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+        Err(failure_message(output.status, &output.stderr))
     }
+}
+
+/// ffmpeg 失败时给人看的原因：它的报错；什么都没说（比如崩了）时写退出码，别给一句空话。
+fn failure_message(status: std::process::ExitStatus, stderr: &[u8]) -> String {
+    let said = String::from_utf8_lossy(stderr).trim().to_owned();
+    if !said.is_empty() {
+        return said;
+    }
+    // Windows 的崩溃码（0xC0000005 访问违例这类）按十六进制写，好查
+    status.code().map_or_else(
+        || format!("ffmpeg 异常退出（{status}），没有输出错误信息"),
+        |code| format!("ffmpeg 异常退出，退出码 0x{code:08X}，没有输出错误信息"),
+    )
 }
 
 /// 倒放（剪映「倒放」）：把素材 `input` 里 `[from, from + len)` 这一段倒着生成到 `out`
@@ -1142,6 +1155,34 @@ mod tests {
         let bad = dir.path().join("坏.mp4");
         std::fs::write(&bad, "不是视频").unwrap();
         assert!(make_proxy(&bad, &dir.path().join("x.mp4")).is_err());
+    }
+
+    #[test]
+    fn a_silent_ffmpeg_failure_still_says_something() {
+        let status = Command::new(ffmpeg_program())
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "quiet",
+                "-i",
+                "没有这个文件.mp4",
+            ])
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        let message = failure_message(
+            status, b"  
+",
+        );
+        assert!(message.contains("退出码"), "{message}");
+        assert_eq!(
+            failure_message(
+                status,
+                b" No such file 
+"
+            ),
+            "No such file"
+        );
     }
 
     #[test]
