@@ -97,40 +97,6 @@ pub(crate) fn text_tab(
         .child(label)
 }
 
-/// 二级分段控件（「基础 / 抠像 / 蒙版…」）：深色底，选中的一段亮一些。
-pub(crate) fn segments(items: &[(&'static str, bool)], cx: &App) -> Div {
-    h_flex()
-        .p(px(2.))
-        .gap(px(2.))
-        .rounded(px(4.))
-        .bg(cx.theme().muted)
-        .children(items.iter().map(|&(label, selected)| {
-            div()
-                .flex_1()
-                .h(px(24.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(3.))
-                .text_xs()
-                .when_selected(selected, cx)
-                .child(label)
-        }))
-}
-
-/// 选中的分段用亮底，没选中的用次要字色。
-trait SegmentStyle: gpui_kit::Styled + Sized {
-    fn when_selected(self, selected: bool, cx: &App) -> Self {
-        if selected {
-            self.bg(cx.theme().accent).text_color(cx.theme().foreground)
-        } else {
-            self.text_color(cx.theme().muted_foreground)
-        }
-    }
-}
-
-impl<T: gpui_kit::Styled> SegmentStyle for T {}
-
 /// 可选项小块（草稿参数里的比例、分辨率、帧率）：选中的是主色青描边 + 青字。
 pub(crate) fn chip(
     id: impl Into<ElementId>,
@@ -162,7 +128,7 @@ pub(crate) fn chip(
 }
 
 /// 快捷键键帽：深色小圆角块 + 白字（菜单项右侧）。
-pub(crate) fn keycaps(keys: &'static str, cx: &App) -> Div {
+pub(crate) fn keycaps(keys: &str, cx: &App) -> Div {
     h_flex()
         .gap_0p5()
         .children(keys.split('+').filter(|k| !k.is_empty()).map(|k| {
@@ -177,6 +143,6 @@ pub(crate) fn keycaps(keys: &'static str, cx: &App) -> Div {
                 .bg(palette::window_bg())
                 .text_color(cx.theme().muted_foreground)
                 .text_size(px(10.))
-                .child(k)
+                .child(SharedString::from(k.to_owned()))
         }))
 }

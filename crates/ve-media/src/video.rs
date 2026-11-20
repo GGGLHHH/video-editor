@@ -502,9 +502,77 @@ fn premultiply(data: &mut [u8]) {
     }
 }
 
+/// 帧融合（剪映「补帧 · 帧融合」）：慢放时素材时间 `t` 落在相邻两帧 `a`、`b` 之间，
+/// 按离两帧的远近把它们混在一起，画面不再一顿一顿的。预览和导出都用它。
+/// 两帧大小不同、`b` 不在 `a` 后面、或 `t` 就在 `a` 上时返回 `None`（直接用 `a`）。
+#[must_use]
+#[expect(
+    clippy::many_single_char_names,
+    reason = "两帧 a、b，时刻 t，权重 w、x、y 一看就懂"
+)]
+pub fn blend_frames(a: &VideoFrame, b: &VideoFrame, t: Time) -> Option<VideoFrame> {
+    if a.width != b.width || a.height != b.height || b.pts <= a.pts || a.data.len() != b.data.len()
+    {
+        return None;
+    }
+    #[expect(clippy::cast_precision_loss, reason = "相邻两帧的时间差很小")]
+    let w = ((t - a.pts).0 as f64 / (b.pts - a.pts).0 as f64).clamp(0.0, 1.0);
+    if w < 1.0 / 512.0 {
+        return None;
+    }
+    // 定点：权重放大到 0–256
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "权重在 0–256"
+    )]
+    let wb = (w * 256.0).round() as u32;
+    let wa = 256 - wb;
+    let data = a
+        .data
+        .iter()
+        .zip(&b.data)
+        .map(|(&x, &y)| {
+            let v = (u32::from(x) * wa + u32::from(y) * wb + 128) >> 8;
+            u8::try_from(v).unwrap_or(u8::MAX)
+        })
+        .collect();
+    Some(VideoFrame {
+        pts: t,
+        width: a.width,
+        height: a.height,
+        data,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blending_mixes_by_distance_to_each_frame() {
+        let frame = |pts: i64, v: u8| VideoFrame {
+            pts: Time::from_millis(pts),
+            width: 1,
+            height: 1,
+            data: vec![v; 4],
+        };
+        let (a, b) = (frame(0, 0), frame(100, 200));
+        let quarter = blend_frames(&a, &b, Time::from_millis(25)).unwrap();
+        assert_eq!(quarter.data, vec![50; 4]);
+        assert_eq!(quarter.pts, Time::from_millis(25));
+        assert!(blend_frames(&a, &b, Time::ZERO).is_none(), "正好在第一帧上");
+        assert!(
+            blend_frames(&b, &a, Time::from_millis(50)).is_none(),
+            "顺序反了"
+        );
+        let mut big = frame(100, 0);
+        big.width = 2;
+        assert!(
+            blend_frames(&a, &big, Time::from_millis(50)).is_none(),
+            "大小不同"
+        );
+    }
     use crate::testing::{Fixture, expected_gray, fixture};
     use ve_core::FrameRate;
 

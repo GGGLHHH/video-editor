@@ -66,6 +66,10 @@ pub struct Layer<'a> {
     pub opacity: f32,
     /// 调色（单位矩阵时着色器跳过）。
     pub color: ve_core::ColorMatrix,
+    /// 外观：混合模式、圆角、描边、阴影、蒙版、色度抠图。
+    pub look: ve_core::Look,
+    /// 整条调色链（用到进阶调色时才有）：烘焙成 3D 查找表逐像素查，不再用 `color`。
+    pub grades: &'a [ve_core::GradeStep],
 }
 
 /// 每层的参数，作为实例顶点数据传给着色器。
@@ -77,19 +81,108 @@ struct LayerInstance {
     /// 左下、右下两个角（NDC）。
     bottom: [f32; 4],
     uv: [f32; 4],
-    opacity: f32,
+    /// 不透明度、要不要调色（1 / 0）、混合模式编号、圆角半径（像素）。
+    p0: [f32; 4],
     /// 调色矩阵的三行（输出 r、g、b = 行 · (r, g, b, 1)）。
     red: [f32; 4],
     green: [f32; 4],
     blue: [f32; 4],
-    /// 1 = 要调色，0 = 原样（单位矩阵）。
-    colored: f32,
+    /// 显示部分宽、高（像素），往外扩的像素，描边粗细（像素）。
+    sizes: [f32; 4],
+    /// 描边颜色。
+    stroke: [f32; 4],
+    /// 阴影颜色、不透明度。
+    shadow: [f32; 4],
+    /// 阴影偏移 xy（图层坐标）、模糊、蒙版形状（-1 没有）。
+    shadow2: [f32; 4],
+    /// 蒙版中心 xy（图层坐标）、半宽、半高。
+    mask: [f32; 4],
+    /// 蒙版旋转（弧度）、羽化、圆角（像素）、反转。
+    mask2: [f32; 4],
+    /// 抠像颜色、低阈值。
+    key: [f32; 4],
+    /// 高阈值、开没开。
+    key2: [f32; 4],
 }
 
-const INSTANCE_ATTRS: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![
-    0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32,
-    4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32
+const INSTANCE_ATTRS: [wgpu::VertexAttribute; 15] = wgpu::vertex_attr_array![
+    0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4,
+    4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4,
+    8 => Float32x4, 9 => Float32x4, 10 => Float32x4, 11 => Float32x4,
+    12 => Float32x4, 13 => Float32x4, 14 => Float32x4
 ];
+
+/// 外观换成着色器参数（`size` 是显示部分的像素大小，`short` 是画布短边，`angle` 是图层旋转角）。
+#[expect(clippy::many_single_char_names, reason = "宽高、颜色分量")]
+fn look_params(look: &ve_core::Look, size: (f32, f32), short: f32, angle: f32) -> LookParams {
+    let (w, h) = size;
+    let half_min = w.min(h) / 2.0;
+    let rgb = |c: u32| {
+        let [r, g, b] = ve_core::look::rgb_unit(c);
+        [r, g, b, 1.0]
+    };
+    let stroke_w = look.stroke.map_or(0.0, |s| s.width * short);
+    let (shadow, shadow_off, blur) = look.shadow.map_or(([0.0; 4], (0.0, 0.0), 0.0), |s| {
+        let dist = s.distance * short;
+        let a = s.angle.to_radians();
+        // 画布上的方向转回图层自己的方向（图层转了多少，影子方向就要反着转回来）
+        let (dx, dy) = (dist * a.cos(), dist * a.sin());
+        let (sin, cos) = (-angle).sin_cos();
+        let off = (dx * cos - dy * sin, dx * sin + dy * cos);
+        let [r, g, b, _] = rgb(s.color);
+        ([r, g, b, s.opacity], off, s.blur * short)
+    });
+    let (mask_shape, mask, mask2) = look.mask.map_or((-1.0, [0.0; 4], [0.0; 4]), |m| {
+        let (hw, hh) = (m.width * w / 2.0, m.height * h / 2.0);
+        #[expect(clippy::cast_precision_loss, reason = "形状编号很小")]
+        let shape = m.shape.code() as f32;
+        (
+            shape,
+            [w * (0.5 + m.x), h * (0.5 + m.y), hw, hh],
+            [
+                m.rotation.to_radians(),
+                m.feather * half_min,
+                m.round * hw.min(hh),
+                if m.invert { 1.0 } else { 0.0 },
+            ],
+        )
+    });
+    let (key, key2) = look.chroma.map_or(([0.0; 4], [0.0; 4]), |k| {
+        let (lo, hi) = k.thresholds();
+        let [r, g, b, _] = rgb(k.color);
+        ([r, g, b, lo], [hi, 1.0, 0.0, 0.0])
+    });
+    let expand = if stroke_w > 0.0 || shadow[3] > 0.0 {
+        stroke_w.max(shadow_off.0.hypot(shadow_off.1) + blur * 2.0) + 2.0
+    } else {
+        0.0
+    };
+    let stroke = look.stroke.map_or([0.0; 4], |s| rgb(s.color));
+    LookParams {
+        radius: look.radius * half_min,
+        sizes: [w, h, expand, stroke_w],
+        stroke,
+        shadow,
+        shadow2: [shadow_off.0, shadow_off.1, blur, mask_shape],
+        mask,
+        mask2,
+        key,
+        key2,
+    }
+}
+
+/// [`look_params`] 的结果。
+struct LookParams {
+    radius: f32,
+    sizes: [f32; 4],
+    stroke: [f32; 4],
+    shadow: [f32; 4],
+    shadow2: [f32; 4],
+    mask: [f32; 4],
+    mask2: [f32; 4],
+    key: [f32; 4],
+    key2: [f32; 4],
+}
 
 /// 一个图层槽位：纹理按尺寸复用。
 struct Slot {
@@ -186,6 +279,9 @@ struct Target {
     texture: wgpu::Texture,
     readback: wgpu::Buffer,
     padded_row: u32,
+    /// 混合模式图层要读的底图：画它之前把已经合成好的画面拷进来。
+    backdrop: wgpu::Texture,
+    backdrop_bind: wgpu::BindGroup,
 }
 
 /// 显卡合成器。
@@ -193,7 +289,20 @@ pub struct Compositor {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
+    /// 混合模式不是「正常」的图层：读底图、算好后直接写回。
+    blend_pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
+    backdrop_layout: wgpu::BindGroupLayout,
+    lut_layout: wgpu::BindGroupLayout,
+    lut_sampler: wgpu::Sampler,
+    /// 不用查找表的图层绑的占位表。
+    no_lut: wgpu::BindGroup,
+    /// 烘焙过的查找表（按调色链的内容），满了就清空重来。
+    luts: std::collections::HashMap<u64, wgpu::BindGroup>,
+    /// 这一帧各层用哪个查找表（`None` 用占位表）。
+    layer_luts: Vec<Option<u64>>,
+    /// 这一帧各层要不要走混合模式那条路。
+    blended: Vec<bool>,
     sampler: wgpu::Sampler,
     slots: Vec<Slot>,
     /// 各层参数（实例顶点缓冲）和容量，不够时重建。
@@ -207,6 +316,28 @@ pub struct Compositor {
     software: bool,
     /// 底色（没有画面的地方），默认黑；调节片段会把它也调了。
     background: wgpu::Color,
+    /// 画面特效（[`Self::set_effects`]）。
+    effects: Vec<ve_core::EffectPass>,
+    /// 画面特效那一道：读底图、整个画面重画。
+    effect_pipeline: wgpu::RenderPipeline,
+    /// 特效那一道不读图层纹理，第 0 组绑个 1×1 的占位。
+    dummy_layer: wgpu::BindGroup,
+    /// 插件特效的管线（和同一块显卡上的合成器共用）。
+    plugins: PluginCache,
+}
+
+impl Drop for Compositor {
+    /// 软件显卡上释放资源也要和别的合成器错开（同上：WARP 并发会崩）。设备和管线随后自动释放。
+    fn drop(&mut self) {
+        let _serial = software_guard(self.software);
+        self.in_flight.clear();
+        self.readbacks.clear();
+        self.nv12_target = None;
+        self.target = None;
+        self.instances = None;
+        self.slots.clear();
+        self.luts.clear();
+    }
 }
 
 impl std::fmt::Debug for Compositor {
@@ -245,6 +376,10 @@ fn create_device(software: bool) -> Result<DeviceParts, RenderError> {
         ..Default::default()
     }))
     .map_err(|e| RenderError::Device(e.to_string()))?;
+    // 没被错误范围接住的错误：记日志，不 panic（默认处理会让整个程序崩掉）
+    device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| {
+        log::error!("显卡错误：{e}");
+    }));
     Ok((
         device,
         queue,
@@ -253,22 +388,197 @@ fn create_device(software: bool) -> Result<DeviceParts, RenderError> {
     ))
 }
 
-/// 软件模式下所有合成器共用一个 WARP 设备：每次新建要几百毫秒，测试里几十个合成器排队建会超时。
-fn shared_software_device() -> Result<DeviceParts, RenderError> {
-    static DEVICE: std::sync::OnceLock<Result<DeviceParts, String>> = std::sync::OnceLock::new();
-    DEVICE
-        .get_or_init(|| create_device(true).map_err(|e| e.to_string()))
-        .clone()
-        .map_err(RenderError::Device)
+/// 等显卡最多这么久（正常一帧远用不了这么久）；超时报错，别让预览、导出永远挂住。
+const GPU_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 整个进程共用的显卡设备和管线（硬件一套、软件一套）：建一次要几百毫秒，
+/// 而且几十个线程同时建 DX12 设备实测偶尔会让整个进程卡死（测试里）。
+#[derive(Clone)]
+struct Gpu {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    pipeline: wgpu::RenderPipeline,
+    blend_pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    backdrop_layout: wgpu::BindGroupLayout,
+    lut_layout: wgpu::BindGroupLayout,
+    lut_sampler: wgpu::Sampler,
+    no_lut: wgpu::BindGroup,
+    sampler: wgpu::Sampler,
+    effect_pipeline: wgpu::RenderPipeline,
+    dummy_layer: wgpu::BindGroup,
+    /// 编译好的插件特效（按插件名和源码）；编译失败的记 `None`，不再试。
+    plugins: PluginCache,
+    adapter: String,
+    software: bool,
+    /// 设备丢了（驱动重置等）：之后再要设备时重建一套。
+    lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-fn instance() -> wgpu::Instance {
-    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
-    // Windows 上用 DX12：实测比 Vulkan 略快，系统自带，而且有 WARP 软件显卡可用于测试
-    if cfg!(windows) {
-        desc.backends = wgpu::Backends::DX12;
+/// 插件管线缓存：（插件名，源码散列）→ 管线。
+type PluginCache = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<(String, u64), Option<wgpu::RenderPipeline>>>,
+>;
+
+/// 共用的一套现在的状态。
+enum Shared {
+    /// 还没建，或者上次建失败了 / 设备丢了（下次再建）。
+    None,
+    Gpu(Gpu),
+    /// 要硬件显卡却只有软件显卡：用软件那一套。
+    FellBack,
+}
+
+/// 取共用的那一套；第一次时创建。`software` 为假但机器上只有软件显卡时，用软件那一套。
+/// 建失败不记住（下次再试）；设备丢了（驱动重置）下次重建。
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "建设备时要一直拿着锁：别的线程等这一套建好，不同时建"
+)]
+fn shared_gpu(software: bool) -> Result<Gpu, RenderError> {
+    static HARDWARE: std::sync::Mutex<Shared> = std::sync::Mutex::new(Shared::None);
+    static SOFTWARE: std::sync::Mutex<Shared> = std::sync::Mutex::new(Shared::None);
+    let lock = |m: &'static std::sync::Mutex<Shared>| {
+        m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    let alive = |g: &Gpu| !g.lost.load(std::sync::atomic::Ordering::Acquire);
+    if !software {
+        let mut hw = lock(&HARDWARE);
+        match &*hw {
+            Shared::Gpu(g) if alive(g) => return Ok(g.clone()),
+            Shared::FellBack => {}
+            _ => {
+                // 建设备也串行（几十个线程同时建 DX12 设备会卡死；万一选到的是 WARP 也不并行）
+                let made = {
+                    let _serial = software_guard(true);
+                    create_device(false).map(build_gpu)
+                };
+                match made {
+                    Ok(g) if !g.software => {
+                        *hw = Shared::Gpu(g.clone());
+                        return Ok(g);
+                    }
+                    // 退回了软件显卡：丢掉这一个，和软件模式共用一套
+                    Ok(_) => *hw = Shared::FellBack,
+                    Err(e) => {
+                        *hw = Shared::None;
+                        return Err(e);
+                    }
+                }
+            }
+        }
     }
-    wgpu::Instance::new(desc)
+    let mut sw = lock(&SOFTWARE);
+    if let Shared::Gpu(g) = &*sw
+        && alive(g)
+    {
+        return Ok(g.clone());
+    }
+    let made = {
+        let _serial = software_guard(true);
+        create_device(true).map(build_gpu)
+    };
+    *sw = made
+        .as_ref()
+        .map_or(Shared::None, |g| Shared::Gpu(g.clone()));
+    made
+}
+
+/// 在设备上建好合成要用的管线、绑定布局和采样器。
+fn build_gpu((device, queue, adapter, cpu): DeviceParts) -> Gpu {
+    let lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    device.set_device_lost_callback({
+        let lost = std::sync::Arc::clone(&lost);
+        move |reason, message| {
+            log::error!("显卡设备丢失（{reason:?}）：{message}");
+            lost.store(true, std::sync::atomic::Ordering::Release);
+        }
+    });
+    let layout = layer_bind_layout(&device);
+    let backdrop_layout = backdrop_bind_layout(&device);
+    let lut_layout = lut_bind_layout(&device);
+    let layouts = [&layout, &backdrop_layout, &lut_layout];
+    let pipeline = compose_pipeline(&device, layouts, Pass::Normal);
+    let blend_pipeline = compose_pipeline(&device, layouts, Pass::Blend);
+    let effect_pipeline = compose_pipeline(&device, layouts, Pass::Effect);
+    let lut_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("lut"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    let no_lut = lut_bind(
+        &device,
+        &queue,
+        &lut_layout,
+        &lut_sampler,
+        2,
+        &[255; 2 * 2 * 2 * 4],
+    );
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("layer"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    let dummy = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("dummy-layer"),
+        size: extent((1, 1)),
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let dummy_view = dummy.create_view(&wgpu::TextureViewDescriptor::default());
+    let dummy_layer = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("dummy-layer"),
+        layout: &layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&dummy_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+    Gpu {
+        device,
+        queue,
+        pipeline,
+        blend_pipeline,
+        layout,
+        backdrop_layout,
+        lut_layout,
+        lut_sampler,
+        no_lut,
+        sampler,
+        effect_pipeline,
+        dummy_layer,
+        plugins: PluginCache::default(),
+        adapter,
+        software: cpu,
+        lost,
+    }
+}
+
+/// 整个进程共用一个实例（显卡驱动只加载一次）。
+fn instance() -> wgpu::Instance {
+    static INSTANCE: std::sync::OnceLock<wgpu::Instance> = std::sync::OnceLock::new();
+    INSTANCE
+        .get_or_init(|| {
+            let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+            // Windows 上用 DX12：实测比 Vulkan 略快，系统自带，而且有 WARP 软件显卡可用于测试
+            if cfg!(windows) {
+                desc.backends = wgpu::Backends::DX12;
+            }
+            wgpu::Instance::new(desc)
+        })
+        .clone()
 }
 
 fn adapter(instance: &wgpu::Instance, software: bool) -> Option<wgpu::Adapter> {
@@ -313,14 +623,161 @@ fn layer_bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
-fn compose_pipeline(device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> wgpu::RenderPipeline {
+fn lut_bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("lut"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    })
+}
+
+/// 一个 3D 查找表（RGBA8，`size`³）的绑定组。
+fn lut_bind(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    size: u32,
+    data: &[u8],
+) -> wgpu::BindGroup {
+    let extent = wgpu::Extent3d {
+        width: size,
+        height: size,
+        depth_or_array_layers: size,
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("lut"),
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(size * 4),
+            rows_per_image: Some(size),
+        },
+        extent,
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("lut"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
+}
+
+/// 调色链的指纹（缓存查找表用）。
+fn chain_key(grades: &[ve_core::GradeStep]) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    format!("{grades:?}").hash(&mut h);
+    h.finish()
+}
+
+/// 最多缓存这么多个查找表。
+const LUT_CACHE: usize = 64;
+
+fn backdrop_bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("backdrop"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        }],
+    })
+}
+
+/// 合成管线：`blend` 为假是普通的预乘透明叠加（入口 `fs`），为真是混合模式（入口 `fs_blend`，
+/// 读底图、直接写回不再叠加）。两条管线用同一个布局（第 1 组是底图，普通管线不读它）。
+/// 合成管线的三种画法。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    /// 普通图层：预乘透明叠上去。
+    Normal,
+    /// 混合模式图层：读底图，算好直接写回。
+    Blend,
+    /// 画面特效：读底图，整个画面重画。
+    Effect,
+}
+
+fn compose_pipeline(
+    device: &wgpu::Device,
+    layouts: [&wgpu::BindGroupLayout; 3],
+    pass: Pass,
+) -> wgpu::RenderPipeline {
+    let entry = match pass {
+        Pass::Normal => "fs",
+        Pass::Blend => "fs_blend",
+        Pass::Effect => "fs_effect",
+    };
+    pipeline_from(
+        device,
+        layouts,
+        include_str!("shader.wgsl"),
+        entry,
+        pass == Pass::Normal,
+    )
+}
+
+/// 用源码 `source` 的入口 `entry` 建一条合成管线（`blend` 为真时预乘透明叠加，否则直接写回）。
+fn pipeline_from(
+    device: &wgpu::Device,
+    layouts: [&wgpu::BindGroupLayout; 3],
+    source: &str,
+    entry: &str,
+    blend: bool,
+) -> wgpu::RenderPipeline {
+    let [layout, backdrop, lut] = layouts;
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("compose"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("compose"),
-        bind_group_layouts: &[Some(layout)],
+        bind_group_layouts: &[Some(layout), Some(backdrop), Some(lut)],
         ..Default::default()
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -338,10 +795,10 @@ fn compose_pipeline(device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> wg
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: Some("fs"),
+            entry_point: Some(entry),
             targets: &[Some(wgpu::ColorTargetState {
                 format: FORMAT,
-                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                blend: blend.then_some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -360,29 +817,37 @@ impl Compositor {
     /// # Errors
     /// 找不到显卡，或创建设备失败。
     pub fn new(config: &RenderConfig) -> Result<Self, RenderError> {
-        let _serial = software_guard(config.software);
-        let (device, queue, name, cpu) = if config.software {
-            shared_software_device()?
-        } else {
-            match create_device(false)? {
-                // 没有硬件显卡、退回了软件显卡：和软件模式一样共用一个设备（多个 WARP 设备并行会崩）
-                parts if parts.3 => shared_software_device()?,
-                parts => parts,
-            }
-        };
-        let layout = layer_bind_layout(&device);
-        let pipeline = compose_pipeline(&device, &layout);
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("layer"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
+        let Gpu {
+            device,
+            queue,
+            pipeline,
+            blend_pipeline,
+            layout,
+            backdrop_layout,
+            lut_layout,
+            lut_sampler,
+            no_lut,
+            sampler,
+            effect_pipeline,
+            dummy_layer,
+            plugins,
+            adapter,
+            software,
+            lost: _,
+        } = shared_gpu(config.software)?;
         Ok(Self {
             device,
             queue,
             pipeline,
+            blend_pipeline,
             layout,
+            backdrop_layout,
+            lut_layout,
+            lut_sampler,
+            no_lut,
+            luts: std::collections::HashMap::new(),
+            layer_luts: Vec::new(),
+            blended: Vec::new(),
             sampler,
             slots: Vec::new(),
             instances: None,
@@ -391,9 +856,13 @@ impl Compositor {
             nv12_target: None,
             readbacks: Vec::new(),
             in_flight: std::collections::VecDeque::new(),
-            adapter: name,
-            software: cpu || config.software,
+            adapter,
+            software,
             background: wgpu::Color::BLACK,
+            effects: Vec::new(),
+            effect_pipeline,
+            dummy_layer,
+            plugins,
         })
     }
 
@@ -465,16 +934,41 @@ impl Compositor {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let backdrop = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("backdrop"),
+            size: extent(size),
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let backdrop_view = backdrop.create_view(&wgpu::TextureViewDescriptor::default());
+        let backdrop_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("backdrop"),
+            layout: &self.backdrop_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&backdrop_view),
+            }],
+        });
         self.target = Some(Target {
             size,
             texture,
             readback,
             padded_row,
+            backdrop,
+            backdrop_bind,
         });
         self.nv12_target = None;
     }
 
     /// 上传各层像素和参数（槽位按尺寸复用）。
+    #[expect(
+        clippy::too_many_lines,
+        reason = "每层的几何、颜色、外观、查找表参数一起打包，拆开反而难对照着色器"
+    )]
     fn upload(&mut self, size: (u32, u32), layers: &[Layer<'_>]) -> Result<(), RenderError> {
         let max = self.max_texture_size();
         if size.0 == 0 || size.1 == 0 || size.0 > max || size.1 > max {
@@ -493,7 +987,10 @@ impl Compositor {
             }
         }
         let (cw, ch) = (f64::from(size.0), f64::from(size.1));
+        let short = to_f32(cw.min(ch));
         let mut instances = Vec::with_capacity(layers.len());
+        self.blended.clear();
+        self.layer_luts.clear();
         for (i, layer) in layers.iter().enumerate() {
             let pix = layer.pixels.size();
             if self.slots.get(i).is_none_or(|s| s.size != pix) {
@@ -531,15 +1028,74 @@ impl Compositor {
                 )
             };
             let [tl, tr, br, bl] = layer.geometry.corners().map(ndc);
+            let shown = layer.geometry.shown;
+            let lp = look_params(&layer.look, (shown.w, shown.h), short, layer.geometry.angle);
+            #[expect(clippy::cast_precision_loss, reason = "混合模式编号很小")]
+            let blend = layer.look.blend.code() as f32;
+            self.blended
+                .push(layer.look.blend != ve_core::BlendMode::Normal);
+            // 进阶调色：整条链烘焙成查找表（同样的链只烘一次）
+            let lut = (!layer.grades.is_empty()).then(|| chain_key(layer.grades));
+            if let Some(key) = lut
+                && !self.luts.contains_key(&key)
+            {
+                if self.luts.len() >= LUT_CACHE {
+                    self.luts.clear();
+                }
+                let n = u32::try_from(ve_core::grade::BAKE_SIZE).unwrap_or(33);
+                let table = ve_core::grade::bake(layer.grades);
+                let bind = lut_bind(
+                    &self.device,
+                    &self.queue,
+                    &self.lut_layout,
+                    &self.lut_sampler,
+                    n,
+                    &table,
+                );
+                self.luts.insert(key, bind);
+            }
+            self.layer_luts.push(lut);
             instances.push(LayerInstance {
                 top: [tl.0, tl.1, tr.0, tr.1],
                 bottom: [bl.0, bl.1, br.0, br.1],
                 uv: [uv.x, uv.y, uv.x + uv.w, uv.y + uv.h],
-                opacity: layer.opacity.clamp(0.0, 1.0),
+                p0: [
+                    layer.opacity.clamp(0.0, 1.0),
+                    // 用查找表时矩阵已经在链里了
+                    if layer.color.is_identity() || lut.is_some() {
+                        0.0
+                    } else {
+                        1.0
+                    },
+                    blend,
+                    lp.radius,
+                ],
                 red,
                 green,
                 blue,
-                colored: if layer.color.is_identity() { 0.0 } else { 1.0 },
+                sizes: lp.sizes,
+                stroke: lp.stroke,
+                shadow: lp.shadow,
+                shadow2: lp.shadow2,
+                mask: lp.mask,
+                mask2: lp.mask2,
+                key: lp.key,
+                key2: [
+                    lp.key2[0],
+                    lp.key2[1],
+                    if lut.is_some() { 1.0 } else { 0.0 },
+                    0.0,
+                ],
+            });
+        }
+        // 画面特效：每道一个铺满画布的四边形，参数是（种类、强度、秒数）
+        for e in &self.effects {
+            instances.push(LayerInstance {
+                top: [-1.0, 1.0, 1.0, 1.0],
+                bottom: [-1.0, -1.0, 1.0, -1.0],
+                p0: [e.effect.kind.code(), e.effect.amount, e.seconds, 0.0],
+                sizes: [to_f32(cw), to_f32(ch), 0.0, 0.0],
+                ..LayerInstance::zeroed()
             });
         }
         self.write_instances(&instances);
@@ -571,6 +1127,13 @@ impl Compositor {
         }
     }
 
+    /// 画面特效：之后合成的帧都按它做，直到再设。[`ve_core::EffectPass::after`] 是合成时传入的
+    /// 图层下标（画完前这么多层以后做这道特效），超过层数的当作画完所有层以后。
+    pub fn set_effects(&mut self, effects: &[ve_core::EffectPass]) {
+        self.effects.clear();
+        self.effects.extend_from_slice(effects);
+    }
+
     /// 底色：黑色经 `color` 调色后的颜色（调节片段作用在没有画面的地方）；之后合成的帧都用它，
     /// 直到再设。
     pub fn set_background(&mut self, color: &ve_core::ColorMatrix) {
@@ -578,30 +1141,227 @@ impl Compositor {
         self.background = wgpu::Color { r, g, b, a: 1.0 };
     }
 
-    /// 把各层画到输出纹理上（底色见 [`Self::set_background`]）。
-    fn draw(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, count: usize) {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+    /// 底色：黑色经调色链调色后的颜色（调节片段用了进阶调色时）；链是空的时按 `color` 的矩阵。
+    pub fn set_background_chain(
+        &mut self,
+        color: &ve_core::ColorMatrix,
+        chain: &[ve_core::GradeStep],
+    ) {
+        if chain.is_empty() {
+            self.set_background(color);
+            return;
+        }
+        let [r, g, b] = ve_core::grade::apply_chain(chain, [0.0, 0.0, 0.0]).map(f64::from);
+        self.background = wgpu::Color { r, g, b, a: 1.0 };
+    }
+
+    /// 第 `i` 层的查找表绑定组。
+    fn lut_for(&self, i: usize) -> &wgpu::BindGroup {
+        self.layer_luts
+            .get(i)
+            .copied()
+            .flatten()
+            .and_then(|k| self.luts.get(&k))
+            .unwrap_or(&self.no_lut)
+    }
+
+    /// 开一个画到输出纹理上的渲染通道：第一次清成底色，之后接着画。
+    fn begin_pass<'e>(
+        &self,
+        encoder: &'e mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        clear: bool,
+    ) -> wgpu::RenderPass<'e> {
+        let load = if clear {
+            wgpu::LoadOp::Clear(self.background)
+        } else {
+            wgpu::LoadOp::Load
+        };
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("compose"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(self.background),
+                    load,
                     store: wgpu::StoreOp::Store,
                 },
             })],
             ..Default::default()
-        });
-        pass.set_pipeline(&self.pipeline);
-        let Some((instances, _)) = &self.instances else {
+        })
+    }
+
+    /// 把各层画到输出纹理上（底色见 [`Self::set_background`]）。普通图层连着画在一个通道里；
+    /// 混合模式图层先把画到这里的结果拷成底图，再单独画它（读底图、直接写回）；
+    /// 画面特效在它压着的那几层画完后做：同样拷成底图，再整个画面重画。
+    fn draw(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, count: usize) {
+        let (Some((instances, _)), Some(target)) = (&self.instances, &self.target) else {
+            drop(self.begin_pass(encoder, view, true));
             return;
         };
-        pass.set_vertex_buffer(0, instances.slice(..));
-        for (i, slot) in (0u32..).zip(&self.slots[..count]) {
-            pass.set_bind_group(0, &slot.bind, &[]);
-            pass.draw(0..6, i..i + 1);
+        // 第 k 道特效在画完前 after 层后做（超出层数的放最后）
+        let effect_at = |k: usize| self.effects[k].after.min(count);
+        let mut first = true;
+        let mut next_effect = 0;
+        let mut start = 0;
+        loop {
+            // 压在前 start 层上的特效
+            while next_effect < self.effects.len() && effect_at(next_effect) <= start {
+                if first {
+                    drop(self.begin_pass(encoder, view, true));
+                    first = false;
+                }
+                let n = u32::try_from(count + next_effect).unwrap_or(u32::MAX);
+                let e = self.effects[next_effect].effect;
+                let plugin = (e.kind == ve_core::EffectKind::Plugin)
+                    .then(|| self.plugin_pipeline(e.plugin.as_str()));
+                match plugin {
+                    // 插件没登记或编译不过：跳过这道
+                    Some(None) => {}
+                    Some(Some(p)) => self.backdrop_pass(
+                        encoder,
+                        view,
+                        target,
+                        instances,
+                        &self.dummy_layer,
+                        n,
+                        &p,
+                        true,
+                    ),
+                    None => self.backdrop_pass(
+                        encoder,
+                        view,
+                        target,
+                        instances,
+                        &self.dummy_layer,
+                        n,
+                        &self.effect_pipeline,
+                        true,
+                    ),
+                }
+                next_effect += 1;
+            }
+            if start >= count {
+                break;
+            }
+            if self.blended.get(start).copied().unwrap_or(false) {
+                if first {
+                    drop(self.begin_pass(encoder, view, true));
+                    first = false;
+                }
+                let n = u32::try_from(start).unwrap_or(u32::MAX);
+                let bind = &self.slots[start].bind;
+                self.backdrop_pass(
+                    encoder,
+                    view,
+                    target,
+                    instances,
+                    bind,
+                    n,
+                    &self.blend_pipeline,
+                    false,
+                );
+                start += 1;
+                continue;
+            }
+            // 一段连续的普通图层：到下一个混合模式图层或下一道特效为止
+            let stop = if next_effect < self.effects.len() {
+                effect_at(next_effect)
+            } else {
+                count
+            };
+            let end = (start..stop)
+                .find(|&i| self.blended.get(i).copied().unwrap_or(false))
+                .unwrap_or(stop)
+                .max(start + 1)
+                .min(count);
+            let mut pass = self.begin_pass(encoder, view, first);
+            first = false;
+            pass.set_pipeline(&self.pipeline);
+            pass.set_vertex_buffer(0, instances.slice(..));
+            pass.set_bind_group(1, &target.backdrop_bind, &[]);
+            for i in start..end {
+                let n = u32::try_from(i).unwrap_or(u32::MAX);
+                pass.set_bind_group(0, &self.slots[i].bind, &[]);
+                pass.set_bind_group(2, self.lut_for(i), &[]);
+                pass.draw(0..6, n..n + 1);
+            }
+            drop(pass);
+            start = end;
         }
+        if first {
+            drop(self.begin_pass(encoder, view, true));
+        }
+    }
+
+    /// 插件 `name` 的管线：第一次用到时编译（拼上内置着色器）；没登记、编译失败返回 `None`（跳过这道）。
+    fn plugin_pipeline(&self, name: &str) -> Option<wgpu::RenderPipeline> {
+        use std::hash::{Hash as _, Hasher as _};
+        let source = crate::plugin::source(name)?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        source.hash(&mut h);
+        let key = (name.to_owned(), h.finish());
+        let mut cache = self
+            .plugins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                // 登记时已经检查过；这里再兜一层，编译出错不让整个程序崩。naga 检查通过、
+                // 显卡后端（DX12 的着色器编译器）编不过的算内部错误，也要接住
+                let internal = self.device.push_error_scope(wgpu::ErrorFilter::Internal);
+                let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let layouts = [&self.layout, &self.backdrop_layout, &self.lut_layout];
+                let full = crate::plugin::full_source(&source);
+                let pipeline = pipeline_from(
+                    &self.device,
+                    layouts,
+                    &full,
+                    crate::plugin::ENTRY_POINT,
+                    false,
+                );
+                let failed = pollster::block_on(scope.pop());
+                let failed = failed.or_else(|| pollster::block_on(internal.pop()));
+                failed.map_or(Some(pipeline), |e| {
+                    log::warn!("插件特效 {name} 编译失败：{e}");
+                    None
+                })
+            })
+            .clone()
+    }
+
+    /// 读底图的一道：把画到这里的结果拷成底图，再画第 `n` 个实例（混合模式图层或画面特效）。
+    #[expect(clippy::too_many_arguments, reason = "绘制参数，拆成结构体反而难读")]
+    fn backdrop_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        target: &Target,
+        instances: &wgpu::Buffer,
+        layer: &wgpu::BindGroup,
+        n: u32,
+        pipeline: &wgpu::RenderPipeline,
+        effect: bool,
+    ) {
+        encoder.copy_texture_to_texture(
+            target.texture.as_image_copy(),
+            target.backdrop.as_image_copy(),
+            extent(target.size),
+        );
+        let mut pass = self.begin_pass(encoder, view, false);
+        pass.set_pipeline(pipeline);
+        pass.set_vertex_buffer(0, instances.slice(..));
+        pass.set_bind_group(0, layer, &[]);
+        let lut = if effect {
+            &self.no_lut
+        } else {
+            self.lut_for(n as usize)
+        };
+        pass.set_bind_group(2, lut, &[]);
+        pass.set_bind_group(1, &target.backdrop_bind, &[]);
+        pass.draw(0..6, n..n + 1);
     }
 
     /// 上传并画到输出纹理，返回编码器（还没提交）。
@@ -780,7 +1540,7 @@ impl Compositor {
         self.device
             .poll(wgpu::PollType::Wait {
                 submission_index: Some(frame.submission),
-                timeout: None,
+                timeout: Some(GPU_WAIT),
             })
             .map_err(|e| RenderError::Device(e.to_string()))?;
         for _ in 0..2 {
@@ -992,7 +1752,10 @@ fn read_back(
         let _ = tx.send(r);
     });
     device
-        .poll(wgpu::PollType::wait_indefinitely())
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(GPU_WAIT),
+        })
         .map_err(|e| RenderError::Device(e.to_string()))?;
     rx.recv()
         .map_err(|e| RenderError::Device(e.to_string()))?
@@ -1060,6 +1823,8 @@ mod tests {
             geometry,
             opacity,
             color: ve_core::ColorMatrix::IDENTITY,
+            look: ve_core::Look::NONE,
+            grades: &[],
         }
     }
 
@@ -1145,6 +1910,345 @@ mod tests {
         // 没转时横条覆盖的地方，现在是黑的
         assert!(near(px(&out, 18, 18), [0, 0, 0], 0));
         assert!(near(px(&out, 45, 18), [0, 0, 0], 0));
+    }
+
+    fn with_look(mut l: Layer<'_>, look: ve_core::Look) -> Layer<'_> {
+        l.look = look;
+        l
+    }
+
+    fn compose(c: &mut Compositor, layers: &[Layer<'_>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        c.compose_bgra(SIZE, layers, &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::shadow_unrelated,
+        reason = "测试：0–255 的期望值"
+    )]
+    fn blend_modes_match_the_formulas() {
+        use ve_core::BlendMode;
+        let mut c = compositor();
+        let base = solid(2, 2, [128, 128, 128, 255]);
+        let top = solid(2, 2, [64, 128, 192, 255]);
+        for mode in BlendMode::ALL {
+            let look = ve_core::Look {
+                blend: mode,
+                ..ve_core::Look::NONE
+            };
+            // 底下一层普通的、上面再叠一层同样模式的：两层混合模式要能连着用
+            let out = compose(
+                &mut c,
+                &[
+                    layer(&base, 2, 2, FULL, 1.0),
+                    with_look(layer(&top, 2, 2, FULL, 1.0), look),
+                ],
+            );
+            let want = [64u8, 128, 192].map(|s| {
+                let v = mode.channel(128.0 / 255.0, f32::from(s) / 255.0);
+                (v * 255.0).round() as u8
+            });
+            assert!(
+                near(px(&out, 32, 18), want, 2),
+                "{mode:?}: {:?} / {want:?}",
+                px(&out, 32, 18)
+            );
+        }
+        // 半透明：按不透明度在底色和混合结果之间
+        let multiply = ve_core::Look {
+            blend: BlendMode::Multiply,
+            ..ve_core::Look::NONE
+        };
+        let out = compose(
+            &mut c,
+            &[
+                layer(&base, 2, 2, FULL, 1.0),
+                with_look(layer(&top, 2, 2, FULL, 0.5), multiply),
+            ],
+        );
+        let want = [64.0f32, 128.0, 192.0].map(|s| {
+            let b = 128.0 / 255.0;
+            ((b * 0.5 + b * s / 255.0 * 0.5) * 255.0).round() as u8
+        });
+        assert!(near(px(&out, 32, 18), want, 2), "{:?}", px(&out, 32, 18));
+        // 两个混合模式图层叠在一起：第二个读到的底图里已经有第一个
+        let out = compose(
+            &mut c,
+            &[
+                layer(&base, 2, 2, FULL, 1.0),
+                with_look(layer(&top, 2, 2, FULL, 1.0), multiply),
+                with_look(layer(&top, 2, 2, FULL, 1.0), multiply),
+            ],
+        );
+        let want = [64.0f32, 128.0, 192.0].map(|s| {
+            let s = s / 255.0;
+            (128.0 / 255.0 * s * s * 255.0).round() as u8
+        });
+        assert!(near(px(&out, 32, 18), want, 2), "{:?}", px(&out, 32, 18));
+    }
+
+    #[test]
+    fn round_corners_cut_the_corners() {
+        let mut c = compositor();
+        let white = solid(2, 2, [255; 4]);
+        let look = ve_core::Look {
+            radius: 1.0,
+            ..ve_core::Look::NONE
+        };
+        let out = compose(&mut c, &[with_look(layer(&white, 2, 2, FULL, 1.0), look)]);
+        assert!(near(px(&out, 0, 0), [0, 0, 0], 1), "角上透出底色");
+        assert!(near(px(&out, 32, 18), [255, 255, 255], 1));
+        assert!(near(px(&out, 32, 1), [255, 255, 255], 1), "上边中间还在");
+    }
+
+    #[test]
+    #[expect(clippy::shadow_unrelated, reason = "测试：一次一次合成")]
+    fn stroke_rings_the_frame_and_shadow_falls_behind() {
+        let mut c = compositor();
+        let white = solid(2, 2, [255; 4]);
+        let gray = solid(2, 2, [100, 100, 100, 255]);
+        let inner = geom(16.0, 8.0, 32.0, 20.0);
+        let stroke = ve_core::Look {
+            stroke: Some(ve_core::Stroke {
+                color: 0xFF_0000,
+                width: 0.1,
+            }),
+            ..ve_core::Look::NONE
+        };
+        let out = compose(
+            &mut c,
+            &[with_look(layer(&white, 2, 2, inner, 1.0), stroke)],
+        );
+        // 描边 3.6 像素：左边外面 2 像素是红的，再往外是黑的，里面还是白的
+        assert!(
+            near(px(&out, 14, 18), [0, 0, 255], 2),
+            "{:?}",
+            px(&out, 14, 18)
+        );
+        assert!(near(px(&out, 8, 18), [0, 0, 0], 1));
+        assert!(near(px(&out, 20, 18), [255, 255, 255], 1));
+        // 阴影往右 3.6 像素、不模糊：画面右边外面变黑，左边外面还是灰的
+        let shadow = ve_core::Look {
+            shadow: Some(ve_core::Shadow {
+                color: 0,
+                opacity: 1.0,
+                blur: 0.0,
+                distance: 0.1,
+                angle: 0.0,
+            }),
+            ..ve_core::Look::NONE
+        };
+        let out = compose(
+            &mut c,
+            &[
+                layer(&gray, 2, 2, FULL, 1.0),
+                with_look(layer(&white, 2, 2, inner, 1.0), shadow),
+            ],
+        );
+        assert!(
+            near(px(&out, 50, 18), [0, 0, 0], 2),
+            "{:?}",
+            px(&out, 50, 18)
+        );
+        assert!(near(px(&out, 14, 18), [100, 100, 100], 2));
+        assert!(
+            near(px(&out, 30, 18), [255, 255, 255], 1),
+            "画面压在影子上面"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::shadow_unrelated, reason = "测试：一次一次合成")]
+    fn masks_keep_their_shape() {
+        use ve_core::{Mask, MaskShape};
+        let mut c = compositor();
+        let white = solid(2, 2, [255; 4]);
+        let look = |m: Mask| ve_core::Look {
+            mask: Some(m),
+            ..ve_core::Look::NONE
+        };
+        for shape in MaskShape::ALL {
+            let m = Mask::new(shape);
+            let out = compose(
+                &mut c,
+                &[with_look(layer(&white, 2, 2, FULL, 1.0), look(m))],
+            );
+            let center = if shape == MaskShape::Linear {
+                // 线性：留上面
+                px(&out, 32, 6)
+            } else {
+                px(&out, 32, 18)
+            };
+            assert!(
+                near(center, [255, 255, 255], 2),
+                "{shape:?} 中间留着：{center:?}"
+            );
+            assert!(near(px(&out, 1, 34), [0, 0, 0], 2), "{shape:?} 左下角去掉");
+            let inv = compose(
+                &mut c,
+                &[with_look(
+                    layer(&white, 2, 2, FULL, 1.0),
+                    look(Mask { invert: true, ..m }),
+                )],
+            );
+            assert!(near(px(&inv, 1, 34), [255, 255, 255], 2), "{shape:?} 反转");
+        }
+        // 镜面：上下边缘去掉，中间一条留着；转 90° 后变成竖的
+        let mirror = Mask::new(MaskShape::Mirror);
+        let out = compose(
+            &mut c,
+            &[with_look(layer(&white, 2, 2, FULL, 1.0), look(mirror))],
+        );
+        assert!(near(px(&out, 5, 18), [255, 255, 255], 2));
+        assert!(near(px(&out, 32, 2), [0, 0, 0], 2));
+        // 羽化：边上是灰的
+        let soft = Mask {
+            feather: 0.5,
+            ..Mask::new(MaskShape::Circle)
+        };
+        let out = compose(
+            &mut c,
+            &[with_look(layer(&white, 2, 2, FULL, 1.0), look(soft))],
+        );
+        let edge = px(&out, 32 + 9, 18)[0];
+        assert!(edge > 20 && edge < 235, "羽化后的边缘 {edge}");
+    }
+
+    #[test]
+    fn advanced_grades_match_the_cpu_chain() {
+        use std::sync::Arc;
+        let mut c = compositor();
+        // 几种颜色各一列：红、绿、蓝、灰、橙
+        let colors: [[u8; 3]; 5] = [
+            [220, 40, 40],
+            [40, 200, 60],
+            [30, 60, 230],
+            [128, 128, 128],
+            [240, 150, 30],
+        ];
+        let mut data = Vec::new();
+        for _ in 0..4 {
+            for rgb in colors {
+                data.extend([rgb[2], rgb[1], rgb[0], 255]);
+            }
+        }
+        let mut g = ve_core::Grade::default();
+        g.hsl[ve_core::HslBand::Red.index()].saturation = -0.8;
+        g.curves.luma = vec![(0.25, 0.15), (0.75, 0.9)];
+        g.wheels.highlights = [0.2, 0.0, -0.3];
+        let warm = ve_core::ColorAdjust {
+            temperature: 0.3,
+            contrast: 0.1,
+            ..ve_core::ColorAdjust::NONE
+        };
+        let chain = vec![ve_core::GradeStep {
+            input: None,
+            matrix: warm.matrix(),
+            grade: Some(Arc::new(g)),
+        }];
+        let mut l = layer(&data, 5, 4, FULL, 1.0);
+        l.grades = &chain;
+        let out = compose(&mut c, &[l]);
+        for (i, col) in colors.iter().enumerate() {
+            // 每一列的正中间（拉伸后线性过滤不混进旁边那一列）
+            let x = (2 * u32::try_from(i).unwrap() + 1) * 32 / 5;
+            let want = ve_core::grade::apply_chain(&chain, col.map(|v| f32::from(v) / 255.0));
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "0–1 的颜色"
+            )]
+            let want = [want[2], want[1], want[0]].map(|v| (v * 255.0).round() as u8);
+            // 33³ 的查找表（LUT 的通用尺寸）在中性色附近有几个色阶的插值误差：
+            // 灰的邻格是偏红的颜色，会被「红色降饱和」大幅改动
+            assert!(
+                near(px(&out, x, 18), want, 8),
+                "第 {i} 列：{:?} / {want:?}",
+                px(&out, x, 18)
+            );
+        }
+    }
+
+    #[test]
+    fn background_follows_the_adjustment_chain() {
+        use std::sync::Arc;
+        let mut c = compositor();
+        let mut g = ve_core::Grade::default();
+        g.wheels.offset = [0.4, 0.0, 0.0];
+        let chain = vec![ve_core::GradeStep {
+            input: None,
+            matrix: ve_core::ColorMatrix::IDENTITY,
+            grade: Some(Arc::new(g)),
+        }];
+        c.set_background_chain(&ve_core::ColorMatrix::IDENTITY, &chain);
+        let out = compose(&mut c, &[]);
+        assert!(
+            near(px(&out, 1, 1), [0, 0, 26], 2),
+            "黑底偏红：{:?}",
+            px(&out, 1, 1)
+        );
+    }
+
+    #[test]
+    fn stroke_follows_the_mask_shape() {
+        use ve_core::{Mask, MaskShape};
+        let mut c = compositor();
+        let white = solid(2, 2, [255; 4]);
+        // 圆形蒙版（直径 = 画面高的一半 = 18 像素）+ 红色描边 2 像素
+        let look = ve_core::Look {
+            mask: Some(Mask::new(MaskShape::Circle)),
+            stroke: Some(ve_core::Stroke {
+                color: 0xFF_0000,
+                width: 2.0 / 36.0,
+            }),
+            ..ve_core::Look::NONE
+        };
+        let out = compose(&mut c, &[with_look(layer(&white, 2, 2, FULL, 1.0), look)]);
+        // 圆的上边在 y = 18 - 9 = 9：上面 1 像素是描边
+        assert!(
+            near(px(&out, 32, 8), [0, 0, 255], 40),
+            "{:?}",
+            px(&out, 32, 8)
+        );
+        assert!(near(px(&out, 32, 18), [255, 255, 255], 2));
+        // 画面框的边上不再有描边
+        assert!(near(px(&out, 32, 0), [0, 0, 0], 2), "{:?}", px(&out, 32, 0));
+    }
+
+    #[test]
+    #[expect(clippy::shadow_unrelated, reason = "测试：一次一次合成")]
+    fn chroma_key_removes_green_and_keeps_red() {
+        let mut c = compositor();
+        let green = solid(2, 2, [0, 255, 0, 255]);
+        let red = solid(2, 2, [0, 0, 255, 255]);
+        let gray = solid(2, 2, [100, 100, 100, 255]);
+        let key = ve_core::Look {
+            chroma: Some(ve_core::ChromaKey::default()),
+            ..ve_core::Look::NONE
+        };
+        let out = compose(
+            &mut c,
+            &[
+                layer(&gray, 2, 2, FULL, 1.0),
+                with_look(layer(&green, 2, 2, FULL, 1.0), key),
+            ],
+        );
+        assert!(
+            near(px(&out, 32, 18), [100, 100, 100], 2),
+            "绿色抠掉，露出下面"
+        );
+        let out = compose(
+            &mut c,
+            &[
+                layer(&gray, 2, 2, FULL, 1.0),
+                with_look(layer(&red, 2, 2, FULL, 1.0), key),
+            ],
+        );
+        assert!(near(px(&out, 32, 18), [0, 0, 255], 2), "红色留着");
     }
 
     #[test]
@@ -1239,6 +2343,154 @@ mod tests {
         comp.set_background(&ve_core::ColorMatrix::IDENTITY);
         comp.compose_bgra(SIZE, &[], &mut out).unwrap();
         assert_eq!(px(&out, 56, 18), [0, 0, 0, 255]);
+    }
+
+    fn pass(
+        after: usize,
+        kind: ve_core::EffectKind,
+        amount: f32,
+        seconds: f32,
+    ) -> ve_core::EffectPass {
+        ve_core::EffectPass {
+            after,
+            effect: ve_core::Effect {
+                kind,
+                amount,
+                plugin: ve_core::effect::PluginName::EMPTY,
+            },
+            seconds,
+        }
+    }
+
+    /// 左半红、右半蓝的整幅图层。
+    fn red_blue() -> Vec<u8> {
+        let mut tex = Vec::new();
+        for _ in 0..36 {
+            tex.extend(solid(32, 1, [0, 0, 255, 255]));
+            tex.extend(solid(32, 1, [255, 0, 0, 255]));
+        }
+        tex
+    }
+
+    #[test]
+    fn effects_apply_to_what_is_below_them() {
+        use ve_core::EffectKind as K;
+        let mut c = compositor();
+        let white = solid(2, 2, [255, 255, 255, 255]);
+        let mut out = Vec::new();
+        // 暗角：中心不动、角落变黑
+        c.set_effects(&[pass(1, K::Vignette, 1.0, 0.0)]);
+        c.compose_bgra(SIZE, &[layer(&white, 2, 2, FULL, 1.0)], &mut out)
+            .unwrap();
+        assert!(near(px(&out, 32, 18), [255, 255, 255], 3));
+        assert!(px(&out, 0, 0)[0] < 30, "{:?}", px(&out, 0, 0));
+        // 闪白：片段开头整个变白、快到一秒时退回原样
+        let blue = solid(2, 2, [255, 0, 0, 255]);
+        c.set_effects(&[pass(1, K::Flash, 1.0, 0.0)]);
+        c.compose_bgra(SIZE, &[layer(&blue, 2, 2, FULL, 1.0)], &mut out)
+            .unwrap();
+        assert!(near(px(&out, 10, 10), [255, 255, 255], 3));
+        c.set_effects(&[pass(1, K::Flash, 1.0, 0.95)]);
+        c.compose_bgra(SIZE, &[layer(&blue, 2, 2, FULL, 1.0)], &mut out)
+            .unwrap();
+        assert!(
+            near(px(&out, 10, 10), [255, 0, 0], 3),
+            "{:?}",
+            px(&out, 10, 10)
+        );
+        // 特效只压在它下面：闪白在第 0 层之前（只作用于黑底），上面盖左半边的蓝不受影响
+        let mut half = FULL;
+        half.full.w = 32.0;
+        half.shown = half.full;
+        half.center = (16.0, 18.0);
+        c.set_effects(&[pass(0, K::Flash, 1.0, 0.0)]);
+        c.compose_bgra(SIZE, &[layer(&blue, 2, 2, half, 1.0)], &mut out)
+            .unwrap();
+        assert!(
+            near(px(&out, 8, 18), [255, 0, 0], 2),
+            "{:?}",
+            px(&out, 8, 18)
+        );
+        assert!(near(px(&out, 56, 18), [255, 255, 255], 2));
+        // 没有图层也照样做（黑底上闪白）
+        c.compose_bgra(SIZE, &[], &mut out).unwrap();
+        assert!(near(px(&out, 56, 18), [255, 255, 255], 2));
+        c.set_effects(&[]);
+        c.compose_bgra(SIZE, &[], &mut out).unwrap();
+        assert_eq!(px(&out, 56, 18), [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn plugin_effects_run_their_wgsl_and_unknown_ones_are_skipped() {
+        crate::plugin::register(
+            "合成器测试反色",
+            "fn plugin_effect(c: vec3<f32>, p: vec2<f32>, dims: vec2<f32>, amount: f32, t: f32) -> vec3<f32> { return mix(c, vec3(1.0) - c, amount); }",
+        )
+        .unwrap();
+        let mut c = compositor();
+        let blue = solid(2, 2, [255, 0, 0, 255]);
+        let mut out = Vec::new();
+        let mut e = pass(1, ve_core::EffectKind::Plugin, 1.0, 0.0);
+        e.effect.plugin = ve_core::effect::PluginName::new("合成器测试反色").unwrap();
+        c.set_effects(&[e]);
+        c.compose_bgra(SIZE, &[layer(&blue, 2, 2, FULL, 1.0)], &mut out)
+            .unwrap();
+        assert!(
+            near(px(&out, 10, 10), [0, 255, 255], 2),
+            "蓝反成黄 {:?}",
+            px(&out, 10, 10)
+        );
+        // 没登记的插件：跳过，画面不变
+        e.effect.plugin = ve_core::effect::PluginName::new("没有这个插件").unwrap();
+        c.set_effects(&[e]);
+        c.compose_bgra(SIZE, &[layer(&blue, 2, 2, FULL, 1.0)], &mut out)
+            .unwrap();
+        assert!(near(px(&out, 10, 10), [255, 0, 0], 2));
+    }
+
+    #[test]
+    fn spatial_effects_mix_neighbouring_pixels() {
+        use ve_core::EffectKind as K;
+        let mut c = compositor();
+        let tex = red_blue();
+        let mut out = Vec::new();
+        let run = |comp: &mut Compositor, e: ve_core::EffectPass, buf: &mut Vec<u8>| {
+            comp.set_effects(&[e]);
+            comp.compose_bgra(SIZE, &[layer(&tex, 64, 36, FULL, 1.0)], buf)
+                .unwrap();
+        };
+        // 模糊：分界处红蓝混在一起，远处不变
+        run(&mut c, pass(1, K::Blur, 1.0, 0.0), &mut out);
+        let edge = px(&out, 32, 18);
+        assert!(edge[0] > 40 && edge[2] > 40, "分界处 {edge:?}");
+        assert!(near(px(&out, 2, 18), [0, 0, 255], 3));
+        // RGB 色差：分界左边一点点出现蓝（蓝通道往左挪）
+        run(&mut c, pass(1, K::ChromaShift, 1.0, 0.0), &mut out);
+        let left = px(&out, 31, 18);
+        assert!(left[0] > 200 && left[2] > 200, "分界左边 {left:?}");
+        // 锐化：纯色区域不变
+        run(&mut c, pass(1, K::Sharpen, 1.0, 0.0), &mut out);
+        assert!(near(px(&out, 10, 18), [0, 0, 255], 2));
+        // 颗粒：纯色上出现起伏，换个时刻噪点不同
+        run(&mut c, pass(1, K::Grain, 1.0, 0.0), &mut out);
+        let a: Vec<u8> = (0..20).map(|x| px(&out, x, 5)[2]).collect();
+        assert!(a.iter().any(|&v| v < 240), "有暗下去的点 {a:?}");
+        run(&mut c, pass(1, K::Grain, 1.0, 0.5), &mut out);
+        let b: Vec<u8> = (0..20).map(|x| px(&out, x, 5)[2]).collect();
+        assert_ne!(a, b);
+        // 马赛克：同一个方块里颜色一样
+        run(&mut c, pass(1, K::Mosaic, 1.0, 0.0), &mut out);
+        assert_eq!(px(&out, 0, 0), px(&out, 1, 1));
+        // 强度 0 的马赛克：和不加一样
+        run(&mut c, pass(1, K::Mosaic, 0.0, 0.0), &mut out);
+        let mosaic_off = out.clone();
+        c.set_effects(&[]);
+        c.compose_bgra(SIZE, &[layer(&tex, 64, 36, FULL, 1.0)], &mut out)
+            .unwrap();
+        assert_eq!(mosaic_off, out);
+        // 发光：纯红纯蓝都不到发光阈值以上的白，颜色只会更亮不会变暗
+        run(&mut c, pass(1, K::Glow, 1.0, 0.0), &mut out);
+        assert!(px(&out, 10, 18)[2] >= 250);
     }
 
     #[test]

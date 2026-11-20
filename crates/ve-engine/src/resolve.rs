@@ -42,6 +42,12 @@ pub struct AudioSegment {
     pub speed: f32,
     /// 变速时保持音调。
     pub keep_pitch: bool,
+    /// 片段在时间轴上的起点（音量关键帧的时间相对它）。
+    pub clip_start: Time,
+    /// 音量关键帧（dB，时间相对片段起点）；空的时候用 `gain`。
+    pub volume: Vec<ve_core::Key>,
+    /// 声音处理（降噪、均衡、压缩）。
+    pub fx: ve_core::AudioFx,
 }
 
 /// dB 转线性增益。
@@ -95,25 +101,32 @@ pub fn resolve_audio(project: &Project, from: Time, len: Time) -> Vec<AudioSegme
             let Some(sound) = ve_core::compose::audio_span(project, clip.id) else {
                 continue;
             };
-            let start = sound.start.max(from);
-            let end = sound.end.min(to);
-            if end <= start {
-                continue;
+            // 曲线变速的片段分成若干小段，各按那一段的倍数放（和导出同一套切法）
+            for piece in ve_core::compose::audio_pieces(clip, &sound) {
+                let start = piece.start.max(from);
+                let end = (piece.start + piece.len).min(to);
+                if end <= start {
+                    continue;
+                }
+                out.push(AudioSegment {
+                    asset,
+                    clip: clip.id,
+                    source_start: piece.source_start
+                        + (start - piece.start).scaled(f64::from(piece.speed)),
+                    timeline_start: start,
+                    duration: end - start,
+                    gain: db_to_gain(clip.gain_db),
+                    fade_in: sound.fade_in,
+                    fade_out: sound.fade_out,
+                    sound_start: sound.start,
+                    sound_end: sound.end,
+                    speed: piece.speed,
+                    keep_pitch: clip.keep_pitch,
+                    clip_start: clip.start,
+                    volume: clip.animation.keys(ve_core::Prop::Volume).to_vec(),
+                    fx: clip.audio_fx,
+                });
             }
-            out.push(AudioSegment {
-                asset,
-                clip: clip.id,
-                source_start: clip.source_at(start - clip.start).max(Time::ZERO),
-                timeline_start: start,
-                duration: end - start,
-                gain: db_to_gain(clip.gain_db),
-                fade_in: sound.fade_in,
-                fade_out: sound.fade_out,
-                sound_start: sound.start,
-                sound_end: sound.end,
-                speed: clip.speed,
-                keep_pitch: clip.keep_pitch,
-            });
         }
     }
     out
@@ -125,6 +138,61 @@ pub fn resolve_subtitles(project: &Project, t: Time) -> Vec<&str> {
     resolve_subtitle_poses(project, t)
         .into_iter()
         .map(|(text, _)| text)
+        .collect()
+}
+
+/// 一条正在显示的字幕：文字、这一刻的样子（位置、大小、不透明度）、样式，
+/// 逐字入场时每个字的（不透明度，缩放）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubtitleShow<'a> {
+    /// 文字。
+    pub text: &'a str,
+    /// 这一刻的样子。
+    pub state: ve_core::TextState,
+    /// 样式（这一条自己的，没有时是工程的）。
+    pub style: &'a ve_core::SubtitleStyle,
+    /// 逐字入场还没全出来时，每个字（不含换行）的（不透明度，缩放）。
+    pub chars: Option<Vec<(f32, f32)>>,
+}
+
+/// 时刻 `t` 要显示的字幕（和导出的 ASS 按同一套公式）。
+#[must_use]
+pub fn resolve_subtitle_shows(project: &Project, t: Time) -> Vec<SubtitleShow<'_>> {
+    project
+        .timeline
+        .tracks
+        .iter()
+        .filter(|tr| tr.kind == TrackKind::Subtitle && tr.shows())
+        .filter_map(|tr| {
+            let c = tr.clip_at(t).filter(|c| c.enabled())?;
+            let text = c.subtitle_text()?;
+            let offset = t - c.start;
+            let motion = c.text_motion().unwrap_or_default();
+            let n = text.chars().filter(|ch| *ch != '\n').count();
+            let chars = (motion.intro.per_char()
+                && offset
+                    < ve_core::text_motion::char_len(c.duration, n)
+                        + ve_core::text_motion::CHAR_FADE)
+                .then(|| {
+                    (0..n)
+                        .map(|i| {
+                            ve_core::text_motion::char_reveal(
+                                motion.intro,
+                                i,
+                                n,
+                                offset,
+                                c.duration,
+                            )
+                        })
+                        .collect()
+                });
+            Some(SubtitleShow {
+                text,
+                state: ve_core::text_state(c, offset),
+                style: c.own_subtitle_style().unwrap_or(&project.subtitle_style),
+                chars,
+            })
+        })
         .collect()
 }
 
@@ -315,7 +383,24 @@ mod tests {
         let m = ve_core::TextMotion {
             intro: ve_core::TextIn::FadeIn,
             outro: ve_core::TextOut::None,
+            ..ve_core::TextMotion::default()
         };
+        ve_core::edit::set_text_motion(&mut p, &[ids.s1], m).unwrap();
+        let shows = resolve_subtitle_shows(&p, Time::from_millis(1250));
+        assert!((shows[0].state.alpha - 0.5).abs() < 1e-4 && shows[0].chars.is_none());
+        // 打字机：第二个字还没出来
+        let tw = ve_core::TextMotion {
+            intro: ve_core::TextIn::Typewriter,
+            ..ve_core::TextMotion::default()
+        };
+        ve_core::edit::set_text_motion(&mut p, &[ids.s1], tw).unwrap();
+        let typing = resolve_subtitle_shows(&p, Time::from_millis(1050));
+        assert_eq!(typing[0].chars, Some(vec![(1.0, 1.0), (0.0, 1.0)]));
+        assert!(
+            resolve_subtitle_shows(&p, Time::from_secs(2))[0]
+                .chars
+                .is_none()
+        );
         ve_core::edit::set_text_motion(&mut p, &[ids.s1], m).unwrap();
         // s1 在 1–3 秒：1.25 秒时渐显到一半
         let poses = resolve_subtitle_poses(&p, Time::from_millis(1250));

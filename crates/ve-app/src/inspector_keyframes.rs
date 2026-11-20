@@ -15,7 +15,7 @@ use gpui_kit::{
 use ve_core::edit::{
     add_keyframe, add_keyframe_props, remove_keyframe, remove_keyframe_props, set_keyframe_easing,
 };
-use ve_core::{ClipId, Easing, KeyGroup, Time};
+use ve_core::{ClipId, Easing, KeyGroup, Prop, Time};
 
 /// 缓动按钮：（id，文字，缓动）。
 const EASINGS: [(&str, &str, Easing); 4] = [
@@ -42,7 +42,7 @@ struct KeyState {
 
 impl Workspace {
     fn key_state(&self) -> Option<KeyState> {
-        let (clip, ..) = self.bound_video_clip()?;
+        let (clip, ..) = self.bound_visual_clip()?;
         let (_, c) = self.doc.project.timeline.find_clip(clip)?;
         let offset = self.playhead - c.start;
         Some(KeyState {
@@ -50,8 +50,8 @@ impl Workspace {
             start: c.start,
             offset,
             on_clip: offset >= Time::ZERO && offset < c.duration,
-            times: c.animation.times(),
-            easing_here: c.animation.easing_at(offset),
+            times: c.animation.times_of(&Prop::TRANSFORM),
+            easing_here: c.animation.easing_of(&Prop::TRANSFORM, offset),
         })
     }
 
@@ -65,7 +65,7 @@ impl Workspace {
         } else {
             self.apply(window, cx, |p| add_keyframe(p, k.clip, k.offset));
         }
-        if let Some((_, t, _)) = self.bound_video_clip() {
+        if let Some((_, t, _)) = self.bound_visual_clip() {
             self.fill_transform(&t, window, cx);
         }
     }
@@ -86,8 +86,21 @@ impl Workspace {
     fn set_easing_here(&mut self, easing: Easing, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some(k) = self.key_state() else { return };
         self.apply(window, cx, |p| {
-            set_keyframe_easing(p, k.clip, k.offset, easing)
+            set_keyframe_easing(p, k.clip, k.offset, &Prop::TRANSFORM, easing)
         });
+    }
+
+    /// 选中的那一个片段（任何轨道）和播放头的关系：（片段，起点，播放头相对起点，播放头在片段上）。
+    fn bound_offset(&self) -> Option<(ClipId, Time, Time, bool)> {
+        let clip = self.inspector.bound?;
+        let (_, c) = self.doc.project.timeline.find_clip(clip)?;
+        let offset = self.playhead - c.start;
+        Some((
+            clip,
+            c.start,
+            offset,
+            offset >= Time::ZERO && offset < c.duration,
+        ))
     }
 
     /// 某一行（属性组）的 ◇：播放头在这组的关键帧上时删掉，否则只给这组打一个。
@@ -97,7 +110,18 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(k) = self.key_state().filter(|k| k.on_clip) else {
+        let Some(k) = self
+            .bound_offset()
+            .map(|(clip, start, offset, on_clip)| KeyState {
+                clip,
+                start,
+                offset,
+                on_clip,
+                times: Vec::new(),
+                easing_here: None,
+            })
+            .filter(|k| k.on_clip)
+        else {
             return;
         };
         let props = group.props();
@@ -116,22 +140,25 @@ impl Workspace {
                 add_keyframe_props(p, k.clip, k.offset, props)
             });
         }
-        if let Some((_, t, _)) = self.bound_video_clip() {
+        if let Some((_, t, _)) = self.bound_visual_clip() {
             self.fill_transform(&t, window, cx);
         }
+        self.refresh_animated_sliders(true, window, cx);
     }
 
     /// 跳到这一组的上一个 / 下一个关键帧。
     fn jump_group_key(&mut self, group: KeyGroup, forward: bool, cx: &mut Context<'_, Self>) {
-        let Some(k) = self.key_state() else { return };
-        let times = self.group_times(k.clip, group);
+        let Some((clip, start, offset, _)) = self.bound_offset() else {
+            return;
+        };
+        let times = self.group_times(clip, group);
         let target = if forward {
-            times.iter().find(|t| **t > k.offset)
+            times.iter().find(|t| **t > offset)
         } else {
-            times.iter().rev().find(|t| **t < k.offset)
+            times.iter().rev().find(|t| **t < offset)
         };
         if let Some(t) = target {
-            self.seek(k.start + *t, cx);
+            self.seek(start + *t, cx);
         }
     }
 
@@ -156,6 +183,12 @@ impl Workspace {
             KeyGroup::Rotation => "rot",
             KeyGroup::Opacity => "opacity",
             KeyGroup::Crop => "crop",
+            KeyGroup::Adjust(ve_core::AdjustItem::Brightness) => "brightness",
+            KeyGroup::Adjust(ve_core::AdjustItem::Contrast) => "contrast",
+            KeyGroup::Adjust(ve_core::AdjustItem::Saturation) => "saturation",
+            KeyGroup::Adjust(ve_core::AdjustItem::Temperature) => "temperature",
+            KeyGroup::Adjust(ve_core::AdjustItem::Tint) => "tint",
+            KeyGroup::Volume => "volume",
         };
         let id = |suffix: &str| -> gpui_kit::SharedString {
             if suffix.is_empty() {
@@ -165,9 +198,9 @@ impl Workspace {
             }
         };
         let (times, offset, on_clip) = self
-            .key_state()
-            .map_or((Vec::new(), Time::ZERO, false), |k| {
-                (self.group_times(k.clip, group), k.offset, k.on_clip)
+            .bound_offset()
+            .map_or((Vec::new(), Time::ZERO, false), |(clip, _, offset, on)| {
+                (self.group_times(clip, group), offset, on)
             });
         let on_key = times.contains(&offset);
         let has_prev = times.iter().any(|t| *t < offset);

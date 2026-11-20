@@ -167,6 +167,7 @@ impl Workspace {
                     a.error = None;
                 }
                 self.remember_recent(saved);
+                self.sync_session();
             }
             Err(e) => {
                 log::warn!("自动保存失败：{e}");

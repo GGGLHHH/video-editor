@@ -22,6 +22,40 @@ struct ClipAudio {
     next: Time,
     /// 变速且保持音调时的拉伸器（解码器读在它前面，`next` 按输出算）。
     stretch: Option<crate::stretch::Stretcher>,
+    /// 声音处理（降噪、均衡、压缩）的滤镜和已经处理好、还没用掉的样本。
+    fx: Option<FxState>,
+    /// 建不起来的声音处理（比如 ffmpeg 没编进那个滤镜）：记下来，不每块都重建、重新定位。
+    fx_failed: Option<ve_core::AudioFx>,
+    /// 变调变速按块读素材时，每块该读的样本数的小数部分攒在这里（不然每块多读一点，越放越超前）。
+    carry: f64,
+}
+
+/// 片段声音处理的状态：滤镜有记忆，跳着放、改了参数都要重建。
+struct FxState {
+    fx: ve_core::AudioFx,
+    filter: ve_media::AudioFilter,
+    /// 处理好的交错立体声样本（滤镜会压着一点再吐出来，所以输入要读在前面）。
+    ready: std::collections::VecDeque<f32>,
+    /// 输入读完了、滤镜也吐干净了。
+    done: bool,
+}
+
+impl FxState {
+    fn new(fx: ve_core::AudioFx, rate: u32) -> Option<Self> {
+        let spec = fx.filter_spec()?;
+        match ve_media::AudioFilter::new(&spec, rate, fx.latency_samples(rate)) {
+            Ok(filter) => Some(Self {
+                fx,
+                filter,
+                ready: std::collections::VecDeque::new(),
+                done: false,
+            }),
+            Err(e) => {
+                log::warn!("声音处理滤镜建不起来（{spec}）：{e}");
+                None
+            }
+        }
+    }
 }
 
 /// 丢掉已删除的片段、换了素材或文件的解码器和失败记录。
@@ -57,6 +91,10 @@ struct Mixer {
 
 impl Mixer {
     /// 把时间轴从 `pos` 起、`mix` 那么长的所有音频段解码、混进 `mix`（先清零，最后限幅）。
+    #[expect(
+        clippy::too_many_lines,
+        reason = "按片段依次：打开、定位、三种取样本的路子（声音处理 / 变速不变调 / 原速或变调），拆开反而难对照导出"
+    )]
     fn render(&mut self, project: &Project, pos: Time, mix: &mut [f32]) {
         let rate = self.rate;
         let one_sample = Time::from_samples(1, rate).max(Time(1));
@@ -86,6 +124,9 @@ impl Mixer {
                             decoder,
                             next: Time::ZERO,
                             stretch: None,
+                            fx: None,
+                            fx_failed: None,
+                            carry: 0.0,
                         })
                         .into_mut(),
                     Err(e) => {
@@ -105,7 +146,9 @@ impl Mixer {
                 .stretch
                 .as_ref()
                 .is_some_and(|s| !stretching || (s.speed() - seg.speed).abs() > 1e-6);
-            if jumped || stale || (stretching && entry.stretch.is_none()) {
+            let fx_now = entry.fx.as_ref().map(|f| f.fx).or(entry.fx_failed);
+            let fx_changed = fx_now != (!seg.fx.is_none()).then_some(seg.fx);
+            if jumped || stale || fx_changed || (stretching && entry.stretch.is_none()) {
                 // 跳了、换了倍数或开关：从这块该放的地方重新开始（拉伸器开着时解码器读在前面）
                 entry.stretch = None;
                 if let Err(e) = entry.decoder.seek_to(seg.source_start) {
@@ -113,11 +156,21 @@ impl Mixer {
                     continue;
                 }
                 entry.stretch = stretching.then(|| crate::stretch::Stretcher::new(seg.speed));
+                entry.fx = FxState::new(seg.fx, rate);
+                entry.fx_failed = (entry.fx.is_none() && !seg.fx.is_none()).then_some(seg.fx);
+                entry.carry = 0.0;
             }
             let frames = usize::try_from(seg.duration.to_samples(rate))
                 .unwrap_or(0)
                 .min(mix_frames);
             let out_time = Time::from_samples(i64::try_from(frames).unwrap_or(0), rate);
+            if entry.fx.is_some() {
+                // 有声音处理：按时间轴速度取样本过滤镜，读在前面直到够这一块
+                let out = fx_pull(entry, &seg, frames, &mut self.tmp);
+                entry.next = seg.source_start + out_time.scaled(speed);
+                mix_into(mix, &out, &seg, pos, rate);
+                continue;
+            }
             if let Some(stretch) = entry.stretch.as_mut() {
                 // 变速不变调：喂到够这一块用，再取 frames 帧
                 while stretch.available() < frames && !stretch.is_finished() {
@@ -161,6 +214,100 @@ impl Mixer {
         }
         clamp_mix(mix);
     }
+}
+
+/// 吐 [`CHUNK`] 帧要读多少素材样本：小数部分攒在 `carry` 里留给下一块，
+/// 长期下来读的正好是 CHUNK × 倍数（每块向上取整的话会越放越超前）。
+fn source_frames(carry: &mut f64, speed: f64) -> usize {
+    #[expect(clippy::cast_precision_loss, reason = "CHUNK 是一千来帧")]
+    let exact = CHUNK as f64 * speed + *carry;
+    let n = exact.round().max(1.0);
+    *carry = exact - n;
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "一块只有一千来帧"
+    )]
+    let frames = n as usize;
+    frames
+}
+
+/// 按时间轴速度取最多 [`CHUNK`] 帧原始声音（变速不变调走拉伸器，变调走线性重采样）；
+/// 读完了返回空。
+fn raw_chunk(
+    entry: &mut ClipAudio,
+    seg: &crate::resolve::AudioSegment,
+    tmp: &mut Vec<f32>,
+) -> Vec<f32> {
+    if let Some(stretch) = entry.stretch.as_mut() {
+        while stretch.available() < CHUNK && !stretch.is_finished() {
+            tmp.resize(CHUNK * 2, 0.0);
+            match entry.decoder.read(tmp) {
+                Ok(got) if got > 0 => stretch.push(&tmp[..got * 2]),
+                _ => stretch.finish(),
+            }
+        }
+        return stretch.pop(CHUNK);
+    }
+    let speed = f64::from(seg.speed);
+    let src_frames = source_frames(&mut entry.carry, speed);
+    tmp.resize(src_frames * 2, 0.0);
+    let got = entry.decoder.read(tmp).unwrap_or(0);
+    #[expect(clippy::float_cmp, reason = "原速是精确的 1.0")]
+    if seg.speed == 1.0 || got == 0 {
+        return tmp[..got * 2].to_vec();
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "一块只有一千来帧"
+    )]
+    let out_frames = if got == src_frames {
+        CHUNK
+    } else {
+        // 读到结尾了：按比例
+        (got as f64 / speed).round() as usize
+    };
+    crate::resample_linear(&tmp[..got * 2], out_frames)
+}
+
+/// 过了声音处理的 `frames` 帧（不够时有多少给多少）。
+fn fx_pull(
+    entry: &mut ClipAudio,
+    seg: &crate::resolve::AudioSegment,
+    frames: usize,
+    tmp: &mut Vec<f32>,
+) -> Vec<f32> {
+    let want = frames * 2;
+    loop {
+        let Some(state) = entry.fx.as_ref() else {
+            return Vec::new();
+        };
+        if state.ready.len() >= want || state.done {
+            break;
+        }
+        let raw = raw_chunk(entry, seg, tmp);
+        let Some(fx) = entry.fx.as_mut() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let r = if raw.is_empty() {
+            fx.done = true;
+            fx.filter.finish(&mut out)
+        } else {
+            fx.filter.process(&raw, &mut out)
+        };
+        if let Err(e) = r {
+            log::warn!("声音处理失败：{e}");
+            fx.done = true;
+        }
+        fx.ready.extend(out);
+    }
+    entry.fx.as_mut().map_or_else(Vec::new, |fx| {
+        let n = want.min(fx.ready.len());
+        fx.ready.drain(..n).collect()
+    })
 }
 
 /// 倒放时每次往回取多长（帧）：取一段顺着解、再整段倒过来，免得每一小块都让解码器往回跳。
@@ -284,6 +431,7 @@ pub(crate) fn run(shared: &Shared, mut producer: Producer<f32>) {
             generation = Some(current_gen);
             pos = start;
             mixer.shuttle = None;
+            crate::engine::lock(&shared.levels).clear();
             prune(&project, &mut mixer.clips, &mut mixer.failed);
             // 等输出端把旧样本清掉再写新的，否则新样本可能被一起清掉
             let deadline = Instant::now() + Duration::from_millis(100);
@@ -314,6 +462,13 @@ pub(crate) fn run(shared: &Shared, mut producer: Producer<f32>) {
             continue;
         }
         if producer.push_entire_slice(&mix).is_ok() {
+            // 倒放时这一块落在 pos 前面
+            let (at, len) = if step < Time::ZERO {
+                (pos + step, -step)
+            } else {
+                (pos, step)
+            };
+            crate::engine::lock(&shared.levels).push(at, len, &mix);
             pos += step;
         }
     }
@@ -321,6 +476,19 @@ pub(crate) fn run(shared: &Shared, mut producer: Producer<f32>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chunked_reading_at_odd_speeds_does_not_drift() {
+        for speed in [0.7_f64, 1.3, 0.37, 2.5] {
+            let mut carry = 0.0;
+            let total: usize = (0..10_000).map(|_| source_frames(&mut carry, speed)).sum();
+            #[expect(clippy::cast_precision_loss, reason = "测试里的小数")]
+            let want = 10_000.0 * CHUNK as f64 * speed;
+            #[expect(clippy::cast_precision_loss, reason = "测试里的小数")]
+            let off = (total as f64 - want).abs();
+            assert!(off <= 1.0, "{speed}: 差 {off} 帧");
+        }
+    }
+
     use super::*;
     use ve_core::{Asset, edit};
     use ve_media::testing::{Fixture, fixture};

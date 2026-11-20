@@ -10,7 +10,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, div,
 };
 use ve_core::SubtitleStyle;
-use ve_core::edit::set_subtitle_style;
+use ve_core::edit::{set_own_subtitle_style, set_subtitle_style};
 
 /// 预设：（编号，名字，文字色，描边色，描边宽）。
 const PRESETS: [(&str, &str, u32, u32, f32); 6] = [
@@ -64,6 +64,14 @@ impl Workspace {
     ) -> AnyElement {
         chrome::chip(id, label, on, cx)
             .on_click(cx.listener(move |this, _, window, cx| {
+                // 「应用到全部字幕」关着：只改这一条自己的样式
+                if let Some((clip, mut own)) = this.bound_own_style() {
+                    change(&mut own);
+                    this.apply(window, cx, |p| {
+                        set_own_subtitle_style(p, &[clip], Some(&own))
+                    });
+                    return;
+                }
                 let mut s = this.doc.project.subtitle_style.clone();
                 change(&mut s);
                 this.apply(window, cx, |p| set_subtitle_style(p, s));
@@ -71,9 +79,49 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// 选中的字幕有自己的样式时：（片段，样式）。
+    fn bound_own_style(&self) -> Option<(ve_core::ClipId, SubtitleStyle)> {
+        let clip = self.inspector.bound?;
+        let (_, c) = self.doc.project.timeline.find_clip(clip)?;
+        Some((clip, c.own_subtitle_style()?.clone()))
+    }
+
+    /// 「应用到全部字幕」开关：开着时改的是所有字幕共用的样式；关掉后这一条有自己的样式（从共用的复制一份）。
+    fn toggle_apply_to_all(&mut self, window: &mut gpui_kit::Window, cx: &mut Context<'_, Self>) {
+        let Some(clip) = self.inspector.bound else {
+            return;
+        };
+        let own = match self.bound_own_style() {
+            Some(_) => None,
+            None => Some(self.doc.project.subtitle_style.clone()),
+        };
+        self.apply(window, cx, |p| {
+            set_own_subtitle_style(p, &[clip], own.as_ref())
+        });
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "一整块面板的布局，拆开反而难对照界面"
+    )]
     pub(crate) fn render_text_style_tab(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
-        let s = &self.doc.project.subtitle_style;
+        let own = self.bound_own_style();
+        let s = own
+            .as_ref()
+            .map_or(&self.doc.project.subtitle_style, |(_, st)| st);
+        let all = own.is_none();
+        let apply_all = chrome::chip(
+            "ts-apply-all",
+            if all {
+                "☑ 应用到全部字幕"
+            } else {
+                "☐ 应用到全部字幕"
+            },
+            all,
+            cx,
+        )
+        .on_click(cx.listener(|this, _, window, cx| this.toggle_apply_to_all(window, cx)));
         let group = |label: &'static str, chips: Vec<AnyElement>| {
             v_flex()
                 .gap_1()
@@ -156,12 +204,13 @@ impl Workspace {
             .id("insp-text-style")
             .test_support()
             .gap_3()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child("样式应用到全部字幕"),
-            )
+            .child(h_flex().gap_2().child(apply_all).child(
+                div().text_xs().text_color(muted).child(if all {
+                    "改的是所有字幕共用的样式"
+                } else {
+                    "只改这一条字幕"
+                }),
+            ))
             .child(group("预设", presets))
             .child(group("字体", fonts))
             .child(group("字号", sizes))

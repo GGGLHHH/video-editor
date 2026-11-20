@@ -7,6 +7,7 @@
 
 mod compositor;
 mod error;
+pub mod plugin;
 
 pub use compositor::{Compositor, FramePixels, Layer, MappedNv12, Nv12, RenderConfig};
 pub use error::RenderError;

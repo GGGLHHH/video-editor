@@ -67,6 +67,8 @@ struct Worker<'a> {
     /// 合成器（第一次用到时创建）；创建失败后退回只显示最上层。
     compositor: Option<Compositor>,
     compositor_failed: bool,
+    /// 现在按多大解码（画质切换时变，变了就重开解码器、清帧缓存）。
+    preview_max: ve_media::ScaleTarget,
 }
 
 pub(crate) fn run(shared: &Shared) {
@@ -82,6 +84,7 @@ pub(crate) fn run(shared: &Shared) {
         reverse: None,
         compositor: None,
         compositor_failed: false,
+        preview_max: shared.preview_max,
     };
     while !shared.is_shutdown() {
         w.step();
@@ -90,7 +93,7 @@ pub(crate) fn run(shared: &Shared) {
 
 impl Worker<'_> {
     fn step(&mut self) {
-        let (project, playing, generation, seek, revision, play_rate) = {
+        let (project, playing, generation, seek, revision, play_rate, preview_max) = {
             let mut c = self.shared.control();
             (
                 Arc::clone(&c.project),
@@ -99,8 +102,15 @@ impl Worker<'_> {
                 c.seek.take(),
                 c.revision,
                 c.rate,
+                c.preview_max,
             )
         };
+        if preview_max != self.preview_max {
+            self.preview_max = preview_max;
+            self.decoders.clear();
+            self.cache = FrameCache::new(self.shared.cache_bytes);
+            self.cached.clear();
+        }
         if self.generation != Some(generation) || self.revision != Some(revision) {
             self.generation = Some(generation);
             self.revision = Some(revision);
@@ -117,6 +127,11 @@ impl Worker<'_> {
                     project.timeline.duration() - project.settings.frame_rate.frame_duration(),
                 );
                 let frame = self.render(&project, shown.max(Time::ZERO));
+                // 画的时候预览尺寸改了（切画质）：这帧尺寸不对，不交；改尺寸时已经排了重画。
+                // 只看尺寸：拖动、连续改属性时每次都丢的话会一直出不了画面
+                if self.shared.control().preview_max != preview_max {
+                    return;
+                }
                 let mut q = lock(&self.shared.frames);
                 q.items.clear();
                 q.push(t, frame);
@@ -300,13 +315,21 @@ impl Worker<'_> {
     /// 合成时间点 `t` 的预览画面；没有任何画面（空隙或全都解不出）、也没有调节片段把黑底调色时
     /// 返回 `None`。
     fn render(&mut self, project: &Project, t: Time) -> Option<Arc<VideoFrame>> {
-        let ve_core::compose::Composition { layers, background } =
-            ve_core::compose::resolve_frame(project, t);
+        let ve_core::compose::Composition {
+            layers,
+            background,
+            background_grades,
+            effects,
+        } = ve_core::compose::resolve_frame(project, t);
         let frames = self.layer_frames(project, &layers);
-        if frames.iter().all(Option::is_none) && background.is_identity() {
+        if frames.iter().all(Option::is_none)
+            && background.is_identity()
+            && background_grades.is_empty()
+            && effects.is_empty()
+        {
             return None;
         }
-        let canvas = preview_canvas(&project.settings, self.shared.preview_max);
+        let canvas = preview_canvas(&project.settings, self.preview_max);
         if self.compositor.is_none() && !self.compositor_failed {
             match Compositor::new(&self.shared.render) {
                 Ok(c) => {
@@ -323,6 +346,18 @@ impl Worker<'_> {
         let Some(compositor) = self.compositor.as_mut() else {
             return top();
         };
+        let drawn = |l: &LayerSource, f: &Option<Arc<VideoFrame>>| {
+            f.is_some()
+                && project
+                    .assets
+                    .get(&l.asset)
+                    .is_some_and(|a| a.video.is_some())
+        };
+        let kept: Vec<bool> = layers
+            .iter()
+            .zip(&frames)
+            .map(|(l, f)| drawn(l, f))
+            .collect();
         let gpu_layers: Vec<Layer<'_>> = layers
             .iter()
             .zip(&frames)
@@ -343,10 +378,13 @@ impl Worker<'_> {
                     geometry: ve_core::layer_geometry(canvas, source, &l.transform),
                     opacity: l.transform.opacity,
                     color: l.color,
+                    look: l.look,
+                    grades: &l.grades,
                 })
             })
             .collect();
-        compositor.set_background(&background);
+        compositor.set_background_chain(&background, &background_grades);
+        compositor.set_effects(&ve_core::EffectPass::remap(&effects, &kept));
         let mut data = Vec::new();
         match compositor.compose_bgra(canvas, &gpu_layers, &mut data) {
             Ok(()) => Some(Arc::new(VideoFrame {
@@ -401,7 +439,7 @@ impl Worker<'_> {
                 .get(&key)
                 .is_none_or(|(p, _)| *p != asset.path)
             {
-                match VideoDecoder::open(&asset.path, self.shared.preview_max) {
+                match VideoDecoder::open(&asset.path, self.preview_max) {
                     Ok(d) => {
                         self.decoders.insert(key, (asset.path.clone(), d));
                     }
@@ -452,7 +490,44 @@ impl Worker<'_> {
             }
             self.decoders.insert(job.key, (job.path, job.decoder));
         }
+        // 帧融合：慢放的层再取下一帧，按时间混合（和导出同一个函数）
+        for (i, l) in layers.iter().enumerate() {
+            if !l.frame_blend {
+                continue;
+            }
+            let Some(a) = frames[i].clone() else {
+                continue;
+            };
+            if let Some(b) = self.next_frame(project, l)
+                && let Some(mixed) = ve_media::blend_frames(&a, &b, l.source_time)
+            {
+                frames[i] = Some(Arc::new(mixed));
+            }
+        }
         frames
+    }
+
+    /// 层 `l` 那一帧的下一帧（缓存优先，否则用这一层的解码器往后解一帧）。
+    fn next_frame(&mut self, project: &Project, l: &LayerSource) -> Option<Arc<VideoFrame>> {
+        let asset = project.assets.get(&l.asset)?;
+        let info = asset.video?;
+        if info.still {
+            return None;
+        }
+        let index = info.frame_rate.frame_of(l.source_time) + 1;
+        if self.cached.get(&l.asset).is_some_and(|p| *p == asset.path)
+            && let Some(f) = self.cache.get((l.asset, index))
+        {
+            return Some(f);
+        }
+        let key = (l.track, l.asset, l.lane);
+        let (path, decoder) = self.decoders.get_mut(&key)?;
+        if *path != asset.path {
+            return None;
+        }
+        let f = Arc::new(decoder.seek_to(info.frame_rate.time_of_frame(index)).ok()?);
+        self.cache.insert((l.asset, index), Arc::clone(&f));
+        Some(f)
     }
 }
 

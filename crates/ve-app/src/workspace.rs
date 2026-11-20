@@ -47,6 +47,8 @@ pub enum Popup {
     Layout,
     /// 快捷键一览。
     Shortcuts,
+    /// 播放器标题右边的 ≡ 菜单。
+    Player,
 }
 
 impl Workspace {
@@ -90,7 +92,9 @@ pub struct Workspace {
     pub(crate) engine: Engine,
     /// 推给引擎的工程（也给时间轴绘制用）。
     pub(crate) project: Arc<Project>,
-    engine_revision: Option<u64>,
+    /// 给播放引擎的工程：复合片段摊开（[`ve_core::compound::flatten`]）；没有复合片段时就是 `project`。
+    pub(crate) engine_project: Arc<Project>,
+    pub(crate) engine_revision: Option<u64>,
     pub(crate) focus: FocusHandle,
     pub(crate) media: HashMap<AssetId, MediaThumbs>,
     pub(crate) preview: PreviewState,
@@ -110,10 +114,26 @@ pub struct Workspace {
     pub(crate) transition_secs: f64,
     /// 布局模式。
     pub(crate) layout: crate::layout::LayoutMode,
+    /// 找不到文件的素材（[`Self::refresh_missing`]）。
+    pub(crate) missing: std::collections::BTreeSet<AssetId>,
+    /// 快捷键一览里正在改的键位（等用户按新键）。
+    pub(crate) recording_key: Option<String>,
+    /// 改键后的提示（比如新键原来用于别的操作，已经从那里去掉）。
+    pub(crate) shortcut_note: Option<String>,
     /// 片段 / 属性剪贴板。
     pub(crate) clipboard: crate::clip_ops::ClipBoard,
     /// 自动保存（正式启动的程序才打开）。
     pub(crate) autosave: Option<crate::autosave::Autosave>,
+    /// 代理模式（[`crate::proxy`]）。
+    pub(crate) proxies: crate::proxy::Proxies,
+    /// 示波器（[`crate::scopes`]）。
+    pub(crate) scopes: crate::scopes::ScopeState,
+    /// 插件目录（[`crate::plugins`]）。
+    pub(crate) plugin_dir: std::path::PathBuf,
+    /// 载入了的插件名。
+    pub(crate) plugins: Vec<String>,
+    /// 崩溃恢复的会话记录（[`Self::enable_recovery`]）。
+    pub(crate) recovery: Option<crate::recovery::Live>,
     /// 素材面板当前的一级标签。
     pub(crate) bin_tab: crate::media_bin::BinTab,
     /// 顶栏展开着的弹出框（菜单、布局、快捷键），同时只开一个。
@@ -126,6 +146,22 @@ pub struct Workspace {
     pub(crate) zoom_slider: Entity<gpui_kit::component::slider::SliderState>,
     /// 定格图片存放的目录。
     pub(crate) freeze_dir: std::path::PathBuf,
+    /// 播放入出点区域时，播到这里停（Shift+Enter）。
+    pub(crate) play_until: Option<Time>,
+    /// 倒放文件的目录。
+    pub(crate) reverse_dir: std::path::PathBuf,
+    /// 正在后台生成倒放文件。
+    pub(crate) reversing: bool,
+    /// 防抖文件放哪（[`crate::stabilize_ui`]）。
+    pub(crate) stabilize_dir: std::path::PathBuf,
+    /// 正在做视频防抖。
+    pub(crate) stabilizing: bool,
+    /// 换过几次文档（新建、打开、导入）：后台任务做完时据此判断工程是不是已经换了。
+    pub(crate) doc_epoch: u64,
+    /// 正在录音：录音器和从时间轴哪里开始录的。
+    pub(crate) recording: Option<(ve_engine::Recorder, Time)>,
+    /// 录音文件的目录。
+    pub(crate) record_dir: std::path::PathBuf,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -139,7 +175,13 @@ impl std::fmt::Debug for Workspace {
 
 impl Workspace {
     /// 新建主窗口视图（空工程）。
+    #[expect(
+        clippy::too_many_lines,
+        reason = "按字段逐个列出初始值，拆开反而找不到某个字段的默认值"
+    )]
     pub fn new(engine: Engine, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
+        // 默认原画质（剪映播放器底栏的「原画」）
+        engine.set_preview_max(crate::preview::Quality::default().target());
         let events = engine.events();
         // 引擎事件用定时轮询（不 await 跨线程的通道）：引擎线程不直接唤醒界面任务，
         // 测试调度器才能保持确定性；空闲开销是每秒几十次 try_recv。
@@ -184,11 +226,26 @@ impl Workspace {
                 }
             },
         ));
+        // 改快捷键：在快捷键匹配之前截住按下的键
+        let weak = cx.entity().downgrade();
+        subscriptions.push(cx.intercept_keystrokes(move |e, _, cx| {
+            let Some(ws) = weak.upgrade() else {
+                return;
+            };
+            if ws.read(cx).recording_key.is_none() || e.keystroke.is_modifier_key() {
+                return;
+            }
+            cx.stop_propagation();
+            let key = e.keystroke.unparse(cx.platform_info().os);
+            ws.update(cx, |w, cx| w.finish_recording(&key, cx));
+        }));
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         let doc = Document::new();
+        let project = Arc::new(doc.project.clone());
         Self {
-            project: Arc::new(doc.project.clone()),
+            engine_project: Arc::clone(&project),
+            project,
             doc,
             engine,
             engine_revision: None,
@@ -208,13 +265,29 @@ impl Workspace {
             popup_dismissed: None,
             bin_tab: crate::media_bin::BinTab::default(),
             autosave: None,
+            proxies: crate::proxy::Proxies::new(),
+            scopes: crate::scopes::ScopeState::default(),
+            plugin_dir: crate::plugins::default_dir(),
+            plugins: Vec::new(),
+            recovery: None,
             clipboard: crate::clip_ops::ClipBoard::default(),
             layout: crate::layout::LayoutMode::default(),
+            missing: std::collections::BTreeSet::new(),
+            recording_key: None,
+            shortcut_note: None,
             transition_secs: 1.0,
             title: String::new(),
             tasks: vec![listen],
             zoom_slider,
             freeze_dir: crate::freeze::default_dir(),
+            play_until: None,
+            reverse_dir: crate::reverse::default_dir(),
+            reversing: false,
+            stabilize_dir: crate::stabilize_ui::default_dir(),
+            stabilizing: false,
+            doc_epoch: 0,
+            recording: None,
+            record_dir: crate::record::default_dir(),
             _subscriptions: subscriptions,
         }
     }
@@ -241,7 +314,17 @@ impl Workspace {
     pub(crate) fn sync_engine(&mut self) {
         if self.engine_revision != Some(self.doc.revision()) {
             self.project = Arc::new(self.doc.project.clone());
-            self.engine.set_project(Arc::clone(&self.project));
+            // 复合片段摊开再给播放引擎（时间轴上还是一段）
+            let flat = ve_core::compound::flatten(&self.project);
+            self.engine_project = if self.proxies.on {
+                // 代理模式：有副本的素材换成副本
+                let mut p = flat.unwrap_or_else(|| (*self.project).clone());
+                self.with_proxies(&mut p);
+                Arc::new(p)
+            } else {
+                flat.map_or_else(|| Arc::clone(&self.project), Arc::new)
+            };
+            self.engine.set_project(Arc::clone(&self.engine_project));
             self.engine_revision = Some(self.doc.revision());
         }
     }
@@ -255,6 +338,7 @@ impl Workspace {
     ) {
         self.engine.pause();
         self.doc = doc;
+        self.doc_epoch += 1;
         self.engine_revision = None;
         for thumbs in std::mem::take(&mut self.media).into_values() {
             for image in thumbs.thumbnails {
@@ -267,6 +351,20 @@ impl Workspace {
         self.after_change(window, cx);
         let assets: Vec<_> = self.doc.project.assets.values().cloned().collect();
         self.analyze_assets(assets, window, cx);
+    }
+
+    /// 片段 `clip` 现在用的素材（工程编号 + 内容 + 长度 + 变速 + 倒放 / 防抖记录）。后台按片段生成
+    /// 文件（倒放、防抖）前记一份，做完再比：变了（换了工程、片段被裁剪、撤销……）就不套用。
+    pub(crate) fn source_key(&self, clip: ve_core::ClipId) -> Option<SourceKey> {
+        let (_, c) = self.doc.project.timeline.find_clip(clip)?;
+        Some(SourceKey {
+            epoch: self.doc_epoch,
+            content: c.content.clone(),
+            duration: c.duration,
+            speed: c.speed.to_bits(),
+            reversed: c.reversed,
+            stabilized: c.stabilized,
+        })
     }
 
     /// 执行一次编辑；失败时弹提示。
@@ -291,12 +389,15 @@ impl Workspace {
     /// 文档变化后：同步引擎、属性面板，重绘。
     pub(crate) fn after_change(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.clamp_timeline_scroll();
+        self.refresh_missing();
+        self.sync_session();
         self.sync_engine();
         self.sync_inspector(window, cx);
         cx.notify();
     }
 
     pub(crate) fn seek(&mut self, t: Time, cx: &mut Context<'_, Self>) {
+        self.timeline.axis_anchor = None;
         self.engine.seek(t);
         self.playhead = self.engine.position();
         cx.notify();
@@ -305,6 +406,7 @@ impl Workspace {
     // ---- 播放控制 ----
 
     fn play_pause(&mut self, _: &act::PlayPause, _: &mut Window, cx: &mut Context<'_, Self>) {
+        self.end_preview_axis();
         if self.engine.is_playing() {
             self.engine.pause();
         } else {
@@ -478,9 +580,13 @@ impl Workspace {
         self.after_change(window, cx);
     }
 
-    /// Esc：正在拖动（时间轴或预览）时取消这次拖动、回到按下前，不记撤销；
-    /// 正在框选时回到框之前的选择；否则取消选择。
+    /// Esc：开着弹出框（菜单、布局、快捷键）时先关掉它；正在拖动（时间轴或预览）时取消这次拖动、
+    /// 回到按下前，不记撤销；正在框选时回到框之前的选择；否则取消选择。
     fn cancel(&mut self, _: &act::Cancel, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.popup.take().is_some() {
+            cx.notify();
+            return;
+        }
         // 全屏时 Esc 先退出全屏
         if self.preview.fullscreen {
             self.set_fullscreen(false, window, cx);
@@ -720,6 +826,26 @@ impl Workspace {
             .on_action(cx.listener(Self::rotate_90))
             .on_action(cx.listener(Self::zoom_to_fit))
             .on_action(cx.listener(Self::freeze))
+            .on_action(cx.listener(Self::set_in))
+            .on_action(cx.listener(Self::set_out))
+            .on_action(cx.listener(Self::range_from_selection))
+            .on_action(cx.listener(Self::clear_range))
+            .on_action(cx.listener(Self::play_range))
+            .on_action(cx.listener(Self::select_same_color))
+            .on_action(cx.listener(Self::replace_clip))
+            .on_action(cx.listener(Self::make_compound))
+            .on_action(cx.listener(Self::export_otio))
+            .on_action(cx.listener(Self::export_edl))
+            .on_action(cx.listener(Self::import_otio))
+            .on_action(cx.listener(Self::slip_tool))
+            .on_action(cx.listener(Self::slide_tool))
+            .on_action(cx.listener(Self::roll_tool))
+            .on_action(cx.listener(Self::break_compound))
+            .on_action(cx.listener(Self::select_tool))
+            .on_action(cx.listener(Self::blade_tool))
+            .on_action(cx.listener(Self::toggle_preview_axis))
+            .on_action(cx.listener(Self::reverse))
+            .on_action(cx.listener(Self::toggle_record))
     }
 }
 
@@ -728,10 +854,22 @@ impl Render for Workspace {
         self.sync_engine();
         self.pull_frame(window, cx);
         self.measure_subtitle_font(window);
-        self.playhead = self.engine.position();
+        self.stop_at_range_end(cx);
+        // 预览轴在预览别处时，播放头还是原来的位置
+        self.playhead = self
+            .timeline
+            .axis_anchor
+            .unwrap_or_else(|| self.engine.position());
         self.follow_playhead_in_inspector(window, cx);
+        self.refresh_animated_sliders(false, window, cx);
+        self.refresh_look_sliders(window, cx);
+        self.refresh_curve_sliders(window, cx);
+        self.refresh_grade_sliders(window, cx);
+        self.refresh_effect_slider(window, cx);
+        self.refresh_audio_fx_sliders(window, cx);
         self.sync_zoom_slider(window, cx);
-        if self.engine.is_playing() {
+        // 播放中、录音中一直刷新
+        if self.engine.is_playing() || self.recording.is_some() {
             window.request_animation_frame();
         }
         let title = format!("{} — 视频剪辑器", self.doc.title());
@@ -771,8 +909,14 @@ impl Render for Workspace {
 }
 
 /// 弹出提示。
+#[expect(
+    clippy::needless_pass_by_ref_mut,
+    reason = "调用的地方都是拿着 &mut Window 的界面代码；改成 & 会让一串函数跟着改签名"
+)]
 pub(crate) fn notify(note: Notification, window: &mut Window, cx: &mut App) {
-    window.push_notification(note, cx);
+    // 延到这一轮更新结束再弹：启动时（命令行带工程、崩溃恢复）主窗口还在搭建，组件库的根视图
+    // 还没有，直接弹会 panic
+    window.defer(cx, move |window, cx| window.push_notification(note, cx));
 }
 
 /// 打开主窗口时用：在 `cx.new` 里构造。
@@ -780,4 +924,15 @@ pub fn build(engine: Engine, window: &mut Window, cx: &mut App) -> Entity<Worksp
     // 旋转光标要直接调系统（GPUI 没有自定义光标）；装不上（无界面测试、非 Windows）就退回手指光标
     crate::platform_cursor::install(window);
     cx.new(|cx| Workspace::new(engine, window, cx))
+}
+
+/// 见 [`Workspace::source_key`]。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SourceKey {
+    epoch: u64,
+    content: ve_core::ClipContent,
+    duration: Time,
+    speed: u32,
+    reversed: Option<(AssetId, Time)>,
+    stabilized: Option<(AssetId, Time, u8)>,
 }

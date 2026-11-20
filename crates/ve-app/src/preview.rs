@@ -46,8 +46,14 @@ pub struct PreviewState {
     pub(crate) cursor: gpui_kit::CursorStyle,
     /// 底栏「比例」菜单是否展开。
     pub(crate) ratio_menu: bool,
+    /// 底栏「画质」菜单是否展开。
+    pub(crate) quality_menu: bool,
+    /// 预览画质（剪映「原画 / 清晰」）。
+    pub(crate) quality: Quality,
     /// 全屏预览（剪映的 ⤢）：整个窗口只显示画面，没有控件。
     pub(crate) fullscreen: bool,
+    /// 正在显示的那一帧的像素（取色器用）。
+    pub(crate) last_frame: Option<Arc<VideoFrame>>,
 }
 
 /// BGRA 帧 → 可直接上传的图片（GPUI 的 `RenderImage` 内部就是 BGRA）。
@@ -110,16 +116,26 @@ pub fn fit_rect(area: Bounds<Pixels>, width: u32, height: u32) -> Bounds<Pixels>
 
 impl Workspace {
     /// 从引擎取新帧（每次渲染调用）。
+    /// 播放器上有没有画面（取色器要从这一帧取）。
+    #[must_use]
+    pub const fn showing_frame(&self) -> bool {
+        self.preview.last_frame.is_some()
+    }
+
     pub(crate) fn pull_frame(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some(update) = self.engine.take_frame() else {
             return;
         };
         let next = update.frame.as_deref().and_then(to_render_image);
+        self.preview.last_frame.clone_from(&update.frame);
         if let Some(old) = self.preview.retired.take() {
             cx.drop_image(old, Some(window));
         }
         self.preview.retired = std::mem::replace(&mut self.preview.image, next);
         self.preview.frames_shown += 1;
+        if self.scopes.on {
+            self.refresh_scopes(window, cx);
+        }
         let now = std::time::Instant::now();
         if self
             .preview
@@ -134,7 +150,7 @@ impl Workspace {
     pub(crate) fn render_preview(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         v_flex()
             .size_full()
-            .child(chrome::panel_header("播放器", cx))
+            .child(self.render_player_header(cx))
             .child(self.render_preview_frame(cx))
             .child(self.render_transport(cx))
     }
@@ -146,47 +162,50 @@ impl Workspace {
             video.origin.x - self.preview.bounds.origin.x,
             video.origin.y - self.preview.bounds.origin.y,
         );
-        let project = Arc::clone(&self.project);
-        let subtitles = ve_engine::resolve_subtitle_poses(&project, self.playhead);
-        let style = self.doc.project.subtitle_style.clone();
+        let project = Arc::clone(&self.engine_project);
+        let subtitles = ve_engine::resolve_subtitle_shows(&project, self.playhead);
         let shown_h = f32::from(video.size.height);
+        let shown_w = f32::from(video.size.width);
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
             reason = "显示高度为正且很小"
         )]
         let shown_h_px = shown_h.max(1.0) as u32;
-        // ASS 字号是整行高：行高就用它，字号换成 GPUI 的 em，和导出的字一样大、离底一样远
-        #[expect(clippy::cast_possible_truncation, reason = "字号很小")]
-        let line = px(style.font_px(shown_h_px) as f32);
-        let font = line * self.preview.em_ratio.unwrap_or(1.0);
-        // 描边为 0 时不画；有描边时至少 1 像素，缩小的预览里也看得见
-        #[expect(clippy::cast_possible_truncation, reason = "描边很小")]
-        let outline = if style.outline > 0.0 {
-            (style.outline_px(shown_h_px) as f32).max(1.0)
-        } else {
-            0.0
-        };
-        #[expect(clippy::cast_possible_truncation, reason = "边距很小")]
-        let margin = px(style.margin_px(shown_h_px) as f32);
-        let bottom = self.preview.bounds.size.height - (vy + video.size.height) + margin;
         subtitles
             .into_iter()
-            .map(|(text, pose)| {
-                // 入场 / 出场动画：缩放以底边中点为中心（和 ASS 的 \an2 + \fscx 一致）、往下偏移、透明度
+            .map(|show| {
+                let style = show.style;
+                let state = show.state;
+                // ASS 字号是整行高：行高就用它，字号换成 GPUI 的 em，和导出的字一样大、离底一样远
+                #[expect(clippy::cast_possible_truncation, reason = "字号很小")]
+                let line = px(style.font_px(shown_h_px) as f32);
+                let font = line * self.preview.em_ratio.unwrap_or(1.0);
+                // 描边为 0 时不画；有描边时至少 1 像素，缩小的预览里也看得见
+                #[expect(clippy::cast_possible_truncation, reason = "描边很小")]
+                let outline = if style.outline > 0.0 {
+                    (style.outline_px(shown_h_px) as f32).max(1.0)
+                } else {
+                    0.0
+                };
+                #[expect(clippy::cast_possible_truncation, reason = "边距很小")]
+                let margin = px(style.margin_px(shown_h_px) as f32);
+                let bottom = self.preview.bounds.size.height - (vy + video.size.height) + margin;
+                // 缩放以底边中点为中心（和 ASS 的 \an2 + \fscx 一致）、位置偏移、透明度
                 subtitle_overlay(
-                    text,
-                    font * pose.scale,
-                    line * pose.scale,
-                    outline * pose.scale,
-                    &style,
+                    show.text,
+                    font * state.scale,
+                    line * state.scale,
+                    outline * state.scale,
+                    style,
+                    show.chars.as_deref(),
                 )
                 .absolute()
-                .left(vx)
+                .left(vx + px(state.x * shown_w))
                 .w(video.size.width)
-                .opacity(pose.alpha)
+                .opacity(state.alpha)
                 // 底边对齐、向上长（和 libass 一致），多行时不会掉出画面
-                .bottom(bottom - px(pose.dy * shown_h))
+                .bottom(bottom - px(state.y * shown_h))
                 .into_any_element()
             })
             .collect()
@@ -262,6 +281,7 @@ impl Workspace {
             .when(!self.preview.fullscreen, |frame| {
                 frame.children(self.render_selection_box(cx))
             })
+            .children(self.render_scopes())
     }
 
     /// 播放器底栏（剪映式）：左边当前时间（青）/ 总长，中间播放键，右边比例和全屏。
@@ -327,6 +347,7 @@ impl Workspace {
                     ),
             )
             .child(div().flex_1())
+            .child(self.render_quality_button(cx))
             .child(self.render_ratio_button(cx))
             .child(
                 Button::new("tr-fullscreen")
@@ -338,6 +359,58 @@ impl Workspace {
                         this.set_fullscreen(true, window, cx);
                     })),
             )
+    }
+}
+
+/// 预览画质（剪映播放器底栏的「原画」）：只影响预览，导出总是原画。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Quality {
+    /// 原画质：保持原片清晰度（按原片最多 4K 解码）。
+    #[default]
+    Original,
+    /// 清晰画质：播放流畅，不影响导出质量（按 720P 解码）。
+    Smooth,
+}
+
+impl Quality {
+    /// 两档：（元素编号，名字，说明，画质）。
+    pub const ALL: [(&'static str, &'static str, &'static str, Self); 2] = [
+        (
+            "quality-original",
+            "原画质",
+            "保持原片清晰度",
+            Self::Original,
+        ),
+        (
+            "quality-smooth",
+            "清晰画质",
+            "播放流畅，不影响导出质量",
+            Self::Smooth,
+        ),
+    ];
+
+    /// 预览解码尺寸上限。
+    #[must_use]
+    pub const fn target(self) -> ve_media::ScaleTarget {
+        match self {
+            Self::Original => ve_media::ScaleTarget {
+                max_width: 3840,
+                max_height: 3840,
+            },
+            Self::Smooth => ve_media::ScaleTarget {
+                max_width: 1280,
+                max_height: 1280,
+            },
+        }
+    }
+
+    /// 底栏按钮上的字。
+    #[must_use]
+    pub const fn short(self) -> &'static str {
+        match self {
+            Self::Original => "原画",
+            Self::Smooth => "清晰",
+        }
     }
 }
 
@@ -357,6 +430,81 @@ pub const RATIOS: [RatioOption; 8] = [
 ];
 
 impl Workspace {
+    /// 切换预览画质。
+    pub(crate) fn set_quality(&mut self, q: Quality, cx: &mut Context<'_, Self>) {
+        self.preview.quality = q;
+        self.preview.quality_menu = false;
+        self.engine.set_preview_max(q.target());
+        cx.notify();
+    }
+
+    /// 底栏的「原画 ▾」按钮和向上弹出的两档画质（剪映）。
+    fn render_quality_button(&self, cx: &Context<'_, Self>) -> impl IntoElement {
+        let current = self.preview.quality;
+        div()
+            .relative()
+            .child(
+                Button::new("tr-quality")
+                    .ghost()
+                    .compact()
+                    .label(format!("{} ▾", current.short()))
+                    .tooltip("预览画质（只影响预览，不影响导出）")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.preview.quality_menu = !this.preview.quality_menu;
+                        cx.notify();
+                    })),
+            )
+            .children(self.preview.quality_menu.then(|| {
+                let muted = cx.theme().muted_foreground;
+                let items = Quality::ALL.map(|(id, label, note, q)| {
+                    h_flex()
+                        .id(id)
+                        .test_support()
+                        .py_1()
+                        .px_2()
+                        .gap_2()
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .hover(|st| st.bg(palette::menu_hover()))
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_quality(q, cx)))
+                        .child(
+                            div()
+                                .w(px(12.))
+                                .text_color(palette::accent())
+                                .child(if q == current { "✓" } else { "" }),
+                        )
+                        .child(
+                            v_flex()
+                                .child(div().text_sm().child(label))
+                                .child(div().text_xs().text_color(muted).child(note)),
+                        )
+                });
+                gpui_kit::deferred(
+                    v_flex()
+                        .id("quality-menu")
+            // 盖住下面的东西：点菜单不会顺带点到下面的画面 / 时间轴
+            .occlude()
+                        .test_support()
+                        .absolute()
+                        .bottom(px(30.))
+                        .right_0()
+                        .w(px(200.))
+                        .p_1()
+                        .bg(palette::menu_bg())
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .rounded(px(chrome::CARD_RADIUS))
+                        .shadow_lg()
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.preview.quality_menu = false;
+                            cx.notify();
+                        }))
+                        .children(items),
+                )
+                .with_priority(1)
+            }))
+    }
+
     /// 底栏的「比例」按钮和向上弹出的菜单（剪映：横竖屏一键切换，画面自动适配）。
     fn render_ratio_button(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let s = self.doc.project.settings;
@@ -401,6 +549,8 @@ impl Workspace {
                 gpui_kit::deferred(
                     v_flex()
                         .id("ratio-menu")
+            // 盖住下面的东西：点菜单不会顺带点到下面的画面 / 时间轴
+            .occlude()
                         .test_support()
                         .absolute()
                         .bottom(px(30.))
@@ -459,23 +609,49 @@ fn subtitle_overlay(
     line: Pixels,
     outline: f32,
     style: &SubtitleStyle,
+    chars: Option<&[(f32, f32)]>,
 ) -> gpui_kit::Div {
     let family: SharedString = style.font.clone().into();
-    let text: SharedString = text.to_owned().into();
+    let shared: SharedString = text.to_owned().into();
     let weight = if style.bold {
         gpui_kit::FontWeight::BOLD
     } else {
         gpui_kit::FontWeight::NORMAL
     };
-    let styled = |d: gpui_kit::Div, color: gpui_kit::Hsla| {
-        d.w_full()
+    // 逐字入场：每个字一个格子，各自的不透明度和缩放（底边对齐，和 ASS 的逐字 \alpha、\fscx 一样）
+    let per_char = |color: gpui_kit::Hsla, reveal: &[(f32, f32)]| {
+        let mut rows = v_flex().w_full().items_center();
+        let mut k = 0;
+        for row_text in text.split('\n') {
+            let mut row = h_flex().items_end().justify_center();
+            for ch in row_text.chars() {
+                let (a, s) = reveal.get(k).copied().unwrap_or((1.0, 1.0));
+                k += 1;
+                row = row.child(
+                    div()
+                        .text_size(font * s)
+                        .line_height(line)
+                        .font_family(family.clone())
+                        .font_weight(weight)
+                        .text_color(color.opacity(a))
+                        .child(SharedString::from(ch.to_string())),
+                );
+            }
+            rows = rows.child(row);
+        }
+        rows
+    };
+    let styled = |d: gpui_kit::Div, color: gpui_kit::Hsla| match chars {
+        Some(reveal) => d.w_full().child(per_char(color, reveal)),
+        None => d
+            .w_full()
             .text_center()
             .text_size(font)
             .line_height(line)
             .font_family(family.clone())
             .font_weight(weight)
             .text_color(color)
-            .child(text.clone())
+            .child(shared.clone()),
     };
     let (fill, edge): (gpui_kit::Hsla, gpui_kit::Hsla) = (
         gpui_kit::rgb(style.color).into(),

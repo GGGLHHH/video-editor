@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use ve_core::srt::{export_srt, import_srt, parse_srt, write_srt};
 
 /// 对话框的起始目录：工程所在目录，否则用户的「视频」文件夹。
-fn start_dir(doc: &Document) -> PathBuf {
+pub(crate) fn start_dir(doc: &Document) -> PathBuf {
     doc.path()
         .and_then(|p| p.parent().map(PathBuf::from))
         .or_else(|| std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join("Videos")))
@@ -82,6 +82,8 @@ impl Workspace {
         match project_io::save(&mut self.doc, path) {
             Ok(saved) => {
                 self.remember_recent(saved);
+                // 新草稿第一次保存、另存为：崩溃恢复记录换成新路径
+                self.sync_session();
                 cx.notify();
                 true
             }
@@ -137,7 +139,7 @@ impl Workspace {
                     let names = opened.missing.join("、");
                     crate::workspace::notify(
                         Notification::warning(format!(
-                            "找不到这些素材，相关片段会显示为黑场 / 静音：{names}"
+                            "找不到这些素材，相关片段会显示为黑场 / 静音：{names}。在素材面板点「链接媒体」重新指定文件"
                         ))
                         .autohide(false),
                         window,

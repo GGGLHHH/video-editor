@@ -91,6 +91,16 @@ pub mod palette {
     pub fn adjustment_clip() -> Hsla {
         rgb(0x7b_4c8c).into()
     }
+    /// 特效片段（剪映的特效轨是偏黄的橙色）。
+    #[must_use]
+    pub fn effect_clip() -> Hsla {
+        rgb(0x9a_6a1c).into()
+    }
+    /// 复合片段（剪映是深一点的青）。
+    #[must_use]
+    pub fn compound_clip() -> Hsla {
+        rgb(0x1f_6f78).into()
+    }
     /// 波形。
     #[must_use]
     pub fn waveform() -> Hsla {
@@ -146,6 +156,24 @@ pub mod palette {
     pub fn locked_veil() -> Hsla {
         rgba(0x1414_1470).into()
     }
+    /// 录音中的红点。
+    #[must_use]
+    pub fn recording() -> Hsla {
+        rgb(0xE5_484D).into()
+    }
+
+    /// 媒体丢失（剪映标红）：片段上压的一层红。
+    #[must_use]
+    pub fn missing_veil() -> Hsla {
+        rgba(0xB423_18B0).into()
+    }
+
+    /// 预览轴：橙色细线（和白色的播放头区分开）。
+    #[must_use]
+    pub fn preview_axis() -> Hsla {
+        rgb(0xF7_9009).into()
+    }
+
     /// 播放头（剪映是白色）。
     #[must_use]
     pub fn playhead() -> Hsla {

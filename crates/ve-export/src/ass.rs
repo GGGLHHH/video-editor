@@ -59,104 +59,216 @@ pub fn write_ass(project: &Project) -> String {
         style.outline_px(h),
         style.margin_px(h),
     );
-    let mut clips: Vec<_> = project
+    let mut clips: Vec<&ve_core::Clip> = project
         .timeline
         .tracks
         .iter()
         .filter(|t| t.kind == TrackKind::Subtitle && t.shows())
-        .flat_map(|t| t.clips.iter())
-        .filter(|c| c.enabled())
-        .filter_map(|c| {
-            c.subtitle_text()
-                .map(|text| (c.start, c.end(), text, c.text_motion().unwrap_or_default()))
-        })
+        .flat_map(|t| t.clips.iter().map(AsRef::as_ref))
+        .filter(|c| c.enabled() && c.subtitle_text().is_some())
         .collect();
-    clips.sort_by_key(|c| c.0);
-    // 有入场 / 出场动画的字幕拆成三段（入场、中间、出场），各段用自己的标签：
-    // 一行 ASS 只能有一个 \move，入场、出场都滑动时只能拆开
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "边距已取整，比画面高度小"
-    )]
-    let margin = style.margin_px(h) as u32;
-    let (x, base_y) = (w / 2, h.saturating_sub(margin));
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "滑动距离是画面高度的 5%"
-    )]
-    let slide = (f64::from(h) * f64::from(ve_core::text_motion::SLIDE)).round() as u32;
-    let zoom = (ve_core::text_motion::ZOOM_FROM * 100.0).round();
-    for (start, end, text, motion) in clips {
-        let len = ve_core::text_motion::motion_len(end - start);
-        let intro = intro_tags(motion.intro, len, x, base_y, slide, zoom);
-        let outro = outro_tags(motion.outro, len, x, base_y, slide, zoom);
-        let mid_start = if intro.is_some() { start + len } else { start };
-        let mid_end = if outro.is_some() { end - len } else { end };
-        let text = escape(text);
-        let mut line = |from: Time, to: Time, tags: &str| {
-            if to <= from {
-                return;
-            }
-            out.push_str("Dialogue: 0,");
-            ass_time(&mut out, from);
-            out.push(',');
-            ass_time(&mut out, to);
-            let _ = writeln!(out, ",Default,,0,0,0,,{tags}{text}");
-        };
-        if let Some(tags) = &intro {
-            line(start, mid_start, tags);
-        }
-        line(mid_start, mid_end, "");
-        if let Some(tags) = &outro {
-            line(mid_end, end, tags);
-        }
+    clips.sort_by_key(|c| c.start);
+    for clip in clips {
+        write_clip(&mut out, project, clip);
     }
     out
 }
 
-/// 入场那一段的标签（`None` 是没有入场动画）。和 [`ve_core::text_pose`] 一样都是线性的。
-fn intro_tags(
-    intro: ve_core::TextIn,
-    len: Time,
-    x: u32,
-    y: u32,
-    slide: u32,
-    zoom: f32,
-) -> Option<String> {
-    let ms = len.as_millis().max(0);
-    match intro {
-        ve_core::TextIn::None => None,
-        ve_core::TextIn::FadeIn => Some(format!("{{\\fad({ms},0)}}")),
-        ve_core::TextIn::SlideUp => Some(format!(
-            "{{\\an2\\move({x},{},{x},{y})\\fad({ms},0)}}",
-            y + slide
-        )),
-        ve_core::TextIn::ZoomIn => Some(format!(
-            "{{\\fscx{zoom}\\fscy{zoom}\\t(\\fscx100\\fscy100)}}"
-        )),
+/// 一条字幕最多切成这么多段。
+const MAX_SLICES: usize = 400;
+
+/// 字幕要切开的时刻（相对片段起点）：入场 / 出场的分界、逐字入场结束、关键帧，
+/// 循环动画和有缓动的关键帧再细分（每段里都按线性过渡，细分后和预览的曲线贴得很近）。
+fn slice_points(clip: &ve_core::Clip) -> Vec<Time> {
+    use ve_core::text_motion::{CHAR_FADE, char_len, motion_len};
+    let d = clip.duration;
+    let motion = clip.text_motion().unwrap_or_default();
+    let mut pts = vec![Time::ZERO, d];
+    let len = motion_len(d);
+    if motion.intro != ve_core::TextIn::None && !motion.intro.per_char() {
+        pts.push(len);
     }
+    if motion.intro.per_char() {
+        let n = clip.subtitle_text().map_or(1, |t| t.chars().count());
+        pts.push(char_len(d, n) + CHAR_FADE);
+    }
+    if motion.outro != ve_core::TextOut::None {
+        pts.push(d - len);
+    }
+    let keys = clip.animation.times_of(&ve_core::Prop::TRANSFORM);
+    pts.extend(keys.iter().copied());
+    // 有缓动的关键帧段：每段再分 6 份
+    for w in keys.windows(2) {
+        if clip.animation.easing_of(&ve_core::Prop::TRANSFORM, w[0])
+            != Some(ve_core::Easing::Linear)
+        {
+            let step = Time((w[1] - w[0]).0 / 6);
+            pts.extend((1..6).map(|k| w[0] + Time(step.0 * k)));
+        }
+    }
+    // 循环动画：每个周期分 8 段
+    if motion.looping != ve_core::TextLoop::None {
+        let step = Time(motion.looping.period().0 / 8).max(Time::from_millis(20));
+        let mut t = step;
+        while t < d && pts.len() < MAX_SLICES {
+            pts.push(t);
+            t += step;
+        }
+    }
+    pts.retain(|t| *t >= Time::ZERO && *t <= d);
+    pts.sort_unstable();
+    pts.dedup();
+    pts
 }
 
-/// 出场那一段的标签（`None` 是没有出场动画）。
-fn outro_tags(
-    outro: ve_core::TextOut,
-    len: Time,
-    x: u32,
-    y: u32,
-    slide: u32,
-    zoom: f32,
-) -> Option<String> {
-    let ms = len.as_millis().max(0);
-    match outro {
-        ve_core::TextOut::None => None,
-        ve_core::TextOut::FadeOut => Some(format!("{{\\fad(0,{ms})}}")),
-        ve_core::TextOut::SlideDown => Some(format!(
-            "{{\\an2\\move({x},{y},{x},{})\\fad(0,{ms})}}",
-            y + slide
-        )),
-        ve_core::TextOut::ZoomOut => Some(format!("{{\\t(\\fscx{zoom}\\fscy{zoom})}}")),
+/// ASS 的不透明度写法（00 不透明，FF 全透明）。
+fn ass_alpha(alpha: f32) -> String {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "0–255"
+    )]
+    let a = ((1.0 - alpha.clamp(0.0, 1.0)) * 255.0).round() as u8;
+    format!("&H{a:02X}&")
+}
+
+/// 这一条自己的样式（和工程的不一样时）写成行内标签。
+fn style_tags(own: &SubtitleStyle, h: u32) -> String {
+    format!(
+        "\\fn{}\\fs{}\\c{}\\3c{}\\bord{:.1}\\b{}",
+        own.font,
+        own.font_px(h),
+        SubtitleStyle::ass_color(own.color),
+        SubtitleStyle::ass_color(own.outline_color),
+        own.outline_px(h),
+        u8::from(own.bold)
+    )
+}
+
+/// 逐字入场：每个字单独的标签（时间相对这一行开头 `line_start`）。
+fn per_char_text(
+    clip: &ve_core::Clip,
+    text: &str,
+    line_start: Time,
+    line_end: Time,
+    final_alpha: &str,
+    final_scale: f32,
+) -> String {
+    use ve_core::text_motion::{CHAR_FADE, ZOOM_FROM, char_len, char_step};
+    let motion = clip.text_motion().unwrap_or_default();
+    let n = text.chars().filter(|c| *c != '\n').count();
+    let step = char_step(char_len(clip.duration, n), n);
+    let ms = |t: Time| t.as_millis();
+    let full = (final_scale * 100.0).round();
+    let mut out = String::new();
+    let mut i: i64 = 0;
+    for ch in text.chars() {
+        if ch == '\n' {
+            out.push_str("\\N");
+            continue;
+        }
+        let begin = Time(step.0 * i);
+        i += 1;
+        let done = match motion.intro {
+            ve_core::TextIn::Typewriter => begin,
+            _ => begin + CHAR_FADE,
+        };
+        let esc = escape(&ch.to_string());
+        if done <= line_start || begin >= line_end + CHAR_FADE {
+            out.push_str(&esc);
+            continue;
+        }
+        let (a0, s0) = ve_core::text_motion::char_reveal(
+            motion.intro,
+            usize::try_from(i - 1).unwrap_or(0),
+            n,
+            line_start,
+            clip.duration,
+        );
+        let t0 = ms(begin.max(line_start) - line_start);
+        let t1 = ms(done - line_start).max(t0 + 1);
+        let start_alpha = ass_alpha(a0);
+        let _ = match motion.intro {
+            ve_core::TextIn::CharZoom => {
+                let s = (s0.max(ZOOM_FROM) * final_scale * 100.0).round();
+                write!(
+                    out,
+                    "{{\\alpha{start_alpha}\\fscx{s}\\fscy{s}\\t({t0},{t1},\\alpha{final_alpha}\\fscx{full}\\fscy{full})}}{esc}"
+                )
+            }
+            _ => write!(
+                out,
+                "{{\\alpha{start_alpha}\\t({t0},{t1},\\alpha{final_alpha})}}{esc}"
+            ),
+        };
+    }
+    out
+}
+
+/// 一条字幕：按 [`slice_points`] 切开，每段从这一段开头的样子线性过渡到结尾的样子
+/// （位置 `\move`、缩放 `\fscx`、不透明度 `\alpha`，和预览按同一个公式算的 [`ve_core::text_state`]）。
+fn write_clip(out: &mut String, project: &Project, clip: &ve_core::Clip) {
+    let Some(text) = clip.subtitle_text() else {
+        return;
+    };
+    let (w, h) = (project.settings.width, project.settings.height);
+    let own = clip.own_subtitle_style();
+    let style = own.unwrap_or(&project.subtitle_style);
+    let own_tags = own.map(|s| style_tags(s, h)).unwrap_or_default();
+    let base_y = f64::from(h) - style.margin_px(h);
+    let pos = |s: &ve_core::TextState| {
+        (
+            (f64::from(w) * (0.5 + f64::from(s.x))).round(),
+            f64::from(s.y).mul_add(f64::from(h), base_y).round(),
+        )
+    };
+    let per_char = clip.text_motion().is_some_and(|m| m.intro.per_char());
+    let pts = slice_points(clip);
+    for win in pts.windows(2) {
+        let (a, b) = (win[0], win[1]);
+        if b <= a {
+            continue;
+        }
+        let s0 = ve_core::text_state(clip, a);
+        // 段尾取结束前一点点的样子（出场到了最后一刻是全透明的，那一刻已经不显示了）
+        let s1 = ve_core::text_state(clip, b - Time(1).min(Time((b - a).0 / 2)));
+        let (x0, y0) = pos(&s0);
+        let (x1, y1) = pos(&s1);
+        let mut tags = format!("{{\\an2{own_tags}");
+        if (x0 - x1).abs() < 0.5 && (y0 - y1).abs() < 0.5 {
+            let _ = write!(tags, "\\pos({x0},{y0})");
+        } else {
+            let _ = write!(tags, "\\move({x0},{y0},{x1},{y1})");
+        }
+        let (sc0, sc1) = ((s0.scale * 100.0).round(), (s1.scale * 100.0).round());
+        let (al0, al1) = (ass_alpha(s0.alpha), ass_alpha(s1.alpha));
+        if (sc0 - 100.0).abs() > 0.1 || (sc1 - 100.0).abs() > 0.1 {
+            let _ = write!(tags, "\\fscx{sc0}\\fscy{sc0}");
+        }
+        if !per_char && al0 != "&H00&" {
+            let _ = write!(tags, "\\alpha{al0}");
+        }
+        let mut change = String::new();
+        if (sc0 - sc1).abs() > 0.1 {
+            let _ = write!(change, "\\fscx{sc1}\\fscy{sc1}");
+        }
+        if !per_char && al0 != al1 {
+            let _ = write!(change, "\\alpha{al1}");
+        }
+        if !change.is_empty() {
+            let _ = write!(tags, "\\t({change})");
+        }
+        tags.push('}');
+        let body = if per_char {
+            per_char_text(clip, text, a, b, &al1, s1.scale)
+        } else {
+            escape(text)
+        };
+        out.push_str("Dialogue: 0,");
+        ass_time(out, clip.start + a);
+        out.push(',');
+        ass_time(out, clip.start + b);
+        let _ = writeln!(out, ",Default,,0,0,0,,{tags}{body}");
     }
 }
 
@@ -175,7 +287,10 @@ mod tests {
         // 1080 × 0.055 ≈ 59
         assert!(ass.contains("Style: Default,Microsoft YaHei,59,"), "{ass}");
         assert!(
-            ass.contains("Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,你好\n"),
+            ass.contains(&format!(
+                "Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,{{\\an2\\pos(960,{})}}你好\n",
+                (1080.0 - p.subtitle_style.margin_px(1080)).round()
+            )),
             "{ass}"
         );
     }
@@ -213,43 +328,121 @@ mod tests {
         assert!(!write_ass(&p).contains("你好"));
     }
 
+    /// 所有 Dialogue 行（不含头部）。
+    fn dialogues(ass: &str) -> Vec<&str> {
+        ass.lines().filter(|l| l.starts_with("Dialogue:")).collect()
+    }
+
     #[test]
-    fn animated_subtitles_are_split_into_intro_middle_and_outro() {
+    fn animated_subtitles_are_sliced_and_move_linearly() {
         let (mut p, ids) = sample_project();
         let m = ve_core::TextMotion {
             intro: ve_core::TextIn::SlideUp,
             outro: ve_core::TextOut::ZoomOut,
+            ..ve_core::TextMotion::default()
         };
         ve_core::edit::set_text_motion(&mut p, &[ids.s1], m).unwrap();
         let ass = write_ass(&p);
+        let lines = dialogues(&ass);
         // s1 在 1–3 秒：入场 1.0–1.5，中间 1.5–2.5，出场 2.5–3.0
-        // 1080 高：底边离 1080 − 边距；滑动 54 像素
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "边距已取整"
-        )]
-        let y = 1080 - p.subtitle_style.margin_px(1080) as u32;
+        assert_eq!(lines.len(), 3, "{ass}");
+        let y = (1080.0 - p.subtitle_style.margin_px(1080)).round();
         assert!(
-            ass.contains(&format!(
-                "Dialogue: 0,0:00:01.00,0:00:01.50,Default,,0,0,0,,{{\\an2\\move(960,{},960,{y})\\fad(500,0)}}你好\n",
-                y + 54
-            )),
+            lines[0].starts_with("Dialogue: 0,0:00:01.00,0:00:01.50,"),
             "{ass}"
         );
         assert!(
-            ass.contains("Dialogue: 0,0:00:01.50,0:00:02.50,Default,,0,0,0,,你好\n"),
-            "{ass}"
+            lines[0].contains(&format!("\\move(960,{},960,{y})", y + 54.0))
+                && lines[0].contains("\\alpha&HFF&\\t(\\alpha&H00&)"),
+            "入场：从下面 54 像素升上来、从透明到不透明：{}",
+            lines[0]
         );
         assert!(
-            ass.contains(
-                "Dialogue: 0,0:00:02.50,0:00:03.00,Default,,0,0,0,,{\\t(\\fscx50\\fscy50)}你好\n"
-            ),
-            "{ass}"
+            lines[1].contains(&format!("\\pos(960,{y})")),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("\\t(\\fscx50\\fscy50)"),
+            "出场缩到一半：{}",
+            lines[2]
         );
         // 没动画的字幕还是一行
         let (plain, _) = sample_project();
-        assert_eq!(write_ass(&plain).matches("Dialogue:").count(), 1);
+        assert_eq!(dialogues(&write_ass(&plain)).len(), 1);
+    }
+
+    #[test]
+    fn keyframed_position_and_own_style_reach_the_ass() {
+        use ve_core::edit::{add_keyframe_props, apply_transform_at, set_own_subtitle_style};
+        let (mut p, ids) = sample_project();
+        add_keyframe_props(&mut p, ids.s1, Time::ZERO, &[ve_core::Prop::X]).unwrap();
+        let right = ve_core::Transform {
+            x: 0.25,
+            ..ve_core::Transform::default()
+        };
+        apply_transform_at(&mut p, ids.s1, Time::from_secs(2), right).unwrap();
+        ve_core::edit::set_keyframe_easing(
+            &mut p,
+            ids.s1,
+            Time::ZERO,
+            &[ve_core::Prop::X],
+            ve_core::Easing::Linear,
+        )
+        .unwrap();
+        let mut own = p.subtitle_style.clone();
+        own.color = 0xFF_0000;
+        own.size_ratio = 0.1;
+        set_own_subtitle_style(&mut p, &[ids.s1], Some(&own)).unwrap();
+        let ass = write_ass(&p);
+        let lines = dialogues(&ass);
+        assert_eq!(lines.len(), 1, "匀速关键帧：一段就够：{ass}");
+        assert!(
+            lines[0].contains("\\move(960,") && lines[0].contains(",1440,"),
+            "从中间移到右边四分之一：{}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains(&format!(
+                "\\fs{}\\c{}",
+                own.font_px(1080),
+                SubtitleStyle::ass_color(0xFF_0000)
+            )),
+            "自己的样式写成行内标签：{}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn per_char_intro_tags_each_character() {
+        let (mut p, ids) = sample_project();
+        let m = ve_core::TextMotion {
+            intro: ve_core::TextIn::Typewriter,
+            ..ve_core::TextMotion::default()
+        };
+        ve_core::edit::set_text_motion(&mut p, &[ids.s1], m).unwrap();
+        let ass = write_ass(&p);
+        let lines = dialogues(&ass);
+        // 两个字：第二个字 120 毫秒后出现
+        assert!(
+            lines[0].contains("}你{"),
+            "第一个字一开始就在：{}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("{\\alpha&HFF&\\t(120,121,\\alpha&H00&)}好"),
+            "{}",
+            lines[0]
+        );
+        // 逐字入场结束后的那一段不带逐字标签
+        assert!(lines.last().unwrap().ends_with("}你好"), "{ass}");
+        // 循环动画：按周期切成很多段
+        let looping = ve_core::TextMotion {
+            looping: ve_core::TextLoop::Breathe,
+            ..ve_core::TextMotion::default()
+        };
+        ve_core::edit::set_text_motion(&mut p, &[ids.s1], looping).unwrap();
+        assert!(dialogues(&write_ass(&p)).len() > 10);
     }
 
     #[test]
@@ -257,7 +450,7 @@ mod tests {
         let (mut p, ids) = sample_project();
         set_subtitle_text(&mut p, ids.s1, "a{b}c\\d,e\n第二行".into()).unwrap();
         let ass = write_ass(&p);
-        assert!(ass.contains(",,a\\{b\\}c＼d,e\\N第二行\n"), "{ass}");
+        assert!(ass.contains("}a\\{b\\}c＼d,e\\N第二行\n"), "{ass}");
     }
 
     #[test]

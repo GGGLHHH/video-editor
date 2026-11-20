@@ -10,8 +10,8 @@ use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::{
     App, BorderStyle, Bounds, ContentMask, Context, Corners, Hsla, InteractiveElement as _,
     IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _,
-    Pixels, Point, ScrollEvent, Styled as _, TextAlign, Window, canvas, div, fill, outline, point,
-    px, size,
+    Pixels, Point, ScrollEvent, StatefulInteractiveElement as _, Styled as _, TextAlign, Window,
+    canvas, div, fill, outline, point, px, size,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -46,6 +46,18 @@ pub struct TimelineUi {
     pub pointer: (f32, f32),
     /// 正在拖横向滚动条：（按下时的横坐标，按下时的横向滚动）。
     pub thumb_drag: Option<(f32, f32)>,
+    /// 鼠标模式（选择 / 分割）。
+    pub tool: super::tools::MouseTool,
+    /// 鼠标模式菜单展开着。
+    pub tool_menu: bool,
+    /// 预览轴开着（S）。
+    pub preview_axis: bool,
+    /// 鼠标悬停处的时刻（在轨道区域里时）。
+    pub hover_time: Option<Time>,
+    /// 预览轴正在预览：真正的播放头位置（鼠标离开时回到这里）。
+    pub axis_anchor: Option<Time>,
+    /// 主轨「封面」菜单展开着。
+    pub cover_menu: bool,
 }
 
 /// 框选。
@@ -74,6 +86,10 @@ struct Snapshot {
     /// 框选矩形的两个角（时间轴本地坐标）。
     marquee: Option<((f32, f32), (f32, f32))>,
     ghosts: Vec<(usize, Time, Time)>,
+    /// 鼠标处的竖线（分割模式：切开的位置；预览轴：预览的位置）和颜色。
+    hover_line: Option<(Time, Hsla)>,
+    /// 找不到文件的素材（片段标红）。
+    missing: std::collections::BTreeSet<AssetId>,
 }
 
 impl Workspace {
@@ -164,8 +180,19 @@ impl Workspace {
         cx: &mut Context<'_, Self>,
     ) {
         self.focus.focus(window, cx);
+        self.end_preview_axis();
         let (x, y) = self.local(e.position);
         let geo = self.timeline.geometry;
+        if y >= geo.ruler_height
+            && self.blade_click(
+                geo.hit_test(x, y, &self.doc.project.timeline),
+                x,
+                window,
+                cx,
+            )
+        {
+            return;
+        }
         let toggle = e.modifiers.control || e.modifiers.platform;
         let range = e.modifiers.shift;
         match geo.hit_test(x, y, &self.doc.project.timeline) {
@@ -201,7 +228,8 @@ impl Workspace {
         }
         // Ctrl 点击减选掉的片段不跟着拖
         let drag = Drag::begin(&self.doc, &geo, x, y, self.playhead)
-            .filter(|d| d.clip().is_none_or(|c| self.doc.is_selected(c)));
+            .filter(|d| d.clip().is_none_or(|c| self.doc.is_selected(c)))
+            .and_then(|d| self.tool_drag(d, geo.x_to_time(x)));
         if drag.is_some_and(|d| d.clip().is_some()) {
             self.doc.begin_gesture();
         }
@@ -282,7 +310,14 @@ impl Workspace {
                 Hit::Clip { clip, .. } => Some(clip),
                 _ => None,
             };
-            let cursor = super::interaction::cursor_for(hit, None, false);
+            let cursor = if self.timeline.tool == super::tools::MouseTool::Blade
+                && matches!(hit, Hit::Clip { .. })
+            {
+                gpui_kit::CursorStyle::Crosshair
+            } else {
+                super::interaction::cursor_for(hit, None, false)
+            };
+            self.timeline_hover_at(x, if y >= geo.ruler_height { y } else { -1.0 }, cx);
             if hover != self.timeline.hover || cursor != self.timeline.cursor {
                 self.timeline.hover = hover;
                 self.timeline.cursor = cursor;
@@ -448,10 +483,25 @@ impl Workspace {
                 )
             }),
             ghosts: self.timeline.ghosts.clone(),
+            hover_line: self.timeline.hover_time.and_then(|t| {
+                if self.timeline.tool == super::tools::MouseTool::Blade {
+                    Some((t, palette::selection()))
+                } else if self.timeline.axis_anchor.is_some() {
+                    Some((t, palette::preview_axis()))
+                } else {
+                    None
+                }
+            }),
+            missing: self.missing.clone(),
         };
         let this = cx.entity();
         div()
             .id("timeline")
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !*hovered {
+                    this.timeline_hover_end(cx);
+                }
+            }))
             .test_support()
             .flex_1()
             .min_h_0()
@@ -669,6 +719,9 @@ fn paint(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut 
             line(window, t, 1.0, palette::snap());
         }
         line(window, snap.playhead, 2.0, playhead_color(on_playhead));
+        if let Some((t, color)) = snap.hover_line {
+            line(window, t, 1.0, color);
+        }
         paint_marquee(snap, ox, oy, window);
         // 拖到缝上：一条贯穿的白色横线，标出松手后新轨道的位置（剪映）
         if let Some(slot) = snap.insert {
@@ -707,6 +760,7 @@ fn paint(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut 
             }
         }
     }
+    paint_range(snap, ox, oy, w, window);
     paint_markers(snap, ox, oy, w, window);
     paint_transitions(snap, ox, oy, window);
     let px_head = ox + geo.time_to_x(snap.playhead);
@@ -740,6 +794,32 @@ fn paint_transitions(snap: &Snapshot, ox: f32, oy: f32, window: &mut Window) {
             window.paint_quad(
                 outline(r, palette::accent(), BorderStyle::Solid).corner_radii(px(3.0)),
             );
+        }
+    }
+}
+
+/// 入出点区域：标尺上一条半透明的青色带，两头各一条竖线（剪映）。
+fn paint_range(snap: &Snapshot, ox: f32, oy: f32, w: f32, window: &mut Window) {
+    let geo = snap.geo;
+    let Some((a, b)) = snap.project.timeline.range else {
+        return;
+    };
+    let left = ox + geo.header_width;
+    let x0 = (ox + geo.time_to_x(a)).max(left);
+    let x1 = (ox + geo.time_to_x(b)).min(ox + w);
+    if x1 <= x0 {
+        return;
+    }
+    window.paint_quad(fill(
+        rect(x0, oy, x1 - x0, geo.ruler_height),
+        palette::accent().opacity(0.22),
+    ));
+    for (t, x) in [(a, x0), (b, x1)] {
+        if ox + geo.time_to_x(t) >= left {
+            window.paint_quad(fill(
+                rect(x - 1.0, oy, 2.0, geo.ruler_height),
+                palette::accent(),
+            ));
         }
     }
 }
@@ -827,6 +907,32 @@ fn paint_marquee(snap: &Snapshot, ox: f32, oy: f32, window: &mut Window) {
     }
 }
 
+/// 剪映式标题：字幕显示全文；媒体片段显示「名字  精确到帧的时长」（变过速的再标倍数）。
+fn clip_title(snap: &Snapshot, clip: &ve_core::Clip, asset: Option<&ve_core::Asset>) -> String {
+    clip.subtitle_text().map_or_else(
+        || {
+            let name = if clip.is_adjustment() {
+                "调节".to_owned()
+            } else if let Some(e) = clip.effect() {
+                e.name().to_owned()
+            } else if let Some((inner, _)) = clip.compound() {
+                format!("▣ {}", inner.name)
+            } else {
+                asset.map(|a| a.name.clone()).unwrap_or_default()
+            };
+            let rate = snap.project.settings.frame_rate;
+            let time = ve_core::format_timecode(clip.duration, rate);
+            // 变过速的片段标出倍数（剪映在片段上显示「2.0x」）
+            if (clip.speed - 1.0).abs() > 1e-4 {
+                format!("{name}  {time}  {}x", clip.speed)
+            } else {
+                format!("{name}  {time}")
+            }
+        },
+        str::to_owned,
+    )
+}
+
 fn paint_clip(
     snap: &Snapshot,
     clip: &ve_core::Clip,
@@ -841,6 +947,8 @@ fn paint_clip(
     let selected = snap.selection.contains(&clip.id);
     let color = match kind {
         TrackKind::Video if clip.is_adjustment() => palette::adjustment_clip(),
+        TrackKind::Video if clip.effect().is_some() => palette::effect_clip(),
+        _ if clip.compound().is_some() => palette::compound_clip(),
         TrackKind::Video => palette::video_clip(),
         TrackKind::Audio => palette::audio_clip(),
         TrackKind::Subtitle => palette::subtitle_clip(),
@@ -861,28 +969,23 @@ fn paint_clip(
             }
             _ => {}
         }
-        // 剪映式标题：字幕显示全文；媒体片段显示「名字  精确到帧的时长」
-        let label = clip.subtitle_text().map_or_else(
-            || {
-                let name = if clip.is_adjustment() {
-                    "调节".to_owned()
-                } else {
-                    asset.map(|a| a.name.clone()).unwrap_or_default()
-                };
-                let rate = snap.project.settings.frame_rate;
-                let time = ve_core::format_timecode(clip.duration, rate);
-                // 变过速的片段标出倍数（剪映在片段上显示「2.0x」）
-                if (clip.speed - 1.0).abs() > 1e-4 {
-                    format!("{name}  {time}  {}x", clip.speed)
-                } else {
-                    format!("{name}  {time}")
-                }
-            },
-            str::to_owned,
-        );
+        let label = clip_title(snap, clip, asset);
         // 选中的片段：白色描边（剪映式）再蒙一层很淡的白，压在花哨的缩略图上也看得出来
         if selected {
             window.paint_quad(fill(r, palette::selection_tint()));
+        }
+        // 媒体丢失（剪映）：压一层红，标题下面注明
+        if clip.asset().is_some_and(|a| snap.missing.contains(&a)) {
+            window.paint_quad(fill(r, palette::missing_veil()));
+            paint_text(
+                window,
+                cx,
+                "媒体丢失",
+                x0 + 5.0,
+                y0 + 16.0,
+                11.0,
+                palette::text(),
+            );
         }
         // 停用的片段：先压一层深色（标题画在上面，仍看得清），标题下面注明（剪映的「停用片段」）
         if clip.disabled {
@@ -896,6 +999,14 @@ fn paint_clip(
                 11.0,
                 palette::text(),
             );
+        }
+        // 颜色标签（剪映）：标题那一条换成标签色
+        if let Some(l) = clip.label {
+            let w = f32::from(r.size.width);
+            window.paint_quad(fill(
+                rect(x0, y0, w, 15.0),
+                crate::clip_label::label_color(l).opacity(0.85),
+            ));
         }
         paint_text(
             window,

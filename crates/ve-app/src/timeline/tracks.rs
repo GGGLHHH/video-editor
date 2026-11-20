@@ -149,8 +149,20 @@ impl Workspace {
                     .into_any_element(),
             )
         });
+        // 只有主轨有「封面」（剪映）
+        let main = ve_core::magnet::main_track(timeline);
+        let cover = timeline
+            .tracks
+            .iter()
+            .position(|t| Some(t.id) == main)
+            .map(|i| geo.track_top(i) + (geo.track_height - HEADER_BUTTON) / 2.0)
+            .filter(|top| {
+                *top >= geo.ruler_height && *top <= f32::from(self.timeline.bounds.size.height)
+            })
+            .map(|top| self.render_cover_button(top, cx));
         std::iter::once(add.into_any_element())
             .chain(rows)
+            .chain(cover)
             .collect()
     }
 

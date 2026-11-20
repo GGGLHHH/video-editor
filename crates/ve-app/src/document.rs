@@ -291,6 +291,12 @@ impl Document {
         self.path.as_deref()
     }
 
+    /// 内容还没存过（导入出来的新工程）：标成有未保存修改，自动保存、关窗口提示都会管它。
+    pub const fn mark_unsaved(&mut self) {
+        self.dirty = true;
+        self.revision += 1;
+    }
+
     /// 已保存到 `path`。
     pub fn mark_saved(&mut self, path: PathBuf) {
         self.path = Some(path);

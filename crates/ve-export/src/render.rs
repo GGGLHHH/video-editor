@@ -44,10 +44,25 @@ struct LayerFrame {
     source: (u32, u32),
     transform: Transform,
     color: ve_core::ColorMatrix,
+    look: ve_core::Look,
+    grades: ve_core::GradeChain,
 }
 
+/// 一层的画面属性、调色、外观和调色链。
+type Appearance = (
+    Transform,
+    ve_core::ColorMatrix,
+    ve_core::Look,
+    ve_core::GradeChain,
+);
+
 /// 一帧要合成的东西：各层画面（从下往上）和底色的调色。
-type FrameLayers = (Vec<LayerFrame>, ve_core::ColorMatrix);
+/// 一帧要合成的东西：各层画面，底色调色，画面特效（`after` 已按画出来的层换算）。
+type FrameLayers = (
+    Vec<LayerFrame>,
+    (ve_core::ColorMatrix, ve_core::GradeChain),
+    Vec<ve_core::EffectPass>,
+);
 
 /// 按顺序读一个片段的画面：第一次定位，之后一直往后读。
 struct Stepper {
@@ -83,6 +98,32 @@ impl Stepper {
         };
         self.current = Some(Arc::clone(&current));
         Ok(current)
+    }
+
+    /// [`Self::frame_at`]；`blend` 时再和下一帧混合（帧融合）。
+    fn frame_or_blend(&mut self, t: Time, blend: bool) -> Result<Arc<VideoFrame>, MediaError> {
+        let f = self.frame_at(t)?;
+        if blend { self.blended(t, f) } else { Ok(f) }
+    }
+
+    /// 帧融合：[`Self::frame_at`] 取到的那一帧和它的下一帧按时间混合（和预览同一个函数）。
+    fn blended(
+        &mut self,
+        t: Time,
+        current: Arc<VideoFrame>,
+    ) -> Result<Arc<VideoFrame>, MediaError> {
+        if self.still {
+            return Ok(current);
+        }
+        if self.peek.is_none() && !self.ended {
+            self.peek = self.decoder.next_frame()?;
+            self.ended = self.peek.is_none();
+        }
+        Ok(self
+            .peek
+            .as_ref()
+            .and_then(|b| ve_media::blend_frames(&current, b, t))
+            .map_or(current, Arc::new))
     }
 }
 
@@ -137,7 +178,23 @@ fn layer_frames(
     t: Time,
     steppers: &mut HashMap<Key, Stepper>,
 ) -> Result<FrameLayers, ExportError> {
-    let ve_core::compose::Composition { layers, background } = resolve_frame(project, t);
+    let ve_core::compose::Composition {
+        layers,
+        background,
+        background_grades,
+        effects,
+    } = resolve_frame(project, t);
+    // 素材没有画面的层不画：特效压在哪几层上要按画出来的算
+    let kept: Vec<bool> = layers
+        .iter()
+        .map(|l| {
+            project
+                .assets
+                .get(&l.asset)
+                .is_some_and(|a| a.video.is_some())
+        })
+        .collect();
+    let effects = ve_core::EffectPass::remap(&effects, &kept);
     steppers.retain(|key, _| layers.iter().any(|l| (l.track, l.clip) == *key));
     let mut jobs = Vec::with_capacity(layers.len());
     for l in &layers {
@@ -170,19 +227,21 @@ fn layer_frames(
             stepper,
             l.source_time,
             source,
-            (l.transform, l.color),
-            asset.name.clone(),
+            (l.transform, l.color, l.look, l.grades.clone()),
+            (asset.name.clone(), l.frame_blend),
         ));
     }
-    let step = |(key, mut stepper, time, source, (transform, color), name): (
-        Key,
-        Stepper,
-        Time,
-        (u32, u32),
-        (Transform, ve_core::ColorMatrix),
-        String,
-    )| {
-        let r = stepper.frame_at(time).map_err(|e| render_error(&name, &e));
+    let step = |(
+        key,
+        mut stepper,
+        time,
+        source,
+        (transform, color, look, grades),
+        (name, blend),
+    ): (Key, Stepper, Time, (u32, u32), Appearance, (String, bool))| {
+        let r = stepper
+            .frame_or_blend(time, blend)
+            .map_err(|e| render_error(&name, &e));
         (
             key,
             stepper,
@@ -191,6 +250,8 @@ fn layer_frames(
                 source,
                 transform,
                 color,
+                look,
+                grades,
             }),
         )
     };
@@ -216,7 +277,7 @@ fn layer_frames(
         steppers.insert(key, stepper);
         frames.push(r?);
     }
-    Ok((frames, background))
+    Ok((frames, (background, background_grades), effects))
 }
 
 fn render_error(name: &str, e: &MediaError) -> ExportError {
@@ -285,7 +346,7 @@ pub fn render_video(
                 });
                 break;
             };
-            let (layers, background) = match layers {
+            let (layers, background, effects) = match layers {
                 Ok(l) => l,
                 Err(e) => {
                     outcome = Err(e);
@@ -306,9 +367,12 @@ pub fn render_video(
                     geometry: layer_geometry(size, l.source, &l.transform),
                     opacity: l.transform.opacity,
                     color: l.color,
+                    look: l.look,
+                    grades: &l.grades,
                 })
                 .collect();
-            compositor.set_background(&background);
+            compositor.set_background_chain(&background.0, &background.1);
+            compositor.set_effects(&effects);
             if let Err(e) = compositor.submit_nv12(size, &gpu) {
                 outcome = Err(ExportError::Render(e.to_string()));
                 break;

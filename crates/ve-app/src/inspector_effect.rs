@@ -1,0 +1,156 @@
+//! 画面特效片段的属性（剪映选中特效后的「特效」标签）：换特效种类、调强度。
+
+use crate::chrome;
+use crate::workspace::Workspace;
+use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
+use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::{
+    AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
+};
+use ve_core::{ClipId, Effect, EffectKind};
+
+/// 特效标签的控件。
+#[derive(Debug)]
+pub(crate) struct EffectFields {
+    /// 强度 0–100。
+    amount: Entity<SliderState>,
+    /// 正在拖强度滑条（整次拖动一步撤销）。
+    gesture: bool,
+}
+
+impl EffectFields {
+    pub(crate) fn new(
+        window: &Window,
+        cx: &mut Context<'_, Workspace>,
+    ) -> (Self, Vec<Subscription>) {
+        let amount = cx.new(|_| {
+            SliderState::new()
+                .min(0.0)
+                .max(100.0)
+                .step(1.0)
+                .default_value(Effect::DEFAULT_AMOUNT * 100.0)
+        });
+        let sub = cx.subscribe_in(
+            &amount,
+            window,
+            |this: &mut Workspace, _, e: &SliderEvent, window, cx| {
+                this.on_effect_amount(e, window, cx);
+            },
+        );
+        (
+            Self {
+                amount,
+                gesture: false,
+            },
+            vec![sub],
+        )
+    }
+}
+
+impl Workspace {
+    /// 选中的特效片段和它的特效。
+    fn bound_effect(&self) -> Option<(ClipId, Effect)> {
+        let id = self.inspector.bound?;
+        let (_, c) = self.doc.project.timeline.find_clip(id)?;
+        Some((id, c.effect()?))
+    }
+
+    fn set_bound_effect(
+        &mut self,
+        f: impl FnOnce(&mut Effect),
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((clip, mut e)) = self.bound_effect() else {
+            return;
+        };
+        f(&mut e);
+        if self.inspector.effect.gesture {
+            let _ = self.doc.edit(|p| ve_core::edit::set_effect(p, clip, e));
+            self.after_change(window, cx);
+        } else {
+            self.apply(window, cx, |p| ve_core::edit::set_effect(p, clip, e));
+        }
+    }
+
+    fn on_effect_amount(
+        &mut self,
+        e: &SliderEvent,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        match e {
+            SliderEvent::Change(v) => {
+                if !self.inspector.effect.gesture {
+                    self.doc.begin_gesture();
+                    self.inspector.effect.gesture = true;
+                }
+                let amount = (v.start() / 100.0).clamp(0.0, 1.0);
+                self.set_bound_effect(|e| e.amount = amount, window, cx);
+            }
+            SliderEvent::Release(_) => {
+                if self.inspector.effect.gesture {
+                    self.doc.end_gesture();
+                    self.inspector.effect.gesture = false;
+                }
+            }
+        }
+    }
+
+    /// 强度滑条跟着片段走（换了片段、撤销之后）；正在拖的时候不动。
+    pub(crate) fn refresh_effect_slider(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.inspector.effect.gesture {
+            return;
+        }
+        let Some((_, e)) = self.bound_effect() else {
+            return;
+        };
+        let ui = (e.amount * 100.0).round();
+        let s = &self.inspector.effect.amount;
+        if (s.read(cx).value().start() - ui).abs() > 0.5 {
+            s.update(cx, |s, cx| s.set_value(ui, window, cx));
+        }
+    }
+
+    /// 「特效」标签：特效种类一排、强度滑条。
+    pub(crate) fn render_effect_tab(&self, cx: &Context<'_, Self>) -> impl IntoElement + use<> {
+        let muted = cx.theme().muted_foreground;
+        let current = self.bound_effect().map(|(_, e)| e);
+        let kinds = h_flex()
+            .flex_wrap()
+            .gap_1()
+            .children(EffectKind::ALL.iter().enumerate().map(|(i, &k)| {
+                let on = current.is_some_and(|e| e.kind == k);
+                chrome::chip(format!("effect-kind-{i}"), k.label(), on, cx).on_click(cx.listener(
+                    move |this, _, window, cx| {
+                        this.set_bound_effect(|e| e.kind = k, window, cx);
+                    },
+                ))
+            }));
+        let amount = current.map_or(0.0, |e| e.amount);
+        v_flex()
+            .gap_3()
+            .child(div().text_xs().text_color(muted).child("特效"))
+            .child(kinds)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().w_12().text_xs().child("强度"))
+                    .child(
+                        div()
+                            .id("effect-amount")
+                            .flex_1()
+                            .child(Slider::new(&self.inspector.effect.amount)),
+                    )
+                    .child(
+                        div()
+                            .w_8()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(SharedString::from(format!("{:.0}", amount * 100.0))),
+                    ),
+            )
+    }
+}

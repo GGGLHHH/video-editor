@@ -63,6 +63,21 @@ fn menu_groups() -> [(&'static str, Vec<MenuItem>); 2] {
                 item("menu-srt-out", "导出字幕（SRT）…", "", || {
                     Box::new(act::ExportSrt)
                 }),
+                item(
+                    "menu-otio-in",
+                    "导入 OTIO（Premiere / 达芬奇）…",
+                    "",
+                    || Box::new(act::ImportOtio),
+                ),
+                item(
+                    "menu-otio-out",
+                    "导出 OTIO（Premiere / 达芬奇）…",
+                    "",
+                    || Box::new(act::ExportOtio),
+                ),
+                item("menu-edl-out", "导出 EDL…", "", || {
+                    Box::new(act::ExportEdl)
+                }),
                 item("menu-export", "导出视频…", "Ctrl+E", || {
                     Box::new(act::Export)
                 }),
@@ -219,6 +234,8 @@ impl Workspace {
         rows.extend(self.recent_items(cx));
         v_flex()
             .id("app-menu")
+            // 盖住下面的东西：点菜单不会顺带点到下面的画面 / 时间轴
+            .occlude()
             .test_support()
             .absolute()
             .top(px(30.))

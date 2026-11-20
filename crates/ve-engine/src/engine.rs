@@ -103,6 +103,8 @@ pub(crate) struct Control {
     pub(crate) revision: u64,
     /// 播放倍数（J / K / L；负数倒放）。
     pub(crate) rate: f32,
+    /// 预览画面尺寸上限（剪映的「原画质 / 清晰画质」切换会改它）。
+    pub(crate) preview_max: ScaleTarget,
 }
 
 pub(crate) struct Queued {
@@ -142,6 +144,8 @@ pub(crate) struct Shared {
     pub(crate) preview_max: ScaleTarget,
     pub(crate) cache_bytes: usize,
     pub(crate) render: ve_render::RenderConfig,
+    /// 电平表：最近混出来的各块峰值。
+    pub(crate) levels: Mutex<crate::level::Levels>,
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -232,6 +236,7 @@ impl Engine {
                 start: Time::ZERO,
                 revision: 0,
                 rate: 1.0,
+                preview_max: config.preview_max,
             }),
             wake: Condvar::new(),
             clock,
@@ -241,6 +246,7 @@ impl Engine {
             shutdown: Arc::clone(&shutdown),
             decoded: AtomicU64::new(0),
             seeks: AtomicU64::new(0),
+            levels: Mutex::new(crate::level::Levels::default()),
             preview_max: config.preview_max,
             cache_bytes: config.cache_bytes,
             render: config.render,
@@ -288,6 +294,30 @@ impl Engine {
             threads,
             _stream: stream,
         })
+    }
+
+    /// 改预览画面尺寸上限（画质切换）：解码器按新尺寸重开，当前画面重新渲染。
+    pub fn set_preview_max(&self, max: ScaleTarget) {
+        let mut c = self.shared.control();
+        if c.preview_max == max {
+            return;
+        }
+        c.preview_max = max;
+        c.revision += 1;
+        if c.playing {
+            self.shared.wake.notify_all();
+        } else {
+            let pos = self.shared.clock.position();
+            c.seek = Some(pos);
+            self.shared.bump(&mut c, pos);
+        }
+        drop(c);
+    }
+
+    /// 现在的预览画面尺寸上限。
+    #[must_use]
+    pub fn preview_max(&self) -> ScaleTarget {
+        self.shared.control().preview_max
     }
 
     /// 换工程（编辑后调用）。播放中则从当前位置继续，暂停则重新渲染当前画面。
@@ -376,6 +406,15 @@ impl Engine {
             .clock
             .position()
             .clamp(Time::ZERO, duration.max(Time::ZERO))
+    }
+
+    /// 电平表：正在放的声音的左右峰值（0–1，线性）；停着时为零。
+    #[must_use]
+    pub fn levels(&self) -> [f32; 2] {
+        if !self.is_playing() {
+            return [0.0; 2];
+        }
+        lock(&self.shared.levels).at(self.position(), Time::from_millis(60))
     }
 
     /// 时间轴总长。
@@ -522,6 +561,24 @@ mod tests {
     }
 
     #[test]
+    fn preview_size_can_change_while_open() {
+        let e = engine();
+        e.set_project(Arc::new(project_with(&[Fixture::FrameIndexed30]).0));
+        e.seek(Time::ZERO);
+        let full = wait_frame_at(&e, Time::ZERO).frame.unwrap();
+        assert_eq!((full.width, full.height), (64, 36));
+        // 清晰画质：画面按一半大小解码、合成
+        e.set_preview_max(ScaleTarget {
+            max_width: 32,
+            max_height: 18,
+        });
+        let small = wait_frame_at(&e, Time::ZERO).frame.unwrap();
+        assert_eq!((small.width, small.height), (32, 18));
+        assert!((gray(&small) - expected_gray(0)).abs() <= 2.0);
+        assert_eq!(e.preview_max().max_width, 32);
+    }
+
+    #[test]
     fn seek_delivers_exact_frame() {
         let e = engine();
         e.set_project(Arc::new(project_with(&[Fixture::FrameIndexed30]).0));
@@ -538,7 +595,8 @@ mod tests {
         let e = engine();
         e.set_project(Arc::new(project_with(&[Fixture::FrameIndexed30]).0));
         let events = e.events();
-        e.seek(Time::from_millis(500));
+        // 从 1.5 秒倒回去：并行跑测试时软件显卡要排队，留够出帧的时间
+        e.seek(Time::from_millis(1500));
         e.play_at_rate(-1.0);
         assert!((e.rate() + 1.0).abs() < f32::EPSILON);
         let mut times = Vec::new();
@@ -734,6 +792,50 @@ mod tests {
         assert!((hz - 440.0).abs() < 15.0, "{hz}");
         let peak = left.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         assert!((peak - 0.5).abs() < 0.05, "{peak}");
+    }
+
+    #[test]
+    fn levels_follow_the_sound_while_playing() {
+        let e = engine();
+        e.set_project(Arc::new(project_with(&[Fixture::ToneStereo48k]).0));
+        assert_eq!(e.levels(), [0.0; 2], "停着没有电平");
+        e.play();
+        assert!(wait_until(2000, || e.levels()[0] > 0.4), "{:?}", e.levels());
+        let [l, r] = e.levels();
+        assert!(l < 0.55 && r < 0.55, "峰值约 0.5：{l} {r}");
+        e.pause();
+        assert_eq!(e.levels(), [0.0; 2]);
+    }
+
+    #[test]
+    fn audio_fx_reach_the_preview_without_shifting_the_sound() {
+        // 440 Hz 的正弦：压缩把峰值压下来；降噪有固定延迟，但补偿后声音不挪位置（还是连续的正弦）
+        let e = engine();
+        let (mut p, clips) = project_with(&[Fixture::ToneStereo48k]);
+        let fx = ve_core::AudioFx {
+            denoise: 0.3,
+            eq: [0.0; 3],
+            compress: 1.0,
+        };
+        ve_core::edit::set_audio_fx(&mut p, clips[0], fx).unwrap();
+        e.set_project(Arc::new(p));
+        e.seek(Time::from_millis(500));
+        e.play();
+        sleep(Duration::from_millis(500));
+        e.pause();
+        let left: Vec<f32> = e.captured_audio().iter().step_by(2).copied().collect();
+        assert!(left.len() > 48_000 / 4, "{}", left.len());
+        // 跳过开头压缩器起作用的那一小段
+        let steady = &left[left.len() / 2..];
+        let peak = steady.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(peak < 0.45 && peak > 0.05, "压缩后的峰值 {peak}");
+        let crossings = steady
+            .windows(2)
+            .filter(|w| w[0] <= 0.0 && w[1] > 0.0)
+            .count();
+        #[expect(clippy::cast_precision_loss, reason = "测试里样本数很小")]
+        let hz = crossings as f64 / (steady.len() as f64 / 48_000.0);
+        assert!((hz - 440.0).abs() < 20.0, "{hz}");
     }
 
     #[test]

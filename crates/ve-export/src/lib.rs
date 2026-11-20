@@ -7,9 +7,12 @@ pub mod run;
 
 pub use ass::{SubtitleStyle, has_subtitles, write_ass};
 pub use graph::{
-    Codec, Encoder, ExportError, ExportSettings, FfmpegJob, build_job, estimated_bytes,
-    recommended_kbps,
+    AudioFormat, Codec, Encoder, ExportError, ExportSettings, FfmpegJob, Output, build_job,
+    estimated_bytes, recommended_kbps,
 };
 pub use render::{frame_count, output_size};
-pub use run::{default_settings, export, grab_frame};
+pub use run::{
+    PROXY_SHORT_SIDE, default_settings, export, grab_frame, make_proxy, reverse_segment,
+    stabilize_segment,
+};
 pub use ve_render::RenderConfig;

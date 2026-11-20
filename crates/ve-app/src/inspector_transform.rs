@@ -37,9 +37,29 @@ pub struct TransformFields {
     /// 缩放滑块（1%–400%，剪映的「缩放」那一条）；超出范围的值靠输入框打。
     scale_slider: Entity<SliderState>,
     scale_gesture: bool,
+    /// 正在数值框上左右拖动改值（剪映）。
+    scrub: Option<Scrub>,
     /// 上次填进输入框的文字：没被改过的字段提交时沿用片段的精确值，
     /// 不会把四舍五入后的显示值写回去（预览上拖出来的值精度比显示的高）。
     shown: [String; 8],
+}
+
+/// 数值框上按下鼠标后左右拖：每像素改一格（1% 或 1°）。
+#[derive(Debug, Clone, Copy)]
+struct Scrub {
+    field: StepField,
+    start_x: f32,
+    start: f64,
+    /// 已经拖过阈值（开始改值、开了一步撤销）。
+    moving: bool,
+}
+
+/// 拖过这么多像素才算拖动（之前当作点进去打字）。
+const SCRUB_THRESHOLD: f32 = 3.0;
+
+/// 拖动距离对应的新值文字。
+fn scrubbed(start: f64, dx: f32) -> String {
+    one_decimal(start + f64::from(dx).round())
 }
 
 /// 缩放滑块的范围（%）。
@@ -226,6 +246,7 @@ impl TransformFields {
                 opacity_gesture: false,
                 scale_slider,
                 scale_gesture: false,
+                scrub: None,
                 shown: Default::default(),
             },
             subs,
@@ -261,6 +282,25 @@ impl TransformFields {
 impl Workspace {
     /// 属性面板绑定的片段在视频轨上时，返回它、播放头那一刻的画面属性（有动画时已求值），
     /// 以及那一刻相对片段起点的时间（播放头不在片段上时夹到片段两端）。
+    /// 选中的、能改位置大小的片段：视频轨上的媒体片段，或者字幕（字幕没有裁剪、旋转、混合）。
+    pub(crate) fn bound_visual_clip(&self) -> Option<(ClipId, Transform, Time)> {
+        self.bound_video_clip().or_else(|| {
+            let clip = self.inspector.bound?;
+            let (_, c) = self.doc.project.timeline.find_clip(clip)?;
+            c.subtitle_text()?;
+            let offset = (self.playhead - c.start).clamp(Time::ZERO, c.duration);
+            Some((clip, c.transform_at(offset), offset))
+        })
+    }
+
+    /// 选中的是不是字幕。
+    fn bound_is_subtitle(&self) -> bool {
+        self.inspector
+            .bound
+            .and_then(|c| self.doc.project.timeline.find_clip(c))
+            .is_some_and(|(_, c)| c.subtitle_text().is_some())
+    }
+
     pub(crate) fn bound_video_clip(&self) -> Option<(ClipId, Transform, Time)> {
         let clip = self.inspector.bound?;
         let (track, c) = self.doc.project.timeline.find_clip(clip)?;
@@ -279,7 +319,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some((clip, t, _)) = self.bound_video_clip() else {
+        let Some((clip, t, _)) = self.bound_visual_clip() else {
             return;
         };
         let animated = self
@@ -345,6 +385,76 @@ impl Workspace {
         self.commit_transform(window, cx);
     }
 
+    fn step_state(&self, field: StepField) -> Entity<InputState> {
+        let f = &self.inspector.transform;
+        match field {
+            StepField::X => &f.x,
+            StepField::Y => &f.y,
+            StepField::Scale => &f.scale,
+            StepField::Rotation => &f.rotation,
+        }
+        .clone()
+    }
+
+    /// 在数值框上按下：记下起点，之后左右拖就改值。
+    fn scrub_down(&mut self, field: StepField, x: f32, cx: &Context<'_, Self>) {
+        let start = self
+            .step_state(field)
+            .read(cx)
+            .value()
+            .trim()
+            .trim_end_matches(['%', '°'])
+            .parse::<f64>()
+            .unwrap_or(0.0);
+        self.inspector.transform.scrub = Some(Scrub {
+            field,
+            start_x: x,
+            start,
+            moving: false,
+        });
+    }
+
+    /// 按着鼠标左右拖：过了阈值就开始改值（整次拖动一步撤销）。
+    pub(crate) fn scrub_move(
+        &mut self,
+        e: &gpui_kit::MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(mut s) = self.inspector.transform.scrub else {
+            return;
+        };
+        if e.pressed_button != Some(gpui_kit::MouseButton::Left) {
+            self.scrub_up(window, cx);
+            return;
+        }
+        let dx = f32::from(e.position.x) - s.start_x;
+        if !s.moving {
+            if dx.abs() < SCRUB_THRESHOLD {
+                return;
+            }
+            s.moving = true;
+            self.doc.begin_gesture();
+            // 焦点挪走：输入框不再跟着拖选文字
+            window.focus(&self.focus, cx);
+        }
+        self.inspector.transform.scrub = Some(s);
+        let text = scrubbed(s.start, dx);
+        self.step_state(s.field)
+            .update(cx, |st, cx| st.set_value(text, window, cx));
+        self.commit_transform(window, cx);
+    }
+
+    /// 松开：结束这次拖动。
+    pub(crate) fn scrub_up(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) {
+        if let Some(s) = self.inspector.transform.scrub.take()
+            && s.moving
+        {
+            self.doc.end_gesture();
+            cx.notify();
+        }
+    }
+
     /// 缩放滑块：拖动中实时改，松手合成一步撤销（和不透明度一样）。
     fn on_scale_slider(
         &mut self,
@@ -352,7 +462,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some((clip, current, at)) = self.bound_video_clip() else {
+        let Some((clip, current, at)) = self.bound_visual_clip() else {
             return;
         };
         match e {
@@ -369,7 +479,7 @@ impl Workspace {
                 let _ = self.doc.edit(|p| apply_transform_at(p, clip, at, t));
                 self.after_change(window, cx);
                 // 输入框跟着滑块走
-                if let Some((_, now, _)) = self.bound_video_clip() {
+                if let Some((_, now, _)) = self.bound_visual_clip() {
                     let text = shown_texts(&now)[2].clone();
                     self.inspector.transform.shown[2].clone_from(&text);
                     self.inspector
@@ -389,7 +499,7 @@ impl Workspace {
 
     /// 输入框改完（回车 / 失焦）：按各字段写回；无效时恢复显示原值。
     fn commit_transform(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let Some((clip, current, at)) = self.bound_video_clip() else {
+        let Some((clip, current, at)) = self.bound_visual_clip() else {
             return;
         };
         if let Some(t) = transform_from_text(&current, &self.inspector.transform.edited_texts(cx))
@@ -398,14 +508,14 @@ impl Workspace {
             self.apply(window, cx, |p| apply_transform_at(p, clip, at, t));
         }
         // 夹过范围或被拒绝时，显示实际生效的值
-        if let Some((_, now, _)) = self.bound_video_clip() {
+        if let Some((_, now, _)) = self.bound_visual_clip() {
             self.fill_transform(&now, window, cx);
         }
     }
 
     /// 换绑前把输入框里还没提交的画面属性写回原片段，返回是否改了。
     pub(crate) fn commit_pending_transform(&mut self, cx: &Context<'_, Self>) -> bool {
-        let Some((clip, current, at)) = self.bound_video_clip() else {
+        let Some((clip, current, at)) = self.bound_visual_clip() else {
             return false;
         };
         match transform_from_text(&current, &self.inspector.transform.edited_texts(cx)) {
@@ -418,7 +528,7 @@ impl Workspace {
     }
 
     fn on_opacity(&mut self, e: &SliderEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let Some((clip, current, at)) = self.bound_video_clip() else {
+        let Some((clip, current, at)) = self.bound_visual_clip() else {
             return;
         };
         match e {
@@ -444,7 +554,7 @@ impl Workspace {
     }
 
     fn reset_transform(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let Some((clip, ..)) = self.bound_video_clip() else {
+        let Some((clip, ..)) = self.bound_visual_clip() else {
             return;
         };
         self.apply(window, cx, |p| reset_transform(p, clip));
@@ -454,7 +564,7 @@ impl Workspace {
     /// 「画面」区（只在选中视频轨上的片段时有）。
     /// 对齐：把选中的画面贴到画布的边或中线（有关键帧时在播放头处打帧）。
     fn align_layer(&mut self, how: Align, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let Some((clip, t, offset)) = self.bound_video_clip() else {
+        let Some((clip, t, offset)) = self.bound_visual_clip() else {
             return;
         };
         let project = &self.doc.project;
@@ -510,28 +620,99 @@ impl Workspace {
             .child(h_flex().gap_0p5().children(buttons))
     }
 
-    /// 「位置大小」组标题：名字和整组「重置」。
-    fn render_transform_header(cx: &Context<'_, Self>) -> impl IntoElement {
-        h_flex()
-            .justify_between()
-            .child(div().text_sm().child("位置大小"))
-            .child(
-                Button::new("tf-reset")
-                    .ghost()
-                    .compact()
-                    .label("重置")
-                    .tooltip("恢复铺满画面、居中、不旋转、不裁剪，并清掉关键帧")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.reset_transform(window, cx);
-                    })),
+    /// 「混合」组：取消勾选 = 混合模式回到「正常」、不透明度回到 100%（一步撤销）。
+    fn toggle_blend(&mut self, on: bool, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if on {
+            return;
+        }
+        let Some((clip, current, at)) = self.bound_visual_clip() else {
+            return;
+        };
+        let t = Transform {
+            opacity: 1.0,
+            ..current
+        };
+        self.apply(window, cx, |p| {
+            apply_transform_at(p, clip, at, t)?;
+            let look = p
+                .timeline
+                .find_clip(clip)
+                .map(|(_, c)| c.look)
+                .unwrap_or_default();
+            ve_core::edit::set_look(
+                p,
+                clip,
+                ve_core::Look {
+                    blend: ve_core::BlendMode::Normal,
+                    ..look
+                },
             )
+        });
+        self.inspector
+            .transform
+            .opacity
+            .update(cx, |s, cx| s.set_value(100.0, window, cx));
     }
 
+    /// 剪映式的一行：左边名字、中间数值、右边这一行的关键帧 ‹ ◇ ›。
+    pub(crate) fn prop_line(
+        &self,
+        label: &'static str,
+        body: gpui_kit::AnyElement,
+        group: KeyGroup,
+        cx: &Context<'_, Self>,
+    ) -> gpui_kit::Div {
+        h_flex()
+            .gap_2()
+            .child(
+                div()
+                    .w(px(64.))
+                    .flex_none()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(label),
+            )
+            .child(h_flex().flex_1().min_w_0().gap_1().child(body))
+            .child(self.render_group_keys(group, cx))
+    }
+
+    /// 「混合」组：不透明度（混合模式见画面合成）。
+    fn render_blend_group(&self, t: &Transform, cx: &Context<'_, Self>) -> gpui_kit::AnyElement {
+        let opacity = self.opacity_row(t.opacity);
+        let blended = self
+            .bound_video_clip()
+            .and_then(|(clip, ..)| self.doc.project.timeline.find_clip(clip))
+            .is_some_and(|(_, c)| c.look.blend != ve_core::BlendMode::Normal);
+        let body = v_flex()
+            .gap_2()
+            .children(self.render_blend_modes(cx))
+            .child(self.prop_line("不透明度", opacity, KeyGroup::Opacity, cx))
+            .into_any_element();
+        self.render_group(
+            crate::inspector_group::Group {
+                id: "tf-blend",
+                title: "混合",
+                check: Some((
+                    blended || (t.opacity - 1.0).abs() > f32::EPSILON,
+                    Self::toggle_blend,
+                )),
+                reset: Some(|this, window, cx| this.toggle_blend(false, window, cx)),
+                extra: None,
+            },
+            body,
+            cx,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "一整块面板的布局，拆开反而难对照界面"
+    )]
     pub(crate) fn render_transform_section(
         &self,
         cx: &Context<'_, Self>,
     ) -> Option<impl IntoElement> {
-        let (_, t, _) = self.bound_video_clip()?;
+        let (_, t, _) = self.bound_visual_clip()?;
         let muted = cx.theme().muted_foreground;
         let f = &self.inspector.transform;
         let field = |id: &'static str, state: &Entity<InputState>| {
@@ -542,71 +723,71 @@ impl Workspace {
                 .test_support()
                 .child(Input::new(state))
         };
-        // 带「−」「+」的数值框（剪映的 ⇕ 微调）
-        let number = |id: &'static str, state: &Entity<InputState>| {
+        // 带「−」「+」的数值框（剪映的 ⇕ 微调）；按住左右拖也能改（剪映）
+        let number = |id: &'static str, field: StepField| {
             div()
                 .flex_1()
                 .min_w_0()
                 .id(id)
                 .test_support()
-                .child(NumberInput::new(state).xsmall())
+                .cursor(gpui_kit::CursorStyle::ResizeLeftRight)
+                .capture_any_mouse_down(cx.listener(
+                    move |this, e: &gpui_kit::MouseDownEvent, _, cx| {
+                        if e.button == gpui_kit::MouseButton::Left {
+                            this.scrub_down(field, f32::from(e.position.x), cx);
+                        }
+                    },
+                ))
+                .child(NumberInput::new(&self.step_state(field)).xsmall())
         };
         let tag = |label: &'static str| div().text_xs().text_color(muted).child(label);
-        // 剪映式：一行一个属性，左边名字、中间数值、右边这一行的关键帧 ‹ ◇ ›
         let line = |label: &'static str, body: gpui_kit::AnyElement, group: KeyGroup| {
-            h_flex()
-                .gap_2()
-                .child(
-                    div()
-                        .w(px(64.))
-                        .flex_none()
-                        .text_sm()
-                        .text_color(muted)
-                        .child(label),
-                )
-                .child(h_flex().flex_1().min_w_0().gap_1().child(body))
-                .child(self.render_group_keys(group, cx))
+            self.prop_line(label, body, group, cx)
         };
-        Some(
-            v_flex()
-                .gap_2()
-                .child(Self::render_transform_header(cx))
-                .children(self.render_keyframe_bar(cx))
-                .child(line(
-                    "缩放 %",
-                    h_flex()
-                        .flex_1()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex_1()
-                                .id("tf-scale-slider")
-                                .test_support()
-                                .child(Slider::new(&f.scale_slider)),
-                        )
-                        .child(div().w(px(96.)).child(number("tf-scale", &f.scale)))
-                        .into_any_element(),
-                    KeyGroup::Scale,
-                ))
-                .child(line(
-                    "位置 %",
-                    h_flex()
-                        .flex_1()
-                        .gap_1()
-                        .child(tag("X"))
-                        .child(number("tf-x", &f.x))
-                        .child(tag("Y"))
-                        .child(number("tf-y", &f.y))
-                        .into_any_element(),
-                    KeyGroup::Position,
-                ))
-                .child(Self::render_align_row(cx))
-                .child(line(
+        let subtitle = self.bound_is_subtitle();
+        let blend = (!subtitle).then(|| self.render_blend_group(&t, cx));
+        let basic = v_flex()
+            .gap_2()
+            .children(self.render_keyframe_bar(cx))
+            .child(line(
+                "缩放 %",
+                h_flex()
+                    .flex_1()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .id("tf-scale-slider")
+                            .test_support()
+                            .child(Slider::new(&f.scale_slider)),
+                    )
+                    .child(div().w(px(96.)).child(number("tf-scale", StepField::Scale)))
+                    .into_any_element(),
+                KeyGroup::Scale,
+            ))
+            .child(line(
+                "位置 %",
+                h_flex()
+                    .flex_1()
+                    .gap_1()
+                    .child(tag("X"))
+                    .child(number("tf-x", StepField::X))
+                    .child(tag("Y"))
+                    .child(number("tf-y", StepField::Y))
+                    .into_any_element(),
+                KeyGroup::Position,
+            ))
+            .children((!subtitle).then(|| Self::render_align_row(cx)))
+            .children((!subtitle).then(|| {
+                line(
                     "旋转 °",
-                    number("tf-rotation", &f.rotation).into_any_element(),
+                    number("tf-rotation", StepField::Rotation).into_any_element(),
                     KeyGroup::Rotation,
-                ))
-                .child(line(
+                )
+            }))
+            .children(self.render_radius_row(cx))
+            .children((!subtitle).then(|| {
+                line(
                     "裁剪 %",
                     h_flex()
                         .flex_1()
@@ -621,13 +802,21 @@ impl Workspace {
                         .child(field("tf-crop-b", &f.crop[3]))
                         .into_any_element(),
                     KeyGroup::Crop,
-                ))
-                .child(line(
-                    "不透明度",
-                    self.opacity_row(t.opacity),
-                    KeyGroup::Opacity,
-                )),
-        )
+                )
+            }))
+            .into_any_element();
+        let size = self.render_group(
+            crate::inspector_group::Group {
+                id: "tf",
+                title: "位置大小",
+                check: None,
+                reset: Some(Self::reset_transform),
+                extra: None,
+            },
+            basic,
+            cx,
+        );
+        Some(v_flex().gap_4().child(size).children(blend))
     }
 
     /// 不透明度：滑块 + 百分比。
@@ -658,6 +847,13 @@ mod tests {
 
     fn fields(v: [&str; 8]) -> [String; 8] {
         v.map(str::to_owned)
+    }
+
+    #[test]
+    fn scrubbing_moves_one_unit_per_pixel() {
+        assert_eq!(scrubbed(100.0, 12.4), "112");
+        assert_eq!(scrubbed(0.0, -30.0), "-30");
+        assert_eq!(scrubbed(12.5, 0.6), "13.5");
     }
 
     #[test]

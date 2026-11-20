@@ -7959,6 +7959,7 @@ dependencies = [
  "ve-engine",
  "ve-export",
  "ve-media",
+ "ve-render",
  "windows-sys 0.61.2",
 ]
 
@@ -7983,6 +7984,7 @@ dependencies = [
  "lru",
  "rtrb",
  "smol",
+ "tempfile",
  "thiserror 2.0.21",
  "ve-core",
  "ve-media",
