@@ -192,6 +192,22 @@ pub fn reverse_segment(
     }
 }
 
+/// vid.stab 分析时画面短边至少要这么大：它按画面大小在上面摆一格格测量区，行列数又强制至少 3，
+/// 画面太小时测量区会摆到画面外面去读（64×36 时要读第 -34 到第 70 行），偶尔读到没映射的内存就崩
+/// （CI 上 ffmpeg 退出码 0xC0000005）。短边 240 时测量区离边最远约 54 像素，都在画面里。
+const VIDSTAB_MIN_SHORT_SIDE: u32 = 240;
+
+/// 画面 `w`×`h` 太小时，防抖前先放大到多大（短边 [`VIDSTAB_MIN_SHORT_SIDE`]、等比、偶数）；够大返回 `None`。
+fn vidstab_upscale(w: u32, h: u32) -> Option<(u32, u32)> {
+    let short = w.min(h);
+    if short == 0 || short >= VIDSTAB_MIN_SHORT_SIDE {
+        return None;
+    }
+    let even = |v: u64| u32::try_from(v.div_ceil(2) * 2).unwrap_or(u32::MAX);
+    let scale = |v: u32| even(u64::from(v) * u64::from(VIDSTAB_MIN_SHORT_SIDE) / u64::from(short));
+    Some((scale(w), scale(h)))
+}
+
 /// 视频防抖（剪映「视频防抖」）：把素材 `input` 里 `[from, from + len)` 这一段两遍处理——先分析抖动
 /// （`vidstabdetect`），再按平滑窗口 `smoothing` 帧把画面拉稳并自动放大盖住黑边（`vidstabtransform`）——
 /// 写到 `out`（H.264 + 原声 AAC 的 mp4）。
@@ -212,6 +228,17 @@ pub fn stabilize_segment(
     // ffmpeg 在临时目录里跑（t.trf 用相对路径，避开盘符冒号）：输入输出都要换成绝对路径
     let input = std::path::absolute(input).map_err(|e| e.to_string())?;
     let out_abs = std::path::absolute(out).map_err(|e| e.to_string())?;
+    // 画面太小时两遍都先放大再交给 vid.stab，拉稳后缩回原来的大小
+    let size = ve_media::probe(&input)
+        .ok()
+        .and_then(|r| r.video)
+        .map(|v| (v.width, v.height));
+    let (up, down) = size
+        .and_then(|(w, h)| Some(((w, h), vidstab_upscale(w, h)?)))
+        .map_or_else(
+            || (String::new(), String::new()),
+            |((w, h), (uw, uh))| (format!("scale={uw}:{uh},"), format!(",scale={w}:{h}")),
+        );
     let secs = |t: ve_core::Time| format!("{:.6}", t.as_secs_f64().max(0.0));
     let range = |args: &mut Vec<std::ffi::OsString>| {
         args.extend([
@@ -229,7 +256,7 @@ pub fn stabilize_segment(
     detect.extend(
         [
             "-vf",
-            "vidstabdetect=shakiness=6:accuracy=15:result=t.trf",
+            &format!("{up}vidstabdetect=shakiness=6:accuracy=15:result=t.trf"),
             "-f",
             "null",
             "-",
@@ -241,7 +268,7 @@ pub fn stabilize_segment(
     let mut transform = Vec::new();
     range(&mut transform);
     let vf = format!(
-        "vidstabtransform=input=t.trf:smoothing={smoothing}:optzoom=1:interpol=bicubic,unsharp=5:5:0.6:3:3:0.3"
+        "{up}vidstabtransform=input=t.trf:smoothing={smoothing}:optzoom=1:interpol=bicubic,unsharp=5:5:0.6:3:3:0.3{down}"
     );
     transform.extend(
         [
@@ -1204,6 +1231,18 @@ mod tests {
             "{:?}",
             r.duration
         );
+        // 64×36 太小，中间放大过：做完缩回原来的大小
+        assert_eq!(r.video.map(|v| (v.width, v.height)), Some((64, 36)));
+    }
+
+    #[test]
+    fn tiny_frames_are_enlarged_for_vidstab() {
+        assert_eq!(vidstab_upscale(64, 36), Some((426, 240)));
+        assert_eq!(vidstab_upscale(36, 64), Some((240, 426)));
+        assert_eq!(vidstab_upscale(100, 100), Some((240, 240)));
+        assert_eq!(vidstab_upscale(426, 240), None, "够大不动");
+        assert_eq!(vidstab_upscale(1920, 1080), None);
+        assert_eq!(vidstab_upscale(0, 0), None);
     }
 
     #[test]
