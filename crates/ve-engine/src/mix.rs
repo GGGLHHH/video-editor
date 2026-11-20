@@ -118,6 +118,7 @@ mod tests {
             keep_pitch: true,
             clip_start: ms(start_ms),
             volume: Vec::new(),
+            fx: ve_core::AudioFx::NONE,
         }
     }
 

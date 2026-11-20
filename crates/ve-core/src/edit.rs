@@ -82,7 +82,8 @@ fn track_index(timeline: &Timeline, track: TrackId) -> Result<usize, EditError> 
 fn fits(project: &Project, content: &ClipContent, kind: TrackKind) -> bool {
     match content {
         ClipContent::Subtitle { .. } => kind == TrackKind::Subtitle,
-        ClipContent::Adjustment => kind == TrackKind::Video,
+        ClipContent::Adjustment | ClipContent::Effect(_) => kind == TrackKind::Video,
+        ClipContent::Compound { .. } => kind != TrackKind::Subtitle,
         ClipContent::Media { asset, .. } => project.assets.get(asset).is_some_and(|a| match kind {
             TrackKind::Video => a.video.is_some(),
             TrackKind::Audio => a.audio.is_some(),
@@ -92,18 +93,21 @@ fn fits(project: &Project, content: &ClipContent, kind: TrackKind) -> bool {
 }
 
 /// 最短片段：一帧。
-fn min_len(project: &Project) -> Time {
+pub(crate) fn min_len(project: &Project) -> Time {
     project.settings.frame_rate.frame_duration().max(Time(1))
 }
 
 /// 片段在素材里最多能延伸到的时间轴终点。
-fn source_end_limit(project: &Project, clip: &Clip) -> Time {
+pub(crate) fn source_end_limit(project: &Project, clip: &Clip) -> Time {
     match &clip.content {
         ClipContent::Media { asset, source_in } => project.assets.get(asset).map_or_else(
             || clip.end(),
             |a| clip.start + (a.source_limit() - *source_in).scaled(1.0 / f64::from(clip.speed)),
         ),
-        ClipContent::Subtitle { .. } | ClipContent::Adjustment => Time(i64::MAX / 4),
+        ClipContent::Compound { inner, source_in } => clip.start + (inner.duration() - *source_in),
+        ClipContent::Subtitle { .. } | ClipContent::Adjustment | ClipContent::Effect(_) => {
+            Time(i64::MAX / 4)
+        }
     }
 }
 
@@ -151,6 +155,10 @@ fn new_media_clip(
         reversed: None,
         curve: None,
         grade: None,
+        audio_fx: crate::AudioFx::NONE,
+        frame_blend: false,
+        stabilized: None,
+        input_space: None,
     })
 }
 
@@ -309,7 +317,10 @@ pub fn trim_start(project: &mut Project, clip: ClipId, new_start: Time) -> Resul
             ClipContent::Media { source_in, .. } => {
                 c.start - source_in.scaled(1.0 / f64::from(c.speed))
             }
-            ClipContent::Subtitle { .. } | ClipContent::Adjustment => Time::ZERO,
+            ClipContent::Compound { source_in, .. } => c.start - *source_in,
+            ClipContent::Subtitle { .. } | ClipContent::Adjustment | ClipContent::Effect(_) => {
+                Time::ZERO
+            }
         };
         let end = c.end();
         // 邻居和素材边界优先于「至少一帧」：片段本身不足一帧时不能因此压到前一个片段
@@ -321,8 +332,10 @@ pub fn trim_start(project: &mut Project, clip: ClipId, new_start: Time) -> Resul
         };
         let start = new_start.clamp(lower, upper);
         let speed = f64::from(c.speed);
-        if let ClipContent::Media { source_in, .. } = &mut c.content {
-            *source_in += (start - c.start).scaled(speed);
+        match &mut c.content {
+            ClipContent::Media { source_in, .. } => *source_in += (start - c.start).scaled(speed),
+            ClipContent::Compound { source_in, .. } => *source_in += start - c.start,
+            _ => {}
         }
         // 关键帧时间相对片段起点：起点后移多少，关键帧就前移多少，仍对着原来的内容
         c.animation.shift(c.start - start);
@@ -417,7 +430,7 @@ pub fn split_at(project: &mut Project, clip: ClipId, at: Time) -> Result<ClipId,
     Ok(right_id)
 }
 
-fn split_in(
+pub(crate) fn split_in(
     tl: &mut Timeline,
     clip: ClipId,
     at: Time,
@@ -465,8 +478,11 @@ fn split_in(
         left.curve = Some(l);
         right.curve = Some(r);
     }
-    if let ClipContent::Media { source_in, .. } = &mut right.content {
-        *source_in = cut_source;
+    match &mut right.content {
+        ClipContent::Media { source_in, .. } | ClipContent::Compound { source_in, .. } => {
+            *source_in = cut_source;
+        }
+        _ => {}
     }
     clamp_fades(&mut right);
     let clips = &mut tl.tracks[ti].clips;
@@ -550,7 +566,7 @@ pub(crate) fn replace_clip(project: &mut Project, clip: Clip) -> Result<(), Edit
     })
 }
 
-fn update_clip(
+pub(crate) fn update_clip(
     project: &mut Project,
     clip: ClipId,
     f: impl FnOnce(&mut Clip) -> Result<(), EditError>,
@@ -1219,6 +1235,61 @@ pub fn set_keep_pitch(project: &mut Project, clip: ClipId, keep: bool) -> Result
     })
 }
 
+/// 改片段的声音处理（降噪、均衡、压缩）。
+///
+/// # Errors
+/// 片段不存在、不是素材片段、数值超出范围。
+pub fn set_audio_fx(
+    project: &mut Project,
+    clip: ClipId,
+    fx: crate::AudioFx,
+) -> Result<(), EditError> {
+    if !fx.is_valid() {
+        return Err(EditError::InvalidValue);
+    }
+    update_clip(project, clip, |c| {
+        if c.asset().is_none() {
+            return Err(EditError::WrongTrackKind);
+        }
+        c.audio_fx = fx;
+        Ok(())
+    })
+}
+
+/// 开 / 关补帧（帧融合）。
+///
+/// # Errors
+/// 片段不存在、不是视频素材片段。
+pub fn set_frame_blend(project: &mut Project, clip: ClipId, on: bool) -> Result<(), EditError> {
+    ensure_video(project, clip)?;
+    update_clip(project, clip, |c| {
+        if c.asset().is_none() {
+            return Err(EditError::WrongTrackKind);
+        }
+        c.frame_blend = on;
+        Ok(())
+    })
+}
+
+/// 设片段素材的色彩空间（`None` 是 Rec.709）。
+///
+/// # Errors
+/// 片段不存在、不是视频素材片段。
+pub fn set_input_space(
+    project: &mut Project,
+    clip: ClipId,
+    space: Option<crate::color_space::InputSpace>,
+) -> Result<(), EditError> {
+    ensure_video(project, clip)?;
+    update_clip(project, clip, |c| {
+        if c.asset().is_none() {
+            return Err(EditError::WrongTrackKind);
+        }
+        c.input_space = space;
+        Ok(())
+    })
+}
+
 /// 设置进入这一段时的转场（`None` 去掉）。转场只在它和前一段紧挨着时起作用。
 ///
 /// # Errors
@@ -1568,7 +1639,7 @@ pub fn reverse_clip(
     let ClipContent::Media { asset, source_in } = c.content else {
         return Err(EditError::WrongTrackKind);
     };
-    if c.reversed.is_some() {
+    if c.reversed.is_some() || c.stabilized.is_some() {
         return Err(EditError::InvalidValue);
     }
     let span = c.source_span();
@@ -1777,6 +1848,53 @@ pub fn add_adjustment(
     at: Time,
     duration: Time,
 ) -> Result<ClipId, EditError> {
+    add_overlay_tool(project, at, duration, ClipContent::Adjustment)
+}
+
+/// 在 `at` 加一段画面特效（剪映「特效 › 画面特效」），放法和 [`add_adjustment`] 一样。
+///
+/// # Errors
+/// 长度不是正数；强度不在 0–1；要新建轨道却建不了。
+pub fn add_effect(
+    project: &mut Project,
+    at: Time,
+    duration: Time,
+    effect: crate::Effect,
+) -> Result<ClipId, EditError> {
+    if !effect.is_valid() {
+        return Err(EditError::InvalidValue);
+    }
+    add_overlay_tool(project, at, duration, ClipContent::Effect(effect))
+}
+
+/// 改特效片段的特效（换种类、调强度）。
+///
+/// # Errors
+/// 片段不存在、不是特效片段、强度不在 0–1。
+pub fn set_effect(
+    project: &mut Project,
+    clip: ClipId,
+    effect: crate::Effect,
+) -> Result<(), EditError> {
+    if !effect.is_valid() {
+        return Err(EditError::InvalidValue);
+    }
+    update_clip(project, clip, |c| {
+        if c.effect().is_none() {
+            return Err(EditError::WrongTrackKind);
+        }
+        c.content = ClipContent::Effect(effect);
+        Ok(())
+    })
+}
+
+/// 调节、特效这类片段：放到最上面一条有空位的非主轨视频轨，没有就新建一条。
+fn add_overlay_tool(
+    project: &mut Project,
+    at: Time,
+    duration: Time,
+    content: ClipContent,
+) -> Result<ClipId, EditError> {
     if duration <= Time::ZERO {
         return Err(EditError::ZeroLength);
     }
@@ -1799,7 +1917,7 @@ pub fn add_adjustment(
         id,
         start,
         duration,
-        content: ClipContent::Adjustment,
+        content,
         gain_db: 0.0,
         fade_in: Time::ZERO,
         fade_out: Time::ZERO,
@@ -1815,6 +1933,10 @@ pub fn add_adjustment(
         reversed: None,
         curve: None,
         grade: None,
+        audio_fx: crate::AudioFx::NONE,
+        frame_blend: false,
+        stabilized: None,
+        input_space: None,
     };
     let ti = track_index(&next.timeline, track)?;
     next.timeline.tracks[ti].insert_sorted(Arc::new(clip));
@@ -1870,6 +1992,10 @@ pub fn add_subtitle(
         reversed: None,
         curve: None,
         grade: None,
+        audio_fx: crate::AudioFx::NONE,
+        frame_blend: false,
+        stabilized: None,
+        input_space: None,
     };
     project.timeline.tracks[ti].insert_sorted(Arc::new(clip));
     Ok(id)
@@ -1938,7 +2064,10 @@ pub fn set_subtitle_text(
             *t = text;
             Ok(())
         }
-        ClipContent::Media { .. } | ClipContent::Adjustment => Err(EditError::WrongTrackKind),
+        ClipContent::Media { .. }
+        | ClipContent::Adjustment
+        | ClipContent::Effect(_)
+        | ClipContent::Compound { .. } => Err(EditError::WrongTrackKind),
     })
 }
 
@@ -3190,6 +3319,29 @@ mod tests {
         let v2 = clip(&p, ids.v2);
         assert_eq!((v2.transform, v2.adjust), (look, warm));
         assert_eq!(copy_attributes(&p, ids.s1), Err(EditError::WrongTrackKind));
+    }
+
+    #[test]
+    fn audio_fx_is_set_on_media_clips_only_and_checked() {
+        let (mut p, ids) = sample_project();
+        let fx = crate::AudioFx {
+            denoise: 0.4,
+            eq: [2.0, 0.0, -3.0],
+            compress: 0.5,
+        };
+        set_audio_fx(&mut p, ids.a1, fx).unwrap();
+        assert_eq!(clip(&p, ids.a1).audio_fx, fx);
+        assert_eq!(
+            set_audio_fx(&mut p, ids.s1, fx),
+            Err(EditError::WrongTrackKind)
+        );
+        let mut bad = fx;
+        bad.compress = 2.0;
+        assert_eq!(
+            set_audio_fx(&mut p, ids.a1, bad),
+            Err(EditError::InvalidValue)
+        );
+        p.timeline.check_invariants(&p.assets).unwrap();
     }
 
     #[test]

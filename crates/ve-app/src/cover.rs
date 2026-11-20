@@ -103,6 +103,8 @@ impl Workspace {
                 deferred(
                     v_flex()
                         .id("cover-menu")
+            // 盖住下面的东西：点菜单不会顺带点到下面的画面 / 时间轴
+            .occlude()
                         .test_support()
                         .absolute()
                         .top(px(24.))

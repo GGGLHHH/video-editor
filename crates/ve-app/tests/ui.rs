@@ -21,9 +21,71 @@ use ve_media::testing::{Fixture, fixture};
 struct Ui {
     win: AnyWindowHandle,
     view: Entity<Workspace>,
+    _watchdog: Watchdog,
+}
+
+/// 单个测试卡住时别让整轮测试一直挂着：超过时限就报出测试名并直接结束进程（CI 上也能看到是哪个）。
+/// 只用一个早早建好的巡查线程、超时用 `abort`：卡死时往往连新线程都起不来、正常退出也会卡住。
+struct Watchdog(u64);
+
+type Running = std::collections::HashMap<u64, (String, std::time::Instant)>;
+
+impl Watchdog {
+    const LIMIT: Duration = Duration::from_secs(120);
+
+    fn running() -> &'static std::sync::Mutex<Running> {
+        static RUNNING: std::sync::OnceLock<std::sync::Mutex<Running>> = std::sync::OnceLock::new();
+        RUNNING.get_or_init(|| {
+            std::thread::spawn(|| {
+                loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let late = Self::running()
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.values().find(|(_, t)| t.elapsed() > Self::LIMIT).cloned());
+                    if let Some((name, _)) = late {
+                        #[expect(
+                            clippy::print_stderr,
+                            reason = "进程马上结束，只能这样留下是哪个测试"
+                        )]
+                        {
+                            eprintln!(
+                                "界面测试 {name} 超过 {} 秒没结束，结束进程",
+                                Self::LIMIT.as_secs()
+                            );
+                        }
+                        std::process::abort();
+                    }
+                }
+            });
+            std::sync::Mutex::new(Running::new())
+        })
+    }
+
+    fn start() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = std::thread::current()
+            .name()
+            .unwrap_or("（无名测试）")
+            .to_owned();
+        if let Ok(mut m) = Self::running().lock() {
+            m.insert(id, (name, std::time::Instant::now()));
+        }
+        Self(id)
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        if let Ok(mut m) = Self::running().lock() {
+            m.remove(&self.0);
+        }
+    }
 }
 
 fn open(cx: &mut TestAppContext) -> Ui {
+    let watchdog = Watchdog::start();
     cx.update(ve_app::app::init);
     let (win, view) = cx.update(|cx| {
         let engine = Engine::new(EngineConfig {
@@ -40,7 +102,11 @@ fn open(cx: &mut TestAppContext) -> Ui {
         };
         gpui_kit::open_window(opts, cx, |w, cx| ve_app::workspace::build(engine, w, cx)).unwrap()
     });
-    let ui = Ui { win, view };
+    let ui = Ui {
+        win,
+        view,
+        _watchdog: watchdog,
+    };
     frame(cx, &ui);
     ui
 }
@@ -112,6 +178,7 @@ fn window_opens_with_all_panels(cx: &mut TestAppContext) {
             "transport",
             "inspector",
             "timeline",
+            "level-meter",
         ] {
             assert!(window.try_find(id).is_some(), "缺少面板 {id}");
         }
@@ -3725,4 +3792,553 @@ fn subtitle_own_style_position_keyframes_and_loops(cx: &mut TestAppContext) {
         sub(cx).text_motion().unwrap().intro,
         ve_core::TextIn::Typewriter
     );
+}
+
+#[gpui_kit::test]
+fn missing_media_is_flagged_and_relinking_finds_the_whole_folder(cx: &mut TestAppContext) {
+    let root = tempfile::tempdir().unwrap();
+    let (old, new) = (root.path().join("旧"), root.path().join("新"));
+    std::fs::create_dir(&new).unwrap();
+    let mut files = Vec::new();
+    for f in [Fixture::FrameIndexed30, Fixture::ToneStereo48k] {
+        let src = fixture(f);
+        let dst = new.join(src.file_name().unwrap());
+        std::fs::copy(&src, &dst).unwrap();
+        files.push(dst);
+    }
+    let ui = open(cx);
+    import(cx, &ui, files.clone(), true);
+    // 工程里记的是素材搬走前的位置（「旧」文件夹已经不在了）
+    let mut project = ui.view.read_with(cx, |w, _| w.document().project.clone());
+    for a in project.assets.values_mut() {
+        a.path = old.join(a.path.file_name().unwrap());
+    }
+    let file = root.path().join("工程.vep");
+    ve_core::save_project(&project, &file).unwrap();
+    cx.update_window(ui.win, |_, window, cx| {
+        ui.view.update(cx, |w, cx| w.open_path(&file, window, cx));
+    })
+    .unwrap();
+    let ids: Vec<ve_core::AssetId> = ui.view.read_with(cx, |w, _| {
+        w.document().project.assets.keys().copied().collect()
+    });
+    let missing = |app: &TestAppContext| {
+        ui.view.read_with(app, |w, _| {
+            ids.iter().filter(|&&id| w.is_missing(id)).count()
+        })
+    };
+    assert_eq!(missing(cx), 2);
+    let button: &'static str = format!("relink-{}", ids[0].0).leak();
+    assert!(exists(cx, &ui, button), "素材卡片上有「链接媒体」");
+    // 给第一个指新位置：同文件夹里的另一个一起找回
+    let target = new.join(files[0].file_name().unwrap());
+    cx.update_window(ui.win, |_, window, cx| {
+        ui.view
+            .update(cx, |w, cx| w.relink_with(ids[0], target, window, cx));
+    })
+    .unwrap();
+    wait(cx, &ui, |w| ids.iter().all(|&id| !w.is_missing(id)));
+    assert!(!exists(cx, &ui, button));
+    // 一步撤销
+    press(cx, &ui, "ctrl-z");
+    assert_eq!(missing(cx), 2);
+}
+
+#[gpui_kit::test]
+fn a_crashed_session_reopens_its_project(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let project = write_project(dir.path(), "上次的");
+    let sessions = ve_app::recovery::Sessions::new(dir.path().join("sessions"));
+    // 上次的进程（早就不在了）开着这个工程，没来得及删记录
+    let gone = u32::MAX - 1;
+    sessions.record(gone, Some(&project)).unwrap();
+    let ui = open(cx);
+    let me = std::process::id();
+    let s = sessions.clone();
+    cx.update_window(ui.win, |_, window, cx| {
+        ui.view
+            .update(cx, |w, cx| w.enable_recovery(s, me, window, cx));
+    })
+    .unwrap();
+    let opened = ui.view.read_with(cx, |w, _| {
+        w.document().path().map(std::path::Path::to_path_buf)
+    });
+    assert_eq!(opened, Some(project.clone()));
+    // 旧记录删了，本进程记着现在的工程
+    let left = sessions.crashed(|_| false);
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].pid, me);
+    assert_eq!(left[0].session.project, Some(project));
+}
+
+#[gpui_kit::test]
+fn picture_effects_are_added_from_the_bin_and_edited_in_the_inspector(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    seek_to(cx, &ui, Time::from_millis(500));
+    click(cx, &ui, "bin-tab-effect");
+    click(cx, &ui, "bin-effect-0");
+    let effect = |app: &TestAppContext| {
+        ui.view.read_with(app, |w, _| {
+            let doc = w.document();
+            let id = doc.selection()[0];
+            let clip = doc.project.timeline.find_clip(id).unwrap().1;
+            (clip.effect(), (clip.start, clip.end()))
+        })
+    };
+    let (added, span) = effect(cx);
+    assert_eq!(
+        added.map(|e| e.kind),
+        Some(ve_core::EffectKind::Blur),
+        "新加的特效片段被选中"
+    );
+    assert_eq!(span, (Time::from_millis(500), Time::from_millis(3500)));
+    // 属性面板只有「特效」：换成暗角，一步撤销
+    assert!(exists(cx, &ui, "insp-tab-effect"));
+    assert!(!exists(cx, &ui, "insp-tab-picture"));
+    click(cx, &ui, "effect-kind-2");
+    assert_eq!(
+        effect(cx).0.map(|e| e.kind),
+        Some(ve_core::EffectKind::Vignette)
+    );
+    press(cx, &ui, "ctrl-z");
+    assert_eq!(
+        effect(cx).0.map(|e| e.kind),
+        Some(ve_core::EffectKind::Blur)
+    );
+    // 预览里有这道特效
+    let passes = ui.view.read_with(cx, |w, _| {
+        ve_core::compose::resolve_frame(&w.document().project, Time::from_secs(1))
+            .effects
+            .len()
+    });
+    assert_eq!(passes, 1);
+}
+
+#[gpui_kit::test]
+fn audio_denoise_eq_and_compression_are_set_in_the_audio_tab(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::ToneStereo48k)], true);
+    // 纯音频片段在音频轨（第 2 行）
+    click_timeline(cx, &ui, 0.5, 2.0, gpui_kit::Modifiers::default());
+    let fx = |app: &TestAppContext| {
+        ui.view.read_with(app, |w, _| {
+            let doc = w.document();
+            let id = doc.selection()[0];
+            doc.project.timeline.find_clip(id).unwrap().1.audio_fx
+        })
+    };
+    assert!(fx(cx).is_none());
+    // 勾上「音频降噪」：默认强度一半
+    click(cx, &ui, "fx-dn-check");
+    assert!((fx(cx).denoise - 0.5).abs() < 1e-6);
+    click(cx, &ui, "fx-cp-check");
+    assert!((fx(cx).compress - 0.5).abs() < 1e-6);
+    // 取消勾选：关掉；撤销回到开着
+    click(cx, &ui, "fx-dn-check");
+    assert_eq!(fx(cx).denoise, 0.0);
+    press(cx, &ui, "ctrl-z");
+    assert!((fx(cx).denoise - 0.5).abs() < 1e-6);
+}
+
+#[gpui_kit::test]
+fn compound_clips_pack_and_unpack_the_selection(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(
+        cx,
+        &ui,
+        vec![
+            fixture(Fixture::FrameIndexed30),
+            fixture(Fixture::ToneStereo48k),
+        ],
+        true,
+    );
+    let count = |app: &TestAppContext| {
+        ui.view.read_with(app, |w, _| {
+            w.document()
+                .project
+                .timeline
+                .tracks
+                .iter()
+                .map(|t| t.clips.len())
+                .sum::<usize>()
+        })
+    };
+    let before = count(cx);
+    press(cx, &ui, "ctrl-a");
+    press(cx, &ui, "alt-g");
+    assert_eq!(count(cx), 1, "全部打包成一段");
+    let compound = ui.view.read_with(cx, |w, _| {
+        let doc = w.document();
+        let id = doc.selection()[0];
+        doc.project
+            .timeline
+            .find_clip(id)
+            .unwrap()
+            .1
+            .compound()
+            .is_some()
+    });
+    assert!(compound, "新的复合片段被选中");
+    assert!(exists(cx, &ui, "insp-break-compound"));
+    // 播放用的工程是摊开的：画面还在
+    let layers = ui.view.read_with(cx, |w, _| {
+        let flat = ve_core::compound::flatten(&w.document().project).unwrap();
+        ve_core::compose::resolve_layers(&flat, Time::from_millis(500)).len()
+    });
+    assert_eq!(layers, 1);
+    // 解除：放回去；撤销回到复合片段
+    click(cx, &ui, "insp-break-compound");
+    assert_eq!(count(cx), before);
+    press(cx, &ui, "ctrl-z");
+    assert_eq!(count(cx), 1);
+    // 点选时间轴上的复合片段（视频轨，第 1 行），快捷键解除
+    click_timeline(cx, &ui, 0.5, 1.0, gpui_kit::Modifiers::default());
+    press(cx, &ui, "alt-shift-g");
+    assert_eq!(count(cx), before);
+}
+
+#[gpui_kit::test]
+fn proxy_mode_plays_a_low_res_copy_and_exports_the_original(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let ui = open(cx);
+    // 测试素材很小：门槛放到 0，什么视频都做副本
+    let proxies = dir.path().join("proxies");
+    ui.view
+        .update(cx, |w, _| w.use_proxy_settings(proxies.clone(), 0));
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    let id = ui.view.read_with(cx, |w, _| {
+        *w.document().project.assets.keys().next().unwrap()
+    });
+    let original = ui
+        .view
+        .read_with(cx, |w, _| w.document().project.assets[&id].path.clone());
+    assert_eq!(
+        ui.view.read_with(cx, |w, _| w.playing_path(id)),
+        Some(original.clone())
+    );
+    // ≡ 菜单里打开代理模式：做好副本后播放用副本
+    click(cx, &ui, "player-menu-btn");
+    click(cx, &ui, "player-proxy");
+    assert!(ui.view.read_with(cx, |w, _| w.proxy_mode()));
+    wait(cx, &ui, |w| w.has_proxy(id));
+    let playing = ui.view.read_with(cx, |w, _| w.playing_path(id)).unwrap();
+    assert!(playing.starts_with(&proxies), "{playing:?}");
+    assert!(playing.is_file());
+    // 时间轴 / 导出用的工程还是原片
+    let in_doc = ui
+        .view
+        .read_with(cx, |w, _| w.document().project.assets[&id].path.clone());
+    assert_eq!(in_doc, original);
+    // 关掉：回到原片
+    click(cx, &ui, "player-menu-btn");
+    click(cx, &ui, "player-proxy");
+    assert_eq!(
+        ui.view.read_with(cx, |w, _| w.playing_path(id)),
+        Some(original)
+    );
+}
+
+#[gpui_kit::test]
+fn frame_blending_is_toggled_in_the_speed_tab(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click_timeline(cx, &ui, 0.5, 1.0, gpui_kit::Modifiers::default());
+    click(cx, &ui, "insp-tab-speed");
+    let blend = |app: &TestAppContext| first_video_clip(app, &ui).frame_blend;
+    assert!(!blend(cx));
+    click(cx, &ui, "speed-frame-blend");
+    assert!(blend(cx));
+    press(cx, &ui, "ctrl-z");
+    assert!(!blend(cx));
+}
+
+#[gpui_kit::test]
+fn video_stabilization_swaps_in_a_steadied_copy_and_back(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let ui = open(cx);
+    ui.view
+        .update(cx, |w, _| w.use_stabilize_dir(dir.path().to_path_buf()));
+    import(cx, &ui, vec![fixture(Fixture::VideoWithAudio)], true);
+    click_timeline(cx, &ui, 0.5, 1.0, gpui_kit::Modifiers::default());
+    let original = first_video_clip(cx, &ui).asset();
+    // 「画面 › 基础」最下面的「视频防抖」：选「推荐」
+    for _ in 0..3 {
+        cx.update_window(ui.win, |_, window, cx| {
+            window.scroll(
+                "inspector-body",
+                ScrollDelta::Pixels(point(px(0.), px(-800.))),
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+        frame(cx, &ui);
+    }
+    // 测试里后台任务在点击这一步就跑完了
+    click(cx, &ui, "stab-1");
+    wait(cx, &ui, |w| !w.is_stabilizing());
+    let c = first_video_clip(cx, &ui);
+    assert_eq!(c.stabilized.map(|s| s.2), Some(1));
+    assert_ne!(c.asset(), original);
+    // 关闭：换回原片
+    click(cx, &ui, "stab-off");
+    let back = first_video_clip(cx, &ui);
+    assert_eq!(back.asset(), original);
+    assert!(back.stabilized.is_none());
+}
+
+#[gpui_kit::test]
+fn slip_slide_and_roll_tools_drag_the_cut_points(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    let c = three_clips(cx, &ui);
+    magnet_off(cx, &ui);
+    let origin = cx
+        .update_window(ui.win, |_, window, _| {
+            window.find("timeline").bounds().origin
+        })
+        .unwrap();
+    let span = |app: &TestAppContext, id: ve_core::ClipId| {
+        ui.view.read_with(app, |w, _| {
+            let (_, x) = w.document().project.timeline.find_clip(id).unwrap();
+            (x.start, x.end(), x.source_in())
+        })
+    };
+    let drag = |app: &mut TestAppContext, from: f32, to: f32| {
+        let a = origin + timeline_point(from, 1.0);
+        let b = origin + timeline_point(to, 1.0);
+        app.update_window(ui.win, |_, window, wcx| window.drag(a, b, wcx))
+            .unwrap();
+        app.run_until_parked();
+    };
+    // 三段各 1 秒（0–1、1–2、2–3）。滚动（R）：拖第二段左边缘往右 0.2 秒
+    press(cx, &ui, "r");
+    let before = span(cx, c[1]);
+    drag(cx, 1.0, 1.2);
+    let after = span(cx, c[1]);
+    assert_eq!(span(cx, c[0]).1, after.0, "剪辑点两边还是紧挨着");
+    assert!(
+        after.0 > before.0 && after.2 > before.2,
+        "{before:?} → {after:?}"
+    );
+    // 滑动（U）：中间那段往右挪，前一段变长、后一段变短（后一段从素材开头放，不能再往左伸）
+    press(cx, &ui, "u");
+    let mid = span(cx, c[1]);
+    drag(cx, 1.5, 1.7);
+    let slid = span(cx, c[1]);
+    assert!(slid.0 > mid.0, "{mid:?} → {slid:?}");
+    assert_eq!(slid.2, mid.2, "内容不变");
+    assert_eq!(span(cx, c[0]).1, slid.0);
+    assert_eq!(span(cx, c[2]).0, slid.1);
+    // 一次拖动一步撤销
+    press(cx, &ui, "ctrl-z");
+    assert_eq!(span(cx, c[1]), mid);
+    // 选择模式（A）回到普通拖动
+    press(cx, &ui, "a");
+    assert!(exists(cx, &ui, "tb-tool"));
+}
+
+#[gpui_kit::test]
+fn export_presets_fill_in_the_platform_settings(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    let dir = tempfile::tempdir().unwrap();
+    open_export_dialog(cx, &ui, &dir.path().join("b站.mp4"));
+    cx.update_window(ui.win, |_, window, cx| window.click("preset-bilibili", cx))
+        .unwrap();
+    cx.run_until_parked();
+    frame(cx, &ui);
+    // 选中的预设和它带的帧率都亮着
+    cx.update_window(ui.win, |_, window, _| {
+        assert!(window.try_find("preset-bilibili").is_some());
+        assert!(window.try_find("fps-60").is_some());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn scopes_show_over_the_preview_from_the_player_menu(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    wait(cx, &ui, Workspace::showing_frame);
+    assert!(!exists(cx, &ui, "scopes"));
+    click(cx, &ui, "player-menu-btn");
+    click(cx, &ui, "player-scopes");
+    assert!(ui.view.read_with(cx, |w, _| w.scopes_on()));
+    assert!(exists(cx, &ui, "scopes"), "画面右上角出现示波器");
+    click(cx, &ui, "player-menu-btn");
+    click(cx, &ui, "player-scopes");
+    assert!(!exists(cx, &ui, "scopes"));
+}
+
+#[gpui_kit::test]
+fn otio_export_and_import_round_trip_the_timeline(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let ui = open(cx);
+    import(
+        cx,
+        &ui,
+        vec![
+            fixture(Fixture::FrameIndexed30),
+            fixture(Fixture::ToneStereo48k),
+        ],
+        true,
+    );
+    let otio = dir.path().join("时间线.otio");
+    let edl = dir.path().join("时间线.edl");
+    ui.view.read_with(cx, |w, _| {
+        w.export_interchange(ve_app::interchange_ui::Interchange::Otio, &otio)
+            .unwrap();
+        w.export_interchange(ve_app::interchange_ui::Interchange::Edl, &edl)
+            .unwrap();
+    });
+    assert!(std::fs::read_to_string(&edl).unwrap().contains("001  AX"));
+    let spans = |app: &TestAppContext| {
+        ui.view.read_with(app, |w, _| {
+            let mut v: Vec<(TrackKind, Time, Time)> = w
+                .document()
+                .project
+                .timeline
+                .tracks
+                .iter()
+                .flat_map(|t| t.clips.iter().map(move |c| (t.kind, c.start, c.end())))
+                .collect();
+            v.sort_by_key(|x| (x.1, x.2));
+            v
+        })
+    };
+    let before = spans(cx);
+    cx.update_window(ui.win, |_, window, cx| {
+        ui.view
+            .update(cx, |w, cx| w.import_otio_path(otio.clone(), window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    frame(cx, &ui);
+    assert_eq!(spans(cx), before, "导回来是一样的剪辑结构");
+    assert_eq!(
+        ui.view.read_with(cx, |w, _| w
+            .document()
+            .path()
+            .map(std::path::Path::to_path_buf)),
+        None,
+        "导入成新草稿"
+    );
+}
+
+#[gpui_kit::test]
+fn input_color_space_is_picked_in_the_adjust_tab(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click_timeline(cx, &ui, 0.5, 1.0, gpui_kit::Modifiers::default());
+    click(cx, &ui, "insp-tab-adjust");
+    for _ in 0..3 {
+        cx.update_window(ui.win, |_, window, cx| {
+            window.scroll(
+                "inspector-body",
+                ScrollDelta::Pixels(point(px(0.), px(-800.))),
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+        frame(cx, &ui);
+    }
+    click(cx, &ui, "cs-2");
+    assert_eq!(
+        first_video_clip(cx, &ui).input_space,
+        Some(ve_core::color_space::InputSpace::SLog3)
+    );
+    click(cx, &ui, "cs-none");
+    assert_eq!(first_video_clip(cx, &ui).input_space, None);
+}
+
+#[gpui_kit::test]
+fn plugin_effects_load_from_the_folder_and_go_on_the_timeline(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let plugins = dir.path().join("effects");
+    ve_app::plugins::seed_examples(&plugins).unwrap();
+    let ui = open(cx);
+    cx.update_window(ui.win, |_, window, cx| {
+        ui.view
+            .update(cx, |w, cx| w.use_plugin_dir(plugins.clone(), window, cx));
+    })
+    .unwrap();
+    assert_eq!(
+        ui.view.read_with(cx, |w, _| w.plugins().to_vec()),
+        ["反色", "老电视"]
+    );
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click(cx, &ui, "bin-tab-effect");
+    click(cx, &ui, "bin-plugin-0");
+    let effect = ui.view.read_with(cx, |w, _| {
+        let doc = w.document();
+        let id = doc.selection()[0];
+        doc.project.timeline.find_clip(id).unwrap().1.effect()
+    });
+    assert_eq!(effect.map(|e| e.name().to_owned()), Some("反色".to_owned()));
+    // 新放一个插件进去，「重新载入」后出现
+    std::fs::write(
+        plugins.join("变暗.wgsl"),
+        "fn plugin_effect(c: vec3<f32>, p: vec2<f32>, dims: vec2<f32>, amount: f32, t: f32) -> vec3<f32> { return c * (1.0 - amount); }",
+    )
+    .unwrap();
+    click(cx, &ui, "bin-plugin-reload");
+    assert_eq!(ui.view.read_with(cx, |w, _| w.plugins().len()), 3);
+}
+
+#[gpui_kit::test]
+fn opening_a_project_with_missing_media_at_startup_does_not_crash(cx: &mut TestAppContext) {
+    // 命令行带工程启动（或崩溃恢复）时，主窗口还在搭建中就打开工程；有丢失的素材会弹提示，
+    // 这时组件库的根视图还没建好，直接弹会 panic
+    let dir = tempfile::tempdir().unwrap();
+    let mut p = ve_core::Project::new();
+    let gone = p.add_asset(ve_core::Asset {
+        id: ve_core::AssetId(0),
+        name: "不在了.mp4".into(),
+        path: dir.path().join("不在了.mp4"),
+        duration: Time::from_secs(2),
+        video: None,
+        audio: Some(ve_core::AudioInfo {
+            sample_rate: 48_000,
+            channels: 2,
+        }),
+    });
+    ve_core::edit::append_audio(&mut p, gone).unwrap();
+    let file = dir.path().join("有丢失素材.vep");
+    ve_core::save_project(&p, &file).unwrap();
+    cx.update(ve_app::app::init);
+    let (win, view) = cx.update(|cx| {
+        let engine = Engine::new(EngineConfig {
+            audio: AudioBackend::Null,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+            let view = ve_app::workspace::build(engine, w, cx);
+            view.update(cx, |ws, cx| ws.open_path(&file, w, cx));
+            view
+        })
+        .unwrap()
+    });
+    cx.run_until_parked();
+    let opened = view.read_with(cx, |w, _| {
+        w.document().path().map(std::path::Path::to_path_buf)
+    });
+    assert_eq!(opened, Some(file));
+    cx.update_window(win, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+}
+
+#[gpui_kit::test]
+fn clicking_a_popup_menu_item_does_not_reach_what_is_under_it(cx: &mut TestAppContext) {
+    // ≡ 菜单盖在预览画面上：点菜单项不能顺带点到下面的画面（会选中那一层）
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    wait(cx, &ui, Workspace::showing_frame);
+    press(cx, &ui, "escape");
+    assert_eq!(selected(cx, &ui), []);
+    click(cx, &ui, "player-menu-btn");
+    click(cx, &ui, "player-scopes");
+    assert!(ui.view.read_with(cx, |w, _| w.scopes_on()));
+    assert_eq!(selected(cx, &ui), [], "菜单下面的画面没被点到");
 }

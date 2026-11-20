@@ -55,6 +55,10 @@ pub const fn media_clip(id: ClipId, asset: AssetId, start: Time, duration: Time)
         reversed: None,
         curve: None,
         grade: None,
+        audio_fx: crate::AudioFx::NONE,
+        frame_blend: false,
+        stabilized: None,
+        input_space: None,
     }
 }
 
@@ -129,6 +133,10 @@ pub fn sample_project() -> (Project, SampleIds) {
         reversed: None,
         curve: None,
         grade: None,
+        audio_fx: crate::AudioFx::NONE,
+        frame_blend: false,
+        stabilized: None,
+        input_space: None,
     };
     // Project::new() 的轨道顺序固定为 字幕、视频、音频
     let [subs, video, audio] = &mut p.timeline.tracks[..] else {

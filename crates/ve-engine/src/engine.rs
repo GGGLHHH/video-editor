@@ -144,6 +144,8 @@ pub(crate) struct Shared {
     pub(crate) preview_max: ScaleTarget,
     pub(crate) cache_bytes: usize,
     pub(crate) render: ve_render::RenderConfig,
+    /// 电平表：最近混出来的各块峰值。
+    pub(crate) levels: Mutex<crate::level::Levels>,
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -244,6 +246,7 @@ impl Engine {
             shutdown: Arc::clone(&shutdown),
             decoded: AtomicU64::new(0),
             seeks: AtomicU64::new(0),
+            levels: Mutex::new(crate::level::Levels::default()),
             preview_max: config.preview_max,
             cache_bytes: config.cache_bytes,
             render: config.render,
@@ -403,6 +406,15 @@ impl Engine {
             .clock
             .position()
             .clamp(Time::ZERO, duration.max(Time::ZERO))
+    }
+
+    /// 电平表：正在放的声音的左右峰值（0–1，线性）；停着时为零。
+    #[must_use]
+    pub fn levels(&self) -> [f32; 2] {
+        if !self.is_playing() {
+            return [0.0; 2];
+        }
+        lock(&self.shared.levels).at(self.position(), Time::from_millis(60))
     }
 
     /// 时间轴总长。
@@ -780,6 +792,50 @@ mod tests {
         assert!((hz - 440.0).abs() < 15.0, "{hz}");
         let peak = left.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         assert!((peak - 0.5).abs() < 0.05, "{peak}");
+    }
+
+    #[test]
+    fn levels_follow_the_sound_while_playing() {
+        let e = engine();
+        e.set_project(Arc::new(project_with(&[Fixture::ToneStereo48k]).0));
+        assert_eq!(e.levels(), [0.0; 2], "停着没有电平");
+        e.play();
+        assert!(wait_until(2000, || e.levels()[0] > 0.4), "{:?}", e.levels());
+        let [l, r] = e.levels();
+        assert!(l < 0.55 && r < 0.55, "峰值约 0.5：{l} {r}");
+        e.pause();
+        assert_eq!(e.levels(), [0.0; 2]);
+    }
+
+    #[test]
+    fn audio_fx_reach_the_preview_without_shifting_the_sound() {
+        // 440 Hz 的正弦：压缩把峰值压下来；降噪有固定延迟，但补偿后声音不挪位置（还是连续的正弦）
+        let e = engine();
+        let (mut p, clips) = project_with(&[Fixture::ToneStereo48k]);
+        let fx = ve_core::AudioFx {
+            denoise: 0.3,
+            eq: [0.0; 3],
+            compress: 1.0,
+        };
+        ve_core::edit::set_audio_fx(&mut p, clips[0], fx).unwrap();
+        e.set_project(Arc::new(p));
+        e.seek(Time::from_millis(500));
+        e.play();
+        sleep(Duration::from_millis(500));
+        e.pause();
+        let left: Vec<f32> = e.captured_audio().iter().step_by(2).copied().collect();
+        assert!(left.len() > 48_000 / 4, "{}", left.len());
+        // 跳过开头压缩器起作用的那一小段
+        let steady = &left[left.len() / 2..];
+        let peak = steady.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(peak < 0.45 && peak > 0.05, "压缩后的峰值 {peak}");
+        let crossings = steady
+            .windows(2)
+            .filter(|w| w[0] <= 0.0 && w[1] > 0.0)
+            .count();
+        #[expect(clippy::cast_precision_loss, reason = "测试里样本数很小")]
+        let hz = crossings as f64 / (steady.len() as f64 / 48_000.0);
+        assert!((hz - 440.0).abs() < 20.0, "{hz}");
     }
 
     #[test]

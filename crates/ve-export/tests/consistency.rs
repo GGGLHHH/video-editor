@@ -329,3 +329,97 @@ fn export_matches_preview_under_an_adjustment_layer() {
     );
     assert!((f64::from(corner(&exported)) - f64::from(lifted)).abs() <= 4.0);
 }
+
+#[test]
+fn export_matches_preview_under_picture_effects() {
+    // 三层工程中间压一道暗角、最上面再压一道模糊：预览和导出一样，角落被压暗
+    let mut p = three_layers(640, 360);
+    let mut vignette = ve_core::Effect::new(ve_core::EffectKind::Vignette);
+    vignette.amount = 1.0;
+    ve_core::edit::add_effect(&mut p, Time::ZERO, Time::from_secs(2), vignette).unwrap();
+    let blur = ve_core::Effect::new(ve_core::EffectKind::Blur);
+    ve_core::edit::add_effect(&mut p, Time::ZERO, Time::from_secs(2), blur).unwrap();
+    let t = RATE.time_of_frame(30);
+    assert_eq!(ve_core::compose::resolve_frame(&p, t).effects.len(), 2);
+    let preview = preview_frame(&p, t);
+    let exported = exported_frame(&p, 640, 360, t);
+    let score = psnr(&preview, &exported);
+    assert!(score >= 33.0, "PSNR {score:.1} dB");
+    let luma = |f: &VideoFrame, x: u32, y: u32| {
+        let i = (4 * (y * f.width + x)) as usize;
+        f.data[i..i + 3].iter().map(|&v| u32::from(v)).sum::<u32>()
+    };
+    assert!(
+        luma(&preview, 2, 2) + 30 < luma(&preview, 320, 180),
+        "角落比中间暗：{} vs {}",
+        luma(&preview, 2, 2),
+        luma(&preview, 320, 180)
+    );
+}
+
+#[test]
+fn frame_blending_mixes_neighbouring_frames_in_preview_and_export() {
+    // 帧号亮度视频 0.5 倍慢放 + 帧融合：时间轴第 21 帧 = 素材第 10.5 帧，亮度在第 10、11 帧中间
+    let mut p = Project::new();
+    p.settings.width = 64;
+    p.settings.height = 36;
+    p.settings.frame_rate = RATE;
+    let gray = add(&mut p, Fixture::FrameIndexed30);
+    let clip = append_asset(&mut p, gray).unwrap();
+    ve_core::edit::set_speed(&mut p, clip, 0.5).unwrap();
+    ve_core::edit::set_frame_blend(&mut p, clip, true).unwrap();
+    let t = RATE.time_of_frame(21);
+    let center = |f: &VideoFrame| f64::from(f.data[((18 * f.width + 32) * 4) as usize]);
+    let want = f64::midpoint(
+        ve_media::testing::expected_gray(10),
+        ve_media::testing::expected_gray(11),
+    );
+    let preview = preview_frame(&p, t);
+    assert!(
+        (center(&preview) - want).abs() <= 2.0,
+        "预览 {} vs {want}",
+        center(&preview)
+    );
+    let exported = exported_frame(&p, 64, 36, t);
+    assert!(
+        (center(&exported) - want).abs() <= 3.0,
+        "导出 {} vs {want}",
+        center(&exported)
+    );
+    // 关掉：停在第 10 帧
+    ve_core::edit::set_frame_blend(&mut p, clip, false).unwrap();
+    let plain = preview_frame(&p, t);
+    assert!((center(&plain) - ve_media::testing::expected_gray(10)).abs() <= 2.0);
+}
+
+#[test]
+fn input_color_space_is_converted_the_same_in_preview_and_export() {
+    // 帧号亮度视频当 S-Log3 素材：预览和导出一样，暗部被压、中灰附近提亮
+    let mut p = Project::new();
+    p.settings.width = 64;
+    p.settings.height = 36;
+    p.settings.frame_rate = RATE;
+    let gray = add(&mut p, Fixture::FrameIndexed30);
+    let clip = append_asset(&mut p, gray).unwrap();
+    ve_core::edit::set_input_space(&mut p, clip, Some(ve_core::color_space::InputSpace::SLog3))
+        .unwrap();
+    // 第 10 帧比较暗：当 Log 解读时会被压成接近黑
+    let t = RATE.time_of_frame(10);
+    let center = |f: &VideoFrame| f64::from(f.data[((18 * f.width + 32) * 4) as usize]);
+    let preview = preview_frame(&p, t);
+    let exported = exported_frame(&p, 64, 36, t);
+    assert!(
+        (center(&preview) - center(&exported)).abs() <= 4.0,
+        "预览 {} vs 导出 {}",
+        center(&preview),
+        center(&exported)
+    );
+    ve_core::edit::set_input_space(&mut p, clip, None).unwrap();
+    let plain = preview_frame(&p, t);
+    assert!(
+        (center(&preview) - center(&plain)).abs() > 10.0,
+        "换了色彩空间画面要变：{} vs {}",
+        center(&preview),
+        center(&plain)
+    );
+}

@@ -109,6 +109,89 @@ pub struct ExportChoices {
     pub cover: Option<CoverAt>,
 }
 
+/// 导出预设（常见平台的推荐参数）：一下子选好分辨率、帧率、码率、编码和目标响度。
+/// 画面比例是工程的设置，预设不改（抖音 / 视频号建议工程用 9:16）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Preset {
+    /// 抖音 / 快手：1080P、30 帧、高码率、-14 LUFS。
+    Douyin,
+    /// B 站：1080P、60 帧、高码率、-14 LUFS。
+    Bilibili,
+    /// `YouTube`：4K、帧率同工程、高码率、-14 LUFS。
+    YouTube,
+    /// 微信视频号：1080P、30 帧、推荐码率、-16 LUFS。
+    Wechat,
+}
+
+impl Preset {
+    /// 全部（对话框里的顺序）。
+    pub const ALL: [Self; 4] = [Self::Douyin, Self::Bilibili, Self::YouTube, Self::Wechat];
+
+    /// 名字。
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Douyin => "抖音 / 快手",
+            Self::Bilibili => "B 站",
+            Self::YouTube => "YouTube",
+            Self::Wechat => "视频号",
+        }
+    }
+
+    const fn id(self) -> &'static str {
+        match self {
+            Self::Douyin => "preset-douyin",
+            Self::Bilibili => "preset-bilibili",
+            Self::YouTube => "preset-youtube",
+            Self::Wechat => "preset-wechat",
+        }
+    }
+
+    /// （分辨率，帧率，码率，响度）。
+    const fn values(self) -> (Resolution, Option<FrameRate>, Bitrate, i8) {
+        match self {
+            Self::Douyin => (
+                Resolution::P1080,
+                Some(FrameRate::new(30, 1)),
+                Bitrate::Higher,
+                -14,
+            ),
+            Self::Bilibili => (
+                Resolution::P1080,
+                Some(FrameRate::new(60, 1)),
+                Bitrate::Higher,
+                -14,
+            ),
+            Self::YouTube => (Resolution::P2160, None, Bitrate::Higher, -14),
+            Self::Wechat => (
+                Resolution::P1080,
+                Some(FrameRate::new(30, 1)),
+                Bitrate::Recommended,
+                -16,
+            ),
+        }
+    }
+
+    /// 套到 `c` 上（编码用最通用的 H.264，同时导出视频）。
+    pub const fn apply(self, c: &mut ExportChoices) {
+        let (resolution, frame_rate, bitrate, lufs) = self.values();
+        c.resolution = resolution;
+        c.frame_rate = frame_rate;
+        c.bitrate = bitrate;
+        c.codec = Codec::H264;
+        c.loudness = Some(lufs);
+        c.video = true;
+    }
+
+    /// `c` 现在就是这个预设。
+    #[must_use]
+    pub fn matches(self, c: &ExportChoices) -> bool {
+        let mut d = *c;
+        self.apply(&mut d);
+        d == *c
+    }
+}
+
 /// 封面取哪一帧。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoverAt {
@@ -622,6 +705,21 @@ impl Render for ExportForm {
                             .child(SharedString::from(self.path.display().to_string())),
                     ),
             )
+            .child(row(
+                "预设",
+                Preset::ALL
+                    .map(|pr| {
+                        Self::pick(
+                            pr.id(),
+                            pr.label(),
+                            pr.matches(&c),
+                            move |ch| pr.apply(ch),
+                            cx,
+                        )
+                    })
+                    .into(),
+                cx,
+            ))
             .children(self.render_outputs(cx))
             .children(c.video.then(|| {
                 v_flex()
@@ -823,7 +921,9 @@ impl Workspace {
             cancel: Arc::clone(&cancel),
             path: first.path.clone(),
         });
-        let project = self.doc.project.clone();
+        // 复合片段摊开再导出（和预览一样）
+        let project = ve_core::compound::flatten(&self.doc.project)
+            .unwrap_or_else(|| self.doc.project.clone());
         let (tx, rx) = smol::channel::unbounded::<Msg>();
         let spawned = std::thread::Builder::new()
             .name("ve-export".into())
@@ -950,6 +1050,25 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presets_set_everything_at_once_and_are_recognised() {
+        let mut c = ExportChoices::default();
+        assert!(
+            Preset::ALL.iter().all(|p| !p.matches(&c)),
+            "默认不是任何预设"
+        );
+        Preset::Bilibili.apply(&mut c);
+        assert!(Preset::Bilibili.matches(&c));
+        assert!(!Preset::Douyin.matches(&c));
+        assert_eq!(c.frame_rate, Some(FrameRate::new(60, 1)));
+        assert_eq!(c.loudness, Some(-14));
+        // 改了一项就不再是这个预设
+        c.bitrate = Bitrate::Lower;
+        assert!(!Preset::Bilibili.matches(&c));
+        Preset::YouTube.apply(&mut c);
+        assert_eq!((c.resolution, c.frame_rate), (Resolution::P2160, None));
+    }
 
     #[test]
     fn scaled_size_keeps_aspect_and_even_width() {

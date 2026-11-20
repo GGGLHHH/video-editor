@@ -7959,6 +7959,7 @@ dependencies = [
  "ve-engine",
  "ve-export",
  "ve-media",
+ "ve-render",
  "windows-sys 0.61.2",
 ]
 

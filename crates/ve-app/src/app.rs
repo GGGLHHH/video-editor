@@ -94,6 +94,20 @@ pub fn run() {
                     // 性能测试时不自动保存（别往草稿目录里写东西）
                     if args.bench_seconds.is_none() {
                         ws.enable_autosave(crate::autosave::default_dir(), window, cx);
+                        // 特效插件：第一次用时放两个示例
+                        let dir = crate::plugins::default_dir();
+                        if let Err(e) = crate::plugins::seed_examples(&dir) {
+                            log::warn!("插件目录建不了：{e}");
+                        }
+                        ws.use_plugin_dir(dir, window, cx);
+                        ws.enable_recovery(
+                            crate::recovery::Sessions::new(
+                                crate::recovery::Sessions::default_dir(),
+                            ),
+                            std::process::id(),
+                            window,
+                            cx,
+                        );
                     }
                 });
                 view

@@ -36,6 +36,28 @@ pub enum Drag {
         /// 片段。
         clip: ClipId,
     },
+    /// 滑移 / 滑动 / 滚动（[`ve_core::trim_tools`]）；滚动时 `clip` 是剪辑点左边那段。
+    Tool {
+        /// 哪种。
+        kind: TrimKind,
+        /// 片段。
+        clip: ClipId,
+        /// 按下时鼠标对着的时刻。
+        origin: Time,
+        /// 已经挪了多少。
+        applied: Time,
+    },
+}
+
+/// 三种剪辑点修剪。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrimKind {
+    /// 滑移。
+    Slip,
+    /// 滑动。
+    Slide,
+    /// 滚动。
+    Roll,
 }
 
 /// 一次拖拽更新的结果。
@@ -82,9 +104,10 @@ impl Drag {
     pub const fn clip(&self) -> Option<ClipId> {
         match self {
             Self::Scrub => None,
-            Self::Move { clip, .. } | Self::TrimStart { clip } | Self::TrimEnd { clip } => {
-                Some(*clip)
-            }
+            Self::Move { clip, .. }
+            | Self::TrimStart { clip }
+            | Self::TrimEnd { clip }
+            | Self::Tool { clip, .. } => Some(*clip),
         }
     }
 
@@ -118,6 +141,26 @@ impl Drag {
             group.clone()
         };
         let snapper = Snapper::new(doc, geo, playhead, &exclude, snapping);
+        // 修剪工具：按帧算总共要挪多少，减去已经挪的，再挪剩下的（碰到边界时实际挪得少）
+        if let Self::Tool {
+            kind,
+            clip,
+            origin,
+            applied,
+        } = self
+        {
+            let want = snapper.rate.snap(pointer) - snapper.rate.snap(*origin) - *applied;
+            let (kind, clip) = (*kind, *clip);
+            let got = doc
+                .edit(|p| match kind {
+                    TrimKind::Slip => ve_core::trim_tools::slip(p, clip, want),
+                    TrimKind::Slide => ve_core::trim_tools::slide(p, clip, want),
+                    TrimKind::Roll => ve_core::trim_tools::roll(p, clip, want),
+                })
+                .unwrap_or(Time::ZERO);
+            *applied += got;
+            return DragOutcome::default();
+        }
         match *self {
             Self::Scrub => DragOutcome {
                 seek: Some(snapper.rate.snap(pointer)),
@@ -164,6 +207,8 @@ impl Drag {
                     ..DragOutcome::default()
                 }
             }
+            // 上面已经处理过
+            Self::Tool { .. } => DragOutcome::default(),
         }
     }
 }
@@ -178,7 +223,7 @@ pub const fn cursor_for(hit: Hit, drag: Option<&Drag>, marquee: bool) -> gpui_ki
     }
     match (drag, hit) {
         (Some(Drag::Move { .. }), _) => CursorStyle::ClosedHand,
-        (Some(Drag::TrimStart { .. } | Drag::TrimEnd { .. }), _)
+        (Some(Drag::TrimStart { .. } | Drag::TrimEnd { .. } | Drag::Tool { .. }), _)
         | (
             None,
             Hit::Clip {

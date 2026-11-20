@@ -158,6 +158,22 @@ impl Workspace {
                     self.reverse_target().is_some() && !self.is_reversing(),
                 ),
             ],
+            vec![
+                item(
+                    "cm-make-compound",
+                    "新建复合片段",
+                    "Alt+G",
+                    || Box::new(act::MakeCompound),
+                    self.can_make_compound(),
+                ),
+                item(
+                    "cm-break-compound",
+                    "解除复合片段",
+                    "Alt+Shift+G",
+                    || Box::new(act::BreakCompound),
+                    self.selected_compound().is_some(),
+                ),
+            ],
         ]
     }
 
@@ -267,6 +283,8 @@ impl Workspace {
             deferred(
                 v_flex()
                     .id("clip-menu")
+            // 盖住下面的东西：点菜单不会顺带点到下面的画面 / 时间轴
+            .occlude()
                     .test_support()
                     .absolute()
                     .left(px(x))

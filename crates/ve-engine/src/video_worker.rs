@@ -314,11 +314,13 @@ impl Worker<'_> {
             layers,
             background,
             background_grades,
+            effects,
         } = ve_core::compose::resolve_frame(project, t);
         let frames = self.layer_frames(project, &layers);
         if frames.iter().all(Option::is_none)
             && background.is_identity()
             && background_grades.is_empty()
+            && effects.is_empty()
         {
             return None;
         }
@@ -339,6 +341,18 @@ impl Worker<'_> {
         let Some(compositor) = self.compositor.as_mut() else {
             return top();
         };
+        let drawn = |l: &LayerSource, f: &Option<Arc<VideoFrame>>| {
+            f.is_some()
+                && project
+                    .assets
+                    .get(&l.asset)
+                    .is_some_and(|a| a.video.is_some())
+        };
+        let kept: Vec<bool> = layers
+            .iter()
+            .zip(&frames)
+            .map(|(l, f)| drawn(l, f))
+            .collect();
         let gpu_layers: Vec<Layer<'_>> = layers
             .iter()
             .zip(&frames)
@@ -365,6 +379,7 @@ impl Worker<'_> {
             })
             .collect();
         compositor.set_background_chain(&background, &background_grades);
+        compositor.set_effects(&ve_core::EffectPass::remap(&effects, &kept));
         let mut data = Vec::new();
         match compositor.compose_bgra(canvas, &gpu_layers, &mut data) {
             Ok(()) => Some(Arc::new(VideoFrame {
@@ -470,7 +485,44 @@ impl Worker<'_> {
             }
             self.decoders.insert(job.key, (job.path, job.decoder));
         }
+        // 帧融合：慢放的层再取下一帧，按时间混合（和导出同一个函数）
+        for (i, l) in layers.iter().enumerate() {
+            if !l.frame_blend {
+                continue;
+            }
+            let Some(a) = frames[i].clone() else {
+                continue;
+            };
+            if let Some(b) = self.next_frame(project, l)
+                && let Some(mixed) = ve_media::blend_frames(&a, &b, l.source_time)
+            {
+                frames[i] = Some(Arc::new(mixed));
+            }
+        }
         frames
+    }
+
+    /// 层 `l` 那一帧的下一帧（缓存优先，否则用这一层的解码器往后解一帧）。
+    fn next_frame(&mut self, project: &Project, l: &LayerSource) -> Option<Arc<VideoFrame>> {
+        let asset = project.assets.get(&l.asset)?;
+        let info = asset.video?;
+        if info.still {
+            return None;
+        }
+        let index = info.frame_rate.frame_of(l.source_time) + 1;
+        if self.cached.get(&l.asset).is_some_and(|p| *p == asset.path)
+            && let Some(f) = self.cache.get((l.asset, index))
+        {
+            return Some(f);
+        }
+        let key = (l.track, l.asset, l.lane);
+        let (path, decoder) = self.decoders.get_mut(&key)?;
+        if *path != asset.path {
+            return None;
+        }
+        let f = Arc::new(decoder.seek_to(info.frame_rate.time_of_frame(index)).ok()?);
+        self.cache.insert((l.asset, index), Arc::clone(&f));
+        Some(f)
     }
 }
 

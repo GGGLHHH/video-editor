@@ -22,6 +22,8 @@ enum Item {
     Quality(Quality),
     PreviewAxis,
     Fullscreen,
+    Proxy,
+    Scopes,
 }
 
 impl Workspace {
@@ -107,6 +109,8 @@ impl Workspace {
         });
         v_flex()
             .id("player-menu")
+            // 盖住下面的东西：点菜单不会顺带点到下面的画面 / 时间轴
+            .occlude()
             .test_support()
             .absolute()
             .top(px(26.))
@@ -140,6 +144,20 @@ impl Workspace {
                 Item::PreviewAxis,
             ))
             .child(row(
+                "player-scopes".into(),
+                "示波器",
+                self.scopes.on,
+                String::new(),
+                Item::Scopes,
+            ))
+            .child(row(
+                "player-proxy".into(),
+                "代理模式",
+                self.proxies.on,
+                String::new(),
+                Item::Proxy,
+            ))
+            .child(row(
                 "player-fullscreen".into(),
                 "全屏预览",
                 false,
@@ -149,7 +167,7 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn pick_player_item(&mut self, item: Item, window: &Window, cx: &mut Context<'_, Self>) {
+    fn pick_player_item(&mut self, item: Item, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.popup = None;
         match item {
             Item::Quality(q) => self.set_quality(q, cx),
@@ -160,6 +178,8 @@ impl Workspace {
                 }
             }
             Item::Fullscreen => self.set_fullscreen(true, window, cx),
+            Item::Proxy => self.set_proxy_mode(!self.proxies.on, window, cx),
+            Item::Scopes => self.toggle_scopes(window, cx),
         }
         cx.notify();
     }

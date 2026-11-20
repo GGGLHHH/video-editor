@@ -133,6 +133,9 @@ impl Workspace {
         }
         self.preview.retired = std::mem::replace(&mut self.preview.image, next);
         self.preview.frames_shown += 1;
+        if self.scopes.on {
+            self.refresh_scopes(window, cx);
+        }
         let now = std::time::Instant::now();
         if self
             .preview
@@ -159,7 +162,7 @@ impl Workspace {
             video.origin.x - self.preview.bounds.origin.x,
             video.origin.y - self.preview.bounds.origin.y,
         );
-        let project = Arc::clone(&self.project);
+        let project = Arc::clone(&self.engine_project);
         let subtitles = ve_engine::resolve_subtitle_shows(&project, self.playhead);
         let shown_h = f32::from(video.size.height);
         let shown_w = f32::from(video.size.width);
@@ -278,6 +281,7 @@ impl Workspace {
             .when(!self.preview.fullscreen, |frame| {
                 frame.children(self.render_selection_box(cx))
             })
+            .children(self.render_scopes())
     }
 
     /// 播放器底栏（剪映式）：左边当前时间（青）/ 总长，中间播放键，右边比例和全屏。
@@ -478,6 +482,8 @@ impl Workspace {
                 gpui_kit::deferred(
                     v_flex()
                         .id("quality-menu")
+            // 盖住下面的东西：点菜单不会顺带点到下面的画面 / 时间轴
+            .occlude()
                         .test_support()
                         .absolute()
                         .bottom(px(30.))
@@ -543,6 +549,8 @@ impl Workspace {
                 gpui_kit::deferred(
                     v_flex()
                         .id("ratio-menu")
+            // 盖住下面的东西：点菜单不会顺带点到下面的画面 / 时间轴
+            .occlude()
                         .test_support()
                         .absolute()
                         .bottom(px(30.))

@@ -247,6 +247,39 @@ impl Workspace {
             .gap_3()
             .child(self.render_speed_segments(cx))
             .child(body)
+            .children(self.render_frame_blend(clip, cx))
+    }
+
+    /// 智能补帧（剪映）：帧融合开关。只有视频片段有；慢放时才起作用。
+    fn render_frame_blend(
+        &self,
+        clip: &ve_core::Clip,
+        cx: &Context<'_, Self>,
+    ) -> Option<AnyElement> {
+        self.bound_video_clip()?;
+        let muted = cx.theme().muted_foreground;
+        let id = clip.id;
+        let on = clip.frame_blend;
+        let toggle = chrome::chip("speed-frame-blend", "帧融合", on, cx).on_click(cx.listener(
+            move |this, _, window, cx| {
+                this.apply(window, cx, |p| ve_core::edit::set_frame_blend(p, id, !on));
+            },
+        ));
+        Some(
+            v_flex()
+                .gap_1()
+                .child(
+                    h_flex()
+                        .justify_between()
+                        .text_sm()
+                        .child(div().text_color(muted).child("智能补帧"))
+                        .child(toggle),
+                )
+                .child(div().text_xs().text_color(muted).child(
+                    "慢放时把前后两帧按时间混合，画面不再一顿一顿的（倍数小于 1 或曲线变速时生效）",
+                ))
+                .into_any_element(),
+        )
     }
 
     fn render_normal_speed(&self, clip: &ve_core::Clip, cx: &Context<'_, Self>) -> AnyElement {

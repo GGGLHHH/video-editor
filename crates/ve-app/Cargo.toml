@@ -19,6 +19,7 @@ ve-core.workspace = true
 ve-media.workspace = true
 ve-engine.workspace = true
 ve-export.workspace = true
+ve-render.workspace = true
 gpui-kit.workspace = true
 image.workspace = true
 smol.workspace = true

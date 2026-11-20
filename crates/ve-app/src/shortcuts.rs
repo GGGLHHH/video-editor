@@ -23,6 +23,7 @@ pub(crate) const GROUPS: [(&str, &[Item]); 4] = [
         &[
             ("分割", &["Ctrl+B"]),
             ("鼠标选择模式 / 鼠标分割模式", &["A", "B"]),
+            ("滑移 / 滑动 / 滚动修剪", &["Y", "U", "R"]),
             ("预览轴开关", &["S"]),
             ("批量分割（所有轨）", &["Ctrl+Shift+B"]),
             ("向左裁剪 / 向右裁剪", &["Q", "W"]),
@@ -30,6 +31,7 @@ pub(crate) const GROUPS: [(&str, &[Item]); 4] = [
             ("删除", &["Delete", "Backspace"]),
             ("波纹删除", &["Shift+Delete"]),
             ("停用片段", &["V"]),
+            ("新建 / 解除复合片段", &["Alt+G", "Alt+Shift+G"]),
             ("添加 / 去掉标记", &["M"]),
             ("下一个 / 上一个标记", &["Shift+M", "Alt+Shift+M"]),
             ("区域入点 / 出点", &["I", "O"]),
@@ -200,6 +202,8 @@ impl Workspace {
             };
         v_flex()
             .id("shortcuts")
+            // 盖住下面的东西：点菜单不会顺带点到下面的画面 / 时间轴
+            .occlude()
             .test_support()
             .absolute()
             .top(px(30.))

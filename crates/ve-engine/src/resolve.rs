@@ -46,6 +46,8 @@ pub struct AudioSegment {
     pub clip_start: Time,
     /// 音量关键帧（dB，时间相对片段起点）；空的时候用 `gain`。
     pub volume: Vec<ve_core::Key>,
+    /// 声音处理（降噪、均衡、压缩）。
+    pub fx: ve_core::AudioFx,
 }
 
 /// dB 转线性增益。
@@ -122,6 +124,7 @@ pub fn resolve_audio(project: &Project, from: Time, len: Time) -> Vec<AudioSegme
                     keep_pitch: clip.keep_pitch,
                     clip_start: clip.start,
                     volume: clip.animation.keys(ve_core::Prop::Volume).to_vec(),
+                    fx: clip.audio_fx,
                 });
             }
         }

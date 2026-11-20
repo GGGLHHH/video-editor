@@ -28,6 +28,8 @@ pub struct LayerSource {
     /// 整条调色链（片段自己的，再接上压在它上面的调节片段）；只在用到进阶调色（HSL、曲线、
     /// 色轮、LUT）时才有，没有时按 [`Self::color`] 的矩阵调色。
     pub grades: crate::GradeChain,
+    /// 帧融合：慢放时把 `source_time` 前后两帧按时间混合（[`crate::Clip::blends_frames`]）。
+    pub frame_blend: bool,
 }
 
 /// 时间点 `t` 上要合成的东西：各层画面和底色的调色。
@@ -39,6 +41,8 @@ pub struct Composition {
     pub background: crate::ColorMatrix,
     /// 黑底的调色链（调节片段用了进阶调色时才有）。
     pub background_grades: crate::GradeChain,
+    /// 画面特效，按从下到上的顺序（[`crate::EffectPass::after`] 指它压在哪几层上面）。
+    pub effects: Vec<crate::EffectPass>,
 }
 
 /// 时间点 `t` 上所有视频轨的画面，从最下层到最上层（合成顺序）。
@@ -55,6 +59,7 @@ pub fn resolve_frame(project: &Project, t: Time) -> Composition {
     let mut out: Vec<LayerSource> = Vec::new();
     let mut background = crate::ColorMatrix::IDENTITY;
     let mut background_grades: crate::GradeChain = Vec::new();
+    let mut effects = Vec::new();
     for tr in project
         .timeline
         .video_tracks_bottom_up()
@@ -71,10 +76,21 @@ pub fn resolve_frame(project: &Project, t: Time) -> Composition {
         if !clip.enabled() {
             continue;
         }
+        if let Some(effect) = clip.effect() {
+            #[expect(clippy::cast_possible_truncation, reason = "片段内的秒数")]
+            let seconds = (t - clip.start).as_secs_f64() as f32;
+            effects.push(crate::EffectPass {
+                after: out.len(),
+                effect,
+                seconds,
+            });
+            continue;
+        }
         if clip.is_adjustment() {
             let m = clip.adjust_at(t - clip.start).matrix();
             if !m.is_identity() || clip.grade.is_some() {
                 let step = crate::GradeStep {
+                    input: None,
                     matrix: m,
                     grade: clip.grade.clone(),
                 };
@@ -92,7 +108,8 @@ pub fn resolve_frame(project: &Project, t: Time) -> Composition {
         }
     }
     // 整条链都没用进阶调色：只留矩阵（着色器走快的那条路）
-    let plain = |chain: &crate::GradeChain| chain.iter().all(|s| s.grade.is_none());
+    let plain =
+        |chain: &crate::GradeChain| chain.iter().all(|s| s.grade.is_none() && s.input.is_none());
     for l in &mut out {
         if plain(&l.grades) {
             l.grades.clear();
@@ -105,6 +122,7 @@ pub fn resolve_frame(project: &Project, t: Time) -> Composition {
         layers: out,
         background,
         background_grades,
+        effects,
     }
 }
 
@@ -130,9 +148,11 @@ fn layer_of(
         lane: u8::from(index % 2 == 1),
         look: clip.look,
         grades: vec![crate::GradeStep {
+            input: clip.input_space,
             matrix: clip.adjust_at(offset).matrix(),
             grade: clip.grade.clone(),
         }],
+        frame_blend: clip.blends_frames(),
     })
 }
 
@@ -420,6 +440,45 @@ mod tests {
             resolve_frame(&p, Time::from_secs(3)).layers[0].color,
             bw.matrix()
         );
+    }
+
+    #[test]
+    fn effects_sit_on_the_layers_below_them_with_their_own_clock() {
+        use crate::edit::{add_effect, add_track, insert_asset_at, set_effect};
+        let (mut p, ids) = sample_project();
+        let blur = crate::Effect::new(crate::EffectKind::Blur);
+        let fx = add_effect(&mut p, Time::from_secs(1), Time::from_secs(3), blur).unwrap();
+        // 特效上面再叠一层画中画：特效只压在主轨上
+        let top = add_track(&mut p, crate::TrackKind::Video).unwrap();
+        insert_asset_at(&mut p, ids.video_asset, top, Time::ZERO).unwrap();
+        let frame = resolve_frame(&p, Time::from_millis(2500));
+        assert_eq!(frame.layers.len(), 2, "特效片段本身不出画面");
+        assert_eq!(frame.effects.len(), 1);
+        let pass = frame.effects[0];
+        assert_eq!((pass.after, pass.effect), (1, blur));
+        assert!((pass.seconds - 1.5).abs() < 1e-6, "从特效片段开头算");
+        assert_eq!(resolve_frame(&p, Time::from_millis(500)).effects, []);
+        // 换种类、调强度；强度越界不行
+        let mut grain = crate::Effect::new(crate::EffectKind::Grain);
+        grain.amount = 0.8;
+        set_effect(&mut p, fx, grain).unwrap();
+        assert_eq!(
+            resolve_frame(&p, Time::from_secs(2)).effects[0].effect,
+            grain
+        );
+        grain.amount = 2.0;
+        assert_eq!(
+            set_effect(&mut p, fx, grain),
+            Err(crate::EditError::InvalidValue)
+        );
+        assert_eq!(
+            set_effect(&mut p, ids.v1, crate::Effect::new(crate::EffectKind::Blur)),
+            Err(crate::EditError::WrongTrackKind),
+            "素材片段不能当特效改"
+        );
+        let saved = serde_json::to_string(&p).unwrap();
+        let back: Project = serde_json::from_str(&saved).unwrap();
+        assert_eq!(back, p, "特效片段存得进工程文件");
     }
 
     #[test]

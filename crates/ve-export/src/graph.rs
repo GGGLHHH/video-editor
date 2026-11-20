@@ -378,6 +378,18 @@ fn volume_filter_with(clip: &Clip, shift: Time, fade: Option<(Time, Time, Time, 
     )
 }
 
+/// 片段的声音处理（和预览同一串滤镜，[`ve_core::AudioFx::filter_spec`]），前面带逗号；
+/// 不处理是空串。降噪的固定延迟：末尾先补同样长的静音，处理完再把开头那么长剪掉，长度和位置都不变。
+fn fx_filter(fx: &ve_core::AudioFx) -> String {
+    let Some(spec) = fx.filter_spec() else {
+        return String::new();
+    };
+    match fx.latency_samples(MIX_RATE) {
+        0 => format!(",{spec}"),
+        l => format!(",apad=pad_len={l},{spec},atrim=start_sample={l},asetpts=N/SR/TB"),
+    }
+}
+
 fn audio_chain(
     graph: &mut String,
     audio_inputs: &[AudioInput<'_>],
@@ -414,9 +426,10 @@ fn audio_chain(
                 )),
             )
         };
+        let fx = fx_filter(&clip.audio_fx);
         let _ = write!(
             graph,
-            "[{index}:a]aresample={MIX_RATE}{speed},aformat=sample_fmts=fltp:channel_layouts=stereo,{volume}"
+            "[{index}:a]aresample={MIX_RATE}{speed},aformat=sample_fmts=fltp:channel_layouts=stereo{fx},{volume}"
         );
         // 和预览一样：转场处两段的声音叠在一起交叉淡化
         if whole && fade_in > Time::ZERO {
@@ -738,6 +751,22 @@ mod tests {
         set_track_flag(&mut p, ids.video_track, TrackFlag::Hidden, true).unwrap();
         let hidden = args_text(&build_job(&p, &settings(), true).unwrap());
         assert!(hidden.contains("clip.mp4"), "{hidden}");
+    }
+
+    #[test]
+    fn audio_fx_go_before_the_volume_with_the_denoise_delay_cut() {
+        let (mut p, ids) = sample_project();
+        let fx = ve_core::AudioFx {
+            denoise: 0.5,
+            eq: [3.0, 0.0, 0.0],
+            compress: 0.0,
+        };
+        ve_core::edit::set_audio_fx(&mut p, ids.a1, fx).unwrap();
+        let g = build_job(&p, &settings(), true).unwrap().filter_graph;
+        assert!(
+            g.contains("stereo,apad=pad_len=1200,afftdn=nr=18.00:nf=-50,bass=g=3.00:f=100,atrim=start_sample=1200,asetpts=N/SR/TB,volume="),
+            "{g}"
+        );
     }
 
     #[test]

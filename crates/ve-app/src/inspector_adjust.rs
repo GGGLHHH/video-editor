@@ -7,7 +7,7 @@ use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, Styled as _, Subscription, Window, div, px,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
 use ve_core::edit::{apply_adjust_at, set_adjust};
 use ve_core::{AdjustItem, ColorAdjust, KeyGroup, Prop, Time};
@@ -213,6 +213,7 @@ impl Workspace {
                     cx,
                 ))
                 .children(self.render_lut_group(cx))
+                .children(self.render_input_space(cx))
                 .into_any_element(),
             crate::inspector_grade::AdjustSeg::Hsl => self
                 .render_hsl_seg(cx)
@@ -230,6 +231,52 @@ impl Workspace {
             .gap_3()
             .child(self.render_adjust_segments(cx))
             .child(body)
+    }
+}
+
+impl Workspace {
+    /// 「色彩空间」组（HDR / Log 素材换成 Rec.709；只有视频素材片段有）。
+    fn render_input_space(&self, cx: &Context<'_, Self>) -> Option<gpui_kit::AnyElement> {
+        let (clip, _, _) = self.bound_video_clip()?;
+        let (_, c) = self.doc.project.timeline.find_clip(clip)?;
+        let current = c.input_space;
+        let muted = cx.theme().muted_foreground;
+        let option = |id: SharedString, label: &'static str, space| {
+            crate::chrome::chip(id, label, current == space, cx).on_click(cx.listener(
+                move |this, _, window, cx| {
+                    this.apply(window, cx, |p| {
+                        ve_core::edit::set_input_space(p, clip, space)
+                    });
+                },
+            ))
+        };
+        let chips = std::iter::once(option("cs-none".into(), "Rec.709", None)).chain(
+            ve_core::color_space::InputSpace::ALL
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| option(format!("cs-{i}").into(), s.label(), Some(s))),
+        );
+        let body = v_flex()
+            .gap_2()
+            .child(h_flex().flex_wrap().gap_1().children(chips))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("HDR（HLG / PQ）和相机 Log 素材选对应的一项，先换成 Rec.709 再调色"),
+            )
+            .into_any_element();
+        Some(self.render_group(
+            crate::inspector_group::Group {
+                id: "cs",
+                title: "色彩空间",
+                check: None,
+                reset: None,
+                extra: None,
+            },
+            body,
+            cx,
+        ))
     }
 }
 

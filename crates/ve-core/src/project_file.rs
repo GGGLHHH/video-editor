@@ -1,6 +1,6 @@
 //! 工程文件（JSON）读写。
 //!
-//! 顶层 `{"format":"ve-project","version":7,...}`（第 1–6 版也能读）。素材路径同时存绝对路径和
+//! 顶层 `{"format":"ve-project","version":8,...}`（第 1–7 版也能读）。素材路径同时存绝对路径和
 //! 相对工程文件的路径：整个文件夹搬走后仍能找到素材。
 
 use crate::{Asset, AssetId, IdGen, InvariantError, Project, ProjectSettings, Timeline};
@@ -13,9 +13,10 @@ const FORMAT: &str = "ve-project";
 /// 当前写出的版本。第 2 版加了片段的 `transform`，第 3 版加了 `transform.rotation`，
 /// 第 4 版加了片段的关键帧动画 `animation`，第 5 版加了调色 `adjust`、停用 `disabled`、时间轴标记 `markers` 和字幕样式 `subtitle_style`，
 /// 第 6 版加了轨道的 `hidden` / `muted` / `locked`、画面属性的 `mirror`、调节片段 `Adjustment` 和字幕动画 `motion`，
-/// 第 7 版加了调色 / 音量关键帧、片段颜色标签 `label`、入出点区域 `range`。
+/// 第 7 版加了调色 / 音量关键帧、片段颜色标签 `label`、入出点区域 `range`，
+/// 第 8 版加了画面特效片段 `Effect` 和片段的声音处理 `audio_fx`。
 /// 升版本是为了让旧版程序拒绝读新文件，而不是悄悄丢掉它不认识的字段。
-const VERSION: u32 = 7;
+const VERSION: u32 = 8;
 /// 能读的最旧版本（缺的字段取默认值）。
 const OLDEST_READABLE: u32 = 1;
 
@@ -359,7 +360,7 @@ mod tests {
         save_project(&project, &file).unwrap();
         let mut json: serde_json::Value =
             serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
-        assert_eq!(json["version"], 7);
+        assert_eq!(json["version"], 8);
         // 第 2 版文件：transform 里没有 rotation，读进来是 0
         let mut v2 = json.clone();
         v2["version"] = 2.into();
@@ -391,7 +392,7 @@ mod tests {
         }
         save_project(&loaded, &file).unwrap();
         let again: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
-        assert_eq!(again["version"], 7);
+        assert_eq!(again["version"], 8);
     }
 
     #[test]

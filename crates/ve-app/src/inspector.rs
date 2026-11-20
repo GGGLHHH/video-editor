@@ -44,6 +44,10 @@ pub struct Inspector {
     pub(crate) speed: crate::inspector_speed::SpeedFields,
     /// 「调整」标签的进阶调色（HSL、曲线、色轮、LUT）。
     pub(crate) grade: crate::inspector_grade::GradeFields,
+    /// 「特效」标签（画面特效片段）。
+    pub(crate) effect: crate::inspector_effect::EffectFields,
+    /// 「音频」标签的声音处理（降噪、均衡、压缩）。
+    pub(crate) audio_fx: crate::inspector_audio_fx::AudioFxFields,
 }
 
 /// 属性面板的一级标签。
@@ -64,6 +68,8 @@ pub enum InspectorTab {
     Text,
     /// 字幕：字幕列表编辑器（一览、改字、插入、删除）。
     Subtitles,
+    /// 特效：画面特效片段的种类和强度。
+    Effect,
 }
 
 impl InspectorTab {
@@ -78,6 +84,7 @@ impl InspectorTab {
             Self::Adjust => "调整",
             Self::Text => "文本",
             Self::Subtitles => "字幕",
+            Self::Effect => "特效",
         }
     }
 
@@ -90,6 +97,7 @@ impl InspectorTab {
             Self::Adjust => "insp-tab-adjust",
             Self::Text => "insp-tab-text",
             Self::Subtitles => "insp-tab-subtitles",
+            Self::Effect => "insp-tab-effect",
         }
     }
 
@@ -153,6 +161,8 @@ impl Inspector {
         let (look, look_subs) = crate::inspector_look::LookFields::new(window, cx);
         let (speed, speed_subs) = crate::inspector_speed::SpeedFields::new(window, cx);
         let (grade, grade_subs) = crate::inspector_grade::GradeFields::new(window, cx);
+        let (effect, effect_subs) = crate::inspector_effect::EffectFields::new(window, cx);
+        let (audio_fx, audio_fx_subs) = crate::inspector_audio_fx::AudioFxFields::new(window, cx);
         let mut subs = vec![
             cx.subscribe_in(
                 &gain,
@@ -201,6 +211,8 @@ impl Inspector {
         subs.extend(look_subs);
         subs.extend(speed_subs);
         subs.extend(grade_subs);
+        subs.extend(effect_subs);
+        subs.extend(audio_fx_subs);
         (
             Self {
                 gain,
@@ -216,6 +228,8 @@ impl Inspector {
                 look,
                 speed,
                 grade,
+                effect,
+                audio_fx,
                 transform,
                 adjust,
             },
@@ -310,6 +324,7 @@ impl Workspace {
                 body,
                 cx,
             ))
+            .children(self.render_audio_fx(cx))
             .into_any_element()
     }
 
@@ -365,7 +380,7 @@ impl Workspace {
                 let typed = self.inspector.text.read(cx).value().to_string();
                 (typed != *text).then(|| self.doc.edit(|p| set_subtitle_text(p, clip, typed)))
             }
-            ClipContent::Adjustment => None,
+            ClipContent::Adjustment | ClipContent::Effect(_) | ClipContent::Compound { .. } => None,
             ClipContent::Media { .. } => {
                 let fade_in =
                     parse_secs(&self.inspector.fade_in.read(cx).value()).unwrap_or(current.fade_in);
@@ -411,6 +426,7 @@ impl Workspace {
                 self.inspector.fade_out.update(cx, |s, cx| {
                     s.set_value(secs_text(clip.fade_out), window, cx);
                 });
+                self.refresh_audio_fx_sliders(window, cx);
                 if let Some((_, t, _)) = self.bound_video_clip() {
                     self.fill_transform(&t, window, cx);
                     let offset = (self.playhead - clip.start).clamp(Time::ZERO, clip.duration);
@@ -427,6 +443,8 @@ impl Workspace {
                 }
             }
             ClipContent::Adjustment => self.fill_adjust(&clip.adjust, window, cx),
+            ClipContent::Effect(_) => self.refresh_effect_slider(window, cx),
+            ClipContent::Compound { .. } => {}
         }
     }
 
@@ -531,10 +549,15 @@ impl Workspace {
         let Some(c) = clip else {
             return self.render_draft_params(cx);
         };
+        if c.compound().is_some() {
+            return inspector_frame(div(), self.render_compound_panel(&c, cx));
+        }
         let video = self.bound_video_clip().is_some();
         let subtitle = matches!(c.content, ClipContent::Subtitle { .. });
         let available = if c.is_adjustment() {
             &[InspectorTab::Adjust][..]
+        } else if c.effect().is_some() {
+            &[InspectorTab::Effect][..]
         } else {
             InspectorTab::for_clip(video, subtitle)
         };
@@ -567,6 +590,7 @@ impl Workspace {
                         .child(timing)
                         .children(self.render_transform_section(cx))
                         .children(self.render_stroke_shadow(cx))
+                        .children(self.render_stabilize(cx))
                         .into_any_element(),
                     crate::inspector_look::PictureSeg::Key => self
                         .render_key_seg(cx)
@@ -604,6 +628,11 @@ impl Workspace {
                 Self::render_text_motion_tab(*motion, cx).into_any_element()
             }
             (Some(InspectorTab::Adjust), _) => self.render_adjust_tab(cx).into_any_element(),
+            (Some(InspectorTab::Effect), ClipContent::Effect(_)) => v_flex()
+                .gap_3()
+                .child(timing)
+                .child(self.render_effect_tab(cx))
+                .into_any_element(),
             _ => div().into_any_element(),
         };
         // 数值框上拖动改值：拖出数值框也接着改，松开才结束

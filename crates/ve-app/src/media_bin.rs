@@ -151,6 +151,8 @@ impl Workspace {
             }));
         }
         self.tasks.retain(|t| !t.is_ready());
+        // 代理模式开着：新来的大素材也做副本
+        self.ensure_proxies(window, cx);
     }
 
     /// 存入分析结果；该编号的素材已不是这个文件（撤销后再导入、换了工程）时丢弃，返回是否存入。
@@ -201,6 +203,10 @@ impl Workspace {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "卡片上的几种角标（已添加、时长、媒体丢失、+）都叠在缩略图上，拆开反而难对照"
+    )]
     fn render_asset_card(
         &self,
         a: &Asset,
@@ -214,6 +220,7 @@ impl Workspace {
             .get(&id)
             .and_then(|m| m.thumbnails.first().cloned());
         let audio_only = a.video.is_none();
+        let missing = self.is_missing(id);
         let drag = AssetDrag {
             asset: id,
             name: a.name.clone().into(),
@@ -259,20 +266,46 @@ impl Workspace {
                                 .text_color(palette::accent()),
                         )
                     }))
-                    .children(used.then(|| {
+                    .children((used && !missing).then(|| {
                         div()
                             .absolute()
                             .top(px(3.))
                             .left(px(3.))
                             .child(chip("已添加".into()))
                     }))
-                    .child(
+                    .children(missing.then(|| {
+                        // 媒体丢失：整张压红，中间「链接媒体」
+                        v_flex()
+                            .absolute()
+                            .size_full()
+                            .justify_center()
+                            .items_center()
+                            .gap_1()
+                            .bg(palette::missing_veil())
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(gpui_kit::white())
+                                    .child("媒体丢失"),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!("relink-{}", id.0)))
+                                    .xsmall()
+                                    .label("链接媒体")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.relink_prompt(id, window, cx);
+                                    })),
+                            )
+                    }))
+                    // 媒体丢失时不标时长（让出地方给「链接媒体」）
+                    .children((!missing).then(|| {
                         div()
                             .absolute()
                             .bottom(px(3.))
                             .right(px(3.))
-                            .child(chip(format_timecode(a.duration, rate).into())),
-                    )
+                            .child(chip(format_timecode(a.duration, rate).into()))
+                    }))
                     .child(
                         // 悬停时右上角出现「+」：放到时间轴末尾
                         div()
@@ -453,6 +486,7 @@ impl Workspace {
             BinTab::Audio => self.render_audio_tab(cx).into_any_element(),
             BinTab::Filter => self.render_filter_tab(cx).into_any_element(),
             BinTab::Adjust => Self::render_adjust_bin_tab(cx).into_any_element(),
+            BinTab::Effect => self.render_effect_bin_tab(cx).into_any_element(),
         };
         v_flex()
             .id("media-bin")
@@ -499,7 +533,7 @@ impl Workspace {
 /// 卡片宽度（缩略图 16:9）。
 const CARD_W: f32 = 104.0;
 
-/// 素材面板顶部的一级标签（剪映的 13 个里和剪辑有关的 6 个）。
+/// 素材面板顶部的一级标签（剪映的 13 个里和剪辑有关的 7 个）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BinTab {
     /// 导入的素材。
@@ -509,6 +543,8 @@ pub enum BinTab {
     Audio,
     /// 文本：默认文本、导入字幕。
     Text,
+    /// 画面特效。
+    Effect,
     /// 转场（后续）。
     Transition,
     /// 滤镜（后续）。
@@ -519,10 +555,11 @@ pub enum BinTab {
 
 impl BinTab {
     /// 从左到右的顺序。
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Media,
         Self::Audio,
         Self::Text,
+        Self::Effect,
         Self::Transition,
         Self::Filter,
         Self::Adjust,
@@ -533,6 +570,7 @@ impl BinTab {
             Self::Media => "bin-tab-media",
             Self::Audio => "bin-tab-audio",
             Self::Text => "bin-tab-text",
+            Self::Effect => "bin-tab-effect",
             Self::Transition => "bin-tab-transition",
             Self::Filter => "bin-tab-filter",
             Self::Adjust => "bin-tab-adjust",
@@ -546,6 +584,7 @@ impl BinTab {
             Self::Media => "素材",
             Self::Audio => "音频",
             Self::Text => "文本",
+            Self::Effect => "特效",
             Self::Transition => "转场",
             Self::Filter => "滤镜",
             Self::Adjust => "调节",
@@ -557,6 +596,7 @@ impl BinTab {
             Self::Media => Lucide::Film,
             Self::Audio => Lucide::Music,
             Self::Text => Lucide::Type,
+            Self::Effect => Lucide::Sparkles,
             Self::Transition => Lucide::ArrowRightLeft,
             Self::Filter => Lucide::Aperture,
             Self::Adjust => Lucide::SlidersHorizontal,
@@ -569,6 +609,7 @@ impl BinTab {
             Self::Media => &["导入"],
             Self::Audio => &["音频提取"],
             Self::Text => &["新建文本"],
+            Self::Effect => &["画面特效"],
             Self::Transition => &["转场效果"],
             Self::Filter => &["滤镜库"],
             Self::Adjust => &["新建调节"],

@@ -11,5 +11,8 @@ pub use graph::{
     estimated_bytes, recommended_kbps,
 };
 pub use render::{frame_count, output_size};
-pub use run::{default_settings, export, grab_frame, reverse_segment};
+pub use run::{
+    PROXY_SHORT_SIDE, default_settings, export, grab_frame, make_proxy, reverse_segment,
+    stabilize_segment,
+};
 pub use ve_render::RenderConfig;

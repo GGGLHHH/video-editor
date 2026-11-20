@@ -69,6 +69,14 @@ mod generated {
             TogglePreviewAxis,
             Reverse,
             ToggleRecord,
+            MakeCompound,
+            BreakCompound,
+            SlipTool,
+            SlideTool,
+            RollTool,
+            ExportOtio,
+            ExportEdl,
+            ImportOtio,
         ]
     );
 }
@@ -108,6 +116,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("a", SelectTool, Some(NO_INPUT)),
         KeyBinding::new("b", BladeTool, Some(NO_INPUT)),
         KeyBinding::new("s", TogglePreviewAxis, Some(NO_INPUT)),
+        // Premiere 的修剪工具：Y 滑移、U 滑动；滚动编辑 R（Premiere 是 N，这里 N 已是吸附）
+        KeyBinding::new("y", SlipTool, Some(NO_INPUT)),
+        KeyBinding::new("u", SlideTool, Some(NO_INPUT)),
+        KeyBinding::new("r", RollTool, Some(NO_INPUT)),
         KeyBinding::new("ctrl-shift-b", SplitAll, Some(NO_INPUT)),
         KeyBinding::new("q", TrimLeft, Some(NO_INPUT)),
         KeyBinding::new("w", TrimRight, Some(NO_INPUT)),
@@ -135,6 +147,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-c", CopyAttributes, Some(NO_INPUT)),
         KeyBinding::new("ctrl-shift-v", PasteAttributes, Some(NO_INPUT)),
         KeyBinding::new("v", ToggleDisabled, Some(NO_INPUT)),
+        // 剪映：Alt+G 新建复合片段、Alt+Shift+G 解除复合片段
+        KeyBinding::new("alt-g", MakeCompound, Some(NO_INPUT)),
+        KeyBinding::new("alt-shift-g", BreakCompound, Some(NO_INPUT)),
         // 剪映：M 添加标记，Shift+M / Alt+Shift+M 下一个 / 上一个标记
         KeyBinding::new("m", ToggleMarker, Some(NO_INPUT)),
         KeyBinding::new("shift-m", NextMarker, Some(NO_INPUT)),

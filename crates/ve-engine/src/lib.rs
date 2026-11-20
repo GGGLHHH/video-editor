@@ -4,6 +4,7 @@ mod audio_worker;
 pub mod clock;
 pub mod engine;
 pub mod frame_cache;
+pub mod level;
 pub mod mix;
 pub mod output;
 pub mod record;

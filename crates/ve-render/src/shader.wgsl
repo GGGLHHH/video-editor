@@ -292,3 +292,81 @@ fn fs_blend(v: VOut) -> @location(0) vec4<f32> {
     let mixed = vec3(blend_channel(m, cb.r, cs.r), blend_channel(m, cb.g, cs.g), blend_channel(m, cb.b, cs.b));
     return vec4(cb * (1.0 - c.a) + mixed * c.a, 1.0);
 }
+
+// ---- 画面特效（ve_core::EffectKind）：读底图（已经合成好的画面），整个画面重画 ----
+// p0 = （种类编号、强度 0–1、特效片段里过了几秒、0）
+
+fn bd(p: vec2<i32>) -> vec3<f32> {
+    let d = vec2<i32>(textureDimensions(backdrop));
+    return textureLoad(backdrop, clamp(p, vec2(0), d - vec2(1)), 0).rgb;
+}
+
+// 黄金角螺旋上 32 个点的平均（半径 r 像素）；bright 为真时只取亮部（发光用）
+fn spiral_avg(p: vec2<f32>, r: f32, bright: bool) -> vec3<f32> {
+    var sum = vec3(0.0);
+    for (var i = 0; i < 32; i = i + 1) {
+        let f = f32(i);
+        let ang = f * 2.39996323;
+        let rad = r * sqrt((f + 0.5) / 32.0);
+        let q = p + vec2(cos(ang), sin(ang)) * rad;
+        var c = bd(vec2<i32>(round(q)));
+        if bright {
+            c = max(c - vec3(0.6), vec3(0.0)) / 0.4;
+        }
+        sum = sum + c;
+    }
+    return sum / 32.0;
+}
+
+fn hash21(p: vec2<f32>) -> f32 {
+    let q = fract(p * vec2(123.34, 456.21));
+    let r = q + dot(q, q + 45.32);
+    return fract(r.x * r.y);
+}
+
+@fragment
+fn fs_effect(v: VOut) -> @location(0) vec4<f32> {
+    let kind = v.p0.x;
+    let amount = clamp(v.p0.y, 0.0, 1.0);
+    let t = v.p0.z;
+    let dims = vec2<f32>(textureDimensions(backdrop));
+    let short = min(dims.x, dims.y);
+    let p = floor(v.pos.xy);
+    let pi = vec2<i32>(p);
+    let c = bd(pi);
+    var out = c;
+    if kind < 0.5 {
+        // 模糊：半径最大为短边的 3%
+        out = spiral_avg(p, max(amount * short * 0.03, 0.5), false);
+    } else if kind < 1.5 {
+        // 锐化：减去周围一圈的平均
+        let s = max(i32(round(short / 1080.0)), 1);
+        let avg = (bd(pi + vec2(s, 0)) + bd(pi - vec2(s, 0)) + bd(pi + vec2(0, s)) + bd(pi - vec2(0, s))) / 4.0;
+        out = c + (c - avg) * amount * 2.0;
+    } else if kind < 2.5 {
+        // 暗角：中心不动，越往角落越暗（强度 1 时角落全黑）
+        let r = length(p / dims - vec2(0.5)) * 1.41421356;
+        out = c * (1.0 - amount * smoothstep(0.35, 1.0, r));
+    } else if kind < 3.5 {
+        // 颗粒：每秒 30 次换一组噪点
+        let n = hash21(p + floor(t * 30.0) * vec2(17.31, 91.73)) - 0.5;
+        out = c + vec3(n * amount * 0.35);
+    } else if kind < 4.5 {
+        // 马赛克：方块边长最大为短边的 1/24，取方块中心的颜色
+        let b = max(round(amount * short / 24.0), 2.0);
+        out = bd(vec2<i32>((floor(p / b) + 0.5) * b));
+    } else if kind < 5.5 {
+        // RGB 色差：红往右、蓝往左
+        // 最少错开 1 像素（小画面上也看得出）
+        let o = max(i32(round(amount * short * 0.012)), select(0, 1, amount > 0.0));
+        out = vec3(bd(pi - vec2(o, 0)).r, c.g, bd(pi + vec2(o, 0)).b);
+    } else if kind < 6.5 {
+        // 闪白：每秒开头闪一下，很快退掉
+        let w = amount * exp(-fract(t) * 6.0);
+        out = mix(c, vec3(1.0), w);
+    } else {
+        // 发光：亮部模糊后加回去
+        out = c + spiral_avg(p, short * 0.02, true) * amount * 1.5;
+    }
+    return vec4(clamp(out, vec3(0.0), vec3(1.0)), 1.0);
+}

@@ -28,7 +28,46 @@ pub enum MouseTool {
     Select,
     /// 分割：点片段就切开。
     Blade,
+    /// 滑移：拖片段换用素材里的另一段，位置不动。
+    Slip,
+    /// 滑动：拖片段整段挪，前后紧挨着的片段跟着伸缩。
+    Slide,
+    /// 滚动：拖两段之间的剪辑点。
+    Roll,
 }
+
+/// 鼠标模式菜单：编号、图标、名字、快捷键、模式。
+const TOOL_MENU: [(&str, Lucide, &str, &str, MouseTool); 5] = [
+    (
+        "tool-select",
+        Lucide::MousePointer2,
+        "选择",
+        "A",
+        MouseTool::Select,
+    ),
+    (
+        "tool-blade",
+        Lucide::Scissors,
+        "分割",
+        "B",
+        MouseTool::Blade,
+    ),
+    (
+        "tool-slip",
+        Lucide::MoveHorizontal,
+        "滑移",
+        "Y",
+        MouseTool::Slip,
+    ),
+    (
+        "tool-slide",
+        Lucide::ArrowLeftRight,
+        "滑动",
+        "U",
+        MouseTool::Slide,
+    ),
+    ("tool-roll", Lucide::Columns2, "滚动", "R", MouseTool::Roll),
+];
 
 impl Workspace {
     /// 播放头位置（预览轴在预览别处时也是原来的位置）。
@@ -53,6 +92,65 @@ impl Workspace {
         cx: &mut Context<'_, Self>,
     ) {
         self.set_tool(MouseTool::Blade, cx);
+    }
+
+    pub(crate) fn slip_tool(
+        &mut self,
+        _: &act::SlipTool,
+        _: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.set_tool(MouseTool::Slip, cx);
+    }
+
+    pub(crate) fn slide_tool(
+        &mut self,
+        _: &act::SlideTool,
+        _: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.set_tool(MouseTool::Slide, cx);
+    }
+
+    pub(crate) fn roll_tool(
+        &mut self,
+        _: &act::RollTool,
+        _: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.set_tool(MouseTool::Roll, cx);
+    }
+
+    /// 修剪工具下按在片段上：选择模式的拖法换成滑移 / 滑动 / 滚动（滚动按在哪条边就是哪个剪辑点）。
+    pub(crate) fn tool_drag(
+        &self,
+        drag: super::interaction::Drag,
+        origin: Time,
+    ) -> Option<super::interaction::Drag> {
+        use super::interaction::{Drag, TrimKind};
+        let Some(clip) = drag.clip() else {
+            return Some(drag);
+        };
+        let tool = |kind, clip| Drag::Tool {
+            kind,
+            clip,
+            origin,
+            applied: Time::ZERO,
+        };
+        Some(match (self.timeline.tool, drag) {
+            (MouseTool::Select | MouseTool::Blade, d) => d,
+            (MouseTool::Slip, _) => tool(TrimKind::Slip, clip),
+            (MouseTool::Slide, _) => tool(TrimKind::Slide, clip),
+            (MouseTool::Roll, Drag::TrimEnd { .. }) => tool(TrimKind::Roll, clip),
+            (MouseTool::Roll, Drag::TrimStart { .. }) => {
+                // 左边缘：剪辑点是前一段和它之间
+                let (track, c) = self.doc.project.timeline.find_clip(clip)?;
+                let t = self.doc.project.timeline.track(track)?;
+                let prev = t.clips.iter().rev().find(|p| p.end() == c.start)?;
+                tool(TrimKind::Roll, prev.id)
+            }
+            (MouseTool::Roll, _) => return None,
+        })
     }
 
     fn set_tool(&mut self, tool: MouseTool, cx: &mut Context<'_, Self>) {
@@ -162,6 +260,9 @@ impl Workspace {
         let icon = match current {
             MouseTool::Select => Lucide::MousePointer2,
             MouseTool::Blade => Lucide::Scissors,
+            MouseTool::Slip => Lucide::MoveHorizontal,
+            MouseTool::Slide => Lucide::ArrowLeftRight,
+            MouseTool::Roll => Lucide::Columns2,
         };
         div()
             .relative()
@@ -169,13 +270,13 @@ impl Workspace {
                 Button::new("tb-tool")
                     .ghost()
                     .compact()
-                    .icon(Icon::new(icon).text_color(if current == MouseTool::Blade {
-                        palette::accent()
-                    } else {
+                    .icon(Icon::new(icon).text_color(if current == MouseTool::Select {
                         cx.theme().foreground
+                    } else {
+                        palette::accent()
                     }))
                     .label("˅")
-                    .tooltip("鼠标模式：选择（A）/ 分割（B）")
+                    .tooltip("鼠标模式：选择（A）/ 分割（B）/ 滑移（Y）/ 滑动（U）/ 滚动（R）")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.timeline.tool_menu = !this.timeline.tool_menu;
                         cx.notify();
@@ -211,6 +312,8 @@ impl Workspace {
                 deferred(
                     v_flex()
                         .id("tool-menu")
+            // 盖住下面的东西：点菜单不会顺带点到下面的画面 / 时间轴
+            .occlude()
                         .test_support()
                         .absolute()
                         .top(px(30.))
@@ -226,20 +329,9 @@ impl Workspace {
                             this.timeline.tool_menu = false;
                             cx.notify();
                         }))
-                        .child(item(
-                            "tool-select",
-                            Lucide::MousePointer2,
-                            "选择",
-                            "A",
-                            MouseTool::Select,
-                        ))
-                        .child(item(
-                            "tool-blade",
-                            Lucide::Scissors,
-                            "分割",
-                            "B",
-                            MouseTool::Blade,
-                        )),
+                        .children(TOOL_MENU.map(|(id, icon, label, keys, tool)| {
+                            item(id, icon, label, keys, tool)
+                        })),
                 )
                 .with_priority(1)
             }))

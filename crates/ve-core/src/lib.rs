@@ -4,21 +4,28 @@
 
 pub mod adjust;
 pub mod asset;
+pub mod audio_fx;
 pub mod bench;
+pub mod color_space;
 pub mod compose;
+pub mod compound;
 pub mod edit;
+pub mod effect;
 pub mod grade;
 pub mod history;
 pub mod ids;
+pub mod interchange;
 pub mod keyframe;
 pub mod look;
 pub mod magnet;
 pub mod motion;
 pub mod project;
 pub mod project_file;
+pub mod relink;
 pub mod snap;
 pub mod speed_curve;
 pub mod srt;
+pub mod stabilize;
 pub mod subtitle_style;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -27,10 +34,13 @@ pub mod time;
 pub mod timeline;
 pub mod transform;
 pub mod transition;
+pub mod trim_tools;
 
 pub use adjust::{AdjustItem, ColorAdjust, ColorMatrix, FILTERS, Filter};
 pub use asset::{Asset, AudioInfo, VideoInfo};
+pub use audio_fx::AudioFx;
 pub use edit::EditError;
+pub use effect::{Effect, EffectKind, EffectPass};
 pub use grade::{Curves, Grade, GradeChain, GradeStep, HslAdjust, HslBand, LutRef, Wheels};
 pub use history::History;
 pub use ids::{AssetId, ClipId, IdGen, TrackId};

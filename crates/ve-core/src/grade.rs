@@ -534,6 +534,8 @@ pub fn load_lut(path: &Path) -> Option<Arc<Lut>> {
 /// 一步调色：先过调色矩阵，再（有的话）过进阶调色。
 #[derive(Clone, Debug, PartialEq)]
 pub struct GradeStep {
+    /// 先把素材从这个色彩空间换成 Rec.709（HDR / Log 素材；[`crate::color_space`]）。
+    pub input: Option<crate::color_space::InputSpace>,
     /// 基础调整（亮度、对比度…）的矩阵。
     pub matrix: crate::ColorMatrix,
     /// 进阶调色。
@@ -547,6 +549,7 @@ pub type GradeChain = Vec<GradeStep>;
 #[must_use]
 pub fn apply_chain(chain: &[GradeStep], rgb: [f32; 3]) -> [f32; 3] {
     chain.iter().fold(rgb, |c, step| {
+        let c = step.input.map_or(c, |s| s.to_rec709(c));
         let m = step.matrix.apply(c).map(|v| v.clamp(0.0, 1.0));
         step.grade.as_ref().map_or(m, |g| g.apply(m))
     })
@@ -694,6 +697,7 @@ mod tests {
         let mut g = Grade::default();
         g.curves.luma = vec![(0.5, 1.0)];
         let chain = vec![GradeStep {
+            input: None,
             matrix: half.matrix(),
             grade: Some(Arc::new(g)),
         }];

@@ -42,6 +42,17 @@ pub enum ClipContent {
     /// 调节（剪映素材面板「调节」的「自定义调节」）：放在视频轨上，用片段的调色参数给它下面所有轨道的
     /// 画面调色（调节层）。没有素材，长度随意。第 6 版工程文件加的。
     Adjustment,
+    /// 画面特效（剪映「特效 › 画面特效」）：放在视频轨上，对它下面已经合成好的整个画面做处理。
+    /// 没有素材，长度随意。第 8 版工程文件加的。
+    Effect(crate::Effect),
+    /// 复合片段（剪映「新建复合片段」）：里面是几条轨道；`source_in` 是从里面哪里开始放（裁剪过开头）。
+    /// 第 8 版工程文件加的。
+    Compound {
+        /// 里面的轨道。
+        inner: Arc<crate::compound::Compound>,
+        /// 从里面的哪个时刻开始。
+        source_in: Time,
+    },
 }
 
 /// 时间轴上的一个片段。
@@ -99,6 +110,19 @@ pub struct Clip {
     /// 进阶调色（HSL、曲线、色轮、LUT）；没调时不写进文件。第 7 版工程文件加的。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grade: Option<Arc<crate::Grade>>,
+    /// 声音处理：降噪、均衡、压缩；没开时不写进文件。第 8 版工程文件加的。
+    #[serde(default, skip_serializing_if = "crate::AudioFx::is_none")]
+    pub audio_fx: crate::AudioFx,
+    /// 补帧（剪映「智能补帧 · 帧融合」）：慢放时相邻两帧按时间混合。没开时不写进文件。第 8 版加的。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub frame_blend: bool,
+    /// 视频防抖过（剪映「视频防抖」）：原来的（素材，素材内起点，档位）；现在用的是防抖后的文件。
+    /// 没有时不写进文件。第 8 版加的。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stabilized: Option<(AssetId, Time, u8)>,
+    /// 素材的色彩空间（HDR / Log）；`None` 是 Rec.709。没有时不写进文件。第 8 版加的。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_space: Option<crate::color_space::InputSpace>,
 }
 
 /// 颜色标签的个数。
@@ -239,7 +263,10 @@ impl Clip {
     pub const fn asset(&self) -> Option<AssetId> {
         match &self.content {
             ClipContent::Media { asset, .. } => Some(*asset),
-            ClipContent::Subtitle { .. } | ClipContent::Adjustment => None,
+            ClipContent::Subtitle { .. }
+            | ClipContent::Adjustment
+            | ClipContent::Effect(_)
+            | ClipContent::Compound { .. } => None,
         }
     }
 
@@ -247,8 +274,12 @@ impl Clip {
     #[must_use]
     pub const fn source_in(&self) -> Time {
         match &self.content {
-            ClipContent::Media { source_in, .. } => *source_in,
-            ClipContent::Subtitle { .. } | ClipContent::Adjustment => Time::ZERO,
+            ClipContent::Media { source_in, .. } | ClipContent::Compound { source_in, .. } => {
+                *source_in
+            }
+            ClipContent::Subtitle { .. } | ClipContent::Adjustment | ClipContent::Effect(_) => {
+                Time::ZERO
+            }
         }
     }
 
@@ -257,7 +288,10 @@ impl Clip {
     pub fn subtitle_text(&self) -> Option<&str> {
         match &self.content {
             ClipContent::Subtitle { text, .. } => Some(text),
-            ClipContent::Media { .. } | ClipContent::Adjustment => None,
+            ClipContent::Media { .. }
+            | ClipContent::Adjustment
+            | ClipContent::Effect(_)
+            | ClipContent::Compound { .. } => None,
         }
     }
 
@@ -283,6 +317,39 @@ impl Clip {
     #[must_use]
     pub const fn is_adjustment(&self) -> bool {
         matches!(self.content, ClipContent::Adjustment)
+    }
+
+    /// 画面特效片段的特效。
+    #[must_use]
+    pub const fn effect(&self) -> Option<crate::Effect> {
+        match self.content {
+            ClipContent::Effect(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// 复合片段里面的东西和从哪里开始放。
+    #[must_use]
+    pub const fn compound(&self) -> Option<(&Arc<crate::compound::Compound>, Time)> {
+        match &self.content {
+            ClipContent::Compound { inner, source_in } => Some((inner, *source_in)),
+            _ => None,
+        }
+    }
+
+    /// 这一段实际要不要帧融合：开着、而且是慢放（平均倍数小于 1 或曲线变速）。
+    #[must_use]
+    pub fn blends_frames(&self) -> bool {
+        self.frame_blend && (self.speed < 1.0 || self.curve.is_some())
+    }
+
+    /// 是不是不出画面、作用于下面画面的片段（调节、特效）。
+    #[must_use]
+    pub const fn is_overlay_tool(&self) -> bool {
+        matches!(
+            self.content,
+            ClipContent::Adjustment | ClipContent::Effect(_)
+        )
     }
 }
 
@@ -658,6 +725,7 @@ fn check_clip(
         || !clip.look.is_valid()
         || clip.curve.as_ref().is_some_and(|c| !c.is_valid())
         || clip.grade.as_ref().is_some_and(|g| !g.is_valid())
+        || !clip.audio_fx.is_valid()
         || !(SPEED_RANGE.0..=SPEED_RANGE.1).contains(&clip.speed)
     {
         return Err(InvariantError::BadTransform { clip: id });
@@ -671,6 +739,12 @@ fn check_clip(
     match (&clip.content, kind) {
         (ClipContent::Subtitle { .. }, TrackKind::Subtitle)
         | (ClipContent::Adjustment, TrackKind::Video) => Ok(()),
+        (ClipContent::Effect(e), TrackKind::Video) if e.is_valid() => Ok(()),
+        (ClipContent::Compound { inner, source_in }, TrackKind::Video | TrackKind::Audio)
+            if *source_in >= Time::ZERO && *source_in + clip.duration <= inner.duration() =>
+        {
+            Ok(())
+        }
         (ClipContent::Media { asset, source_in }, TrackKind::Video | TrackKind::Audio) => {
             let a = assets.get(asset).ok_or(InvariantError::MissingAsset {
                 clip: id,

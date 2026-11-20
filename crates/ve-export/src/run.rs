@@ -72,7 +72,16 @@ const REVERSE_CHUNK: ve_core::Time = ve_core::Time::from_secs(10);
 
 /// 跑一次 ffmpeg，失败时带上它的报错。
 fn run_ffmpeg(args: &[std::ffi::OsString]) -> Result<(), String> {
-    let output = ffmpeg_command(ffmpeg_program())
+    run_ffmpeg_in(None, args)
+}
+
+/// 同 [`run_ffmpeg`]，在目录 `dir` 里运行（滤镜参数里的文件名用相对路径，免得 Windows 盘符的冒号被当成分隔符）。
+fn run_ffmpeg_in(dir: Option<&std::path::Path>, args: &[std::ffi::OsString]) -> Result<(), String> {
+    let mut cmd = ffmpeg_command(ffmpeg_program());
+    if let Some(d) = dir {
+        cmd.current_dir(d);
+    }
+    let output = cmd
         .args(["-hide_banner", "-loglevel", "error", "-y"])
         .args(args)
         .stdin(Stdio::null())
@@ -167,6 +176,107 @@ pub fn reverse_segment(
         Ok(())
     } else {
         Err("ffmpeg 没有写出倒放文件".to_owned())
+    }
+}
+
+/// 视频防抖（剪映「视频防抖」）：把素材 `input` 里 `[from, from + len)` 这一段两遍处理——先分析抖动
+/// （`vidstabdetect`），再按平滑窗口 `smoothing` 帧把画面拉稳并自动放大盖住黑边（`vidstabtransform`）——
+/// 写到 `out`（H.264 + 原声 AAC 的 mp4）。
+///
+/// # Errors
+/// 找不到 ffmpeg、ffmpeg 失败（比如这个 ffmpeg 没带 vidstab）、读写临时文件失败。
+pub fn stabilize_segment(
+    input: &std::path::Path,
+    from: ve_core::Time,
+    len: ve_core::Time,
+    smoothing: u32,
+    out: &std::path::Path,
+) -> Result<(), String> {
+    if let Some(dir) = out.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let secs = |t: ve_core::Time| format!("{:.6}", t.as_secs_f64().max(0.0));
+    let range = |args: &mut Vec<std::ffi::OsString>| {
+        args.extend([
+            "-ss".into(),
+            secs(from).into(),
+            "-t".into(),
+            secs(len).into(),
+            "-i".into(),
+            input.as_os_str().to_owned(),
+        ]);
+    };
+    // 第一遍：分析，写 t.trf
+    let mut detect = Vec::new();
+    range(&mut detect);
+    detect.extend(
+        [
+            "-vf",
+            "vidstabdetect=shakiness=6:accuracy=15:result=t.trf",
+            "-f",
+            "null",
+            "-",
+        ]
+        .map(std::ffi::OsString::from),
+    );
+    run_ffmpeg_in(Some(dir.path()), &detect)?;
+    // 第二遍：按分析结果拉稳
+    let mut transform = Vec::new();
+    range(&mut transform);
+    let vf = format!(
+        "vidstabtransform=input=t.trf:smoothing={smoothing}:optzoom=1:interpol=bicubic,unsharp=5:5:0.6:3:3:0.3"
+    );
+    transform.extend(
+        [
+            "-map", "0:v:0", "-map", "0:a:0?", "-vf", &vf, "-c:v", "libx264", "-preset",
+            "veryfast", "-crf", "16", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "256k",
+        ]
+        .map(std::ffi::OsString::from),
+    );
+    transform.push(
+        std::path::absolute(out)
+            .map_err(|e| e.to_string())?
+            .into_os_string(),
+    );
+    run_ffmpeg_in(Some(dir.path()), &transform)?;
+    if out.is_file() {
+        Ok(())
+    } else {
+        Err("ffmpeg 没有写出防抖文件".to_owned())
+    }
+}
+
+/// 代理文件的短边（剪映代理模式的低清副本）。
+pub const PROXY_SHORT_SIDE: u32 = 540;
+
+/// 给素材 `input` 生成预览用的代理文件 `out`：短边 [`PROXY_SHORT_SIDE`]（原片更小时不放大），
+/// H.264、关键帧间隔短（拖动快），声音一起转。导出时还是用原片。
+///
+/// # Errors
+/// 找不到 ffmpeg、ffmpeg 失败、没写出文件。
+pub fn make_proxy(input: &std::path::Path, out: &std::path::Path) -> Result<(), String> {
+    if let Some(dir) = out.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let s = PROXY_SHORT_SIDE;
+    // 横的压高、竖的压宽；另一边按比例取偶数
+    let scale = format!("scale='if(gt(iw,ih),-2,min(iw,{s}))':'if(gt(iw,ih),min(ih,{s}),-2)'");
+    let mut args: Vec<std::ffi::OsString> = vec!["-i".into(), input.as_os_str().to_owned()];
+    args.extend(
+        [
+            "-map", "0:v:0", "-map", "0:a:0?", "-vf", &scale, "-c:v", "libx264", "-preset",
+            "veryfast", "-crf", "23", "-g", "15", "-bf", "0", "-pix_fmt", "yuv420p", "-c:a", "aac",
+            "-b:a", "128k",
+        ]
+        .map(std::ffi::OsString::from),
+    );
+    args.push(out.as_os_str().to_owned());
+    run_ffmpeg(&args)?;
+    if out.is_file() {
+        Ok(())
+    } else {
+        Err("ffmpeg 没有写出代理文件".to_owned())
     }
 }
 
@@ -501,6 +611,49 @@ mod tests {
             .trim()
             .parse()
             .unwrap()
+    }
+
+    #[test]
+    fn audio_fx_are_exported_with_the_same_length() {
+        // 压缩把 440 Hz 正弦压小；降噪的延迟补回来，长度不变
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = project();
+        let tone = p
+            .timeline
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .find(|c| {
+                c.asset()
+                    .and_then(|a| p.assets.get(&a))
+                    .is_some_and(|a| a.video.is_none())
+            })
+            .unwrap()
+            .id;
+        let plain = |proj: &Project, name: &str| {
+            let s = ExportSettings {
+                path: dir.path().join(name),
+                output: crate::Output::Audio(crate::AudioFormat::Wav),
+                loudness_lufs: None,
+                ..settings(dir.path(), Encoder::Nvenc)
+            };
+            export(proj, &s, |_| {}, &AtomicBool::new(false)).unwrap();
+            let r = ve_media::probe(&s.path).unwrap();
+            (integrated_lufs(&s.path), r.duration)
+        };
+        let (before, len_before) = plain(&p, "plain.wav");
+        let fx = ve_core::AudioFx {
+            denoise: 0.3,
+            eq: [0.0; 3],
+            compress: 1.0,
+        };
+        ve_core::edit::set_audio_fx(&mut p, tone, fx).unwrap();
+        let (after, len_after) = plain(&p, "fx.wav");
+        assert!(after < before - 3.0, "压缩后更小：{before} → {after}");
+        assert!(
+            (len_after - len_before).0.abs() <= Time::from_millis(30).0,
+            "{len_before:?} vs {len_after:?}"
+        );
     }
 
     #[test]
@@ -963,6 +1116,50 @@ mod tests {
         let last = d.seek_to(Time::from_millis(960)).unwrap();
         let last = frame_index_from_gray(f64::from(last.data[i]));
         assert!((9..=12).contains(&last), "最后一帧是原来的第 {last} 帧");
+    }
+
+    #[test]
+    fn proxies_shrink_big_video_keep_small_video_and_carry_the_sound() {
+        let dir = tempfile::tempdir().unwrap();
+        // 1280×720 → 短边 540
+        let big = dir.path().join("big.mp4");
+        make_proxy(&fixture(Fixture::Bt709Red), &big).unwrap();
+        let r = ve_media::probe(&big).unwrap();
+        let v = r.video.unwrap();
+        assert_eq!((v.width, v.height), (960, 540));
+        // 64×36 带声音：不放大，声音还在，时长不变
+        let small = dir.path().join("small.mp4");
+        make_proxy(&fixture(Fixture::VideoWithAudio), &small).unwrap();
+        let kept = ve_media::probe(&small).unwrap();
+        let size = kept.video.map(|x| (x.width, x.height));
+        assert_eq!(size, Some((64, 36)));
+        assert!(kept.audio.is_some());
+        assert!((kept.duration - Time::from_secs(2)).0.abs() <= Time::from_millis(60).0);
+        // 坏文件：报错
+        let bad = dir.path().join("坏.mp4");
+        std::fs::write(&bad, "不是视频").unwrap();
+        assert!(make_proxy(&bad, &dir.path().join("x.mp4")).is_err());
+    }
+
+    #[test]
+    fn stabilizing_writes_the_segment_with_its_sound() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("子目录").join("稳.mp4");
+        stabilize_segment(
+            &fixture(Fixture::VideoWithAudio),
+            Time::from_millis(500),
+            Time::from_secs(1),
+            12,
+            &out,
+        )
+        .unwrap();
+        let r = ve_media::probe(&out).unwrap();
+        assert!(r.video.is_some() && r.audio.is_some());
+        assert!(
+            (r.duration - Time::from_secs(1)).0.abs() <= Time::from_millis(70).0,
+            "{:?}",
+            r.duration
+        );
     }
 
     #[test]

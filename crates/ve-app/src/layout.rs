@@ -56,7 +56,19 @@ impl Workspace {
             v_flex()
                 .size_full()
                 .child(self.render_timeline_toolbar(cx))
-                .child(self.render_timeline(cx)),
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .child(self.render_timeline(cx)),
+                        )
+                        .child(self.render_level_meter(cx)),
+                ),
         )
     }
 
@@ -223,6 +235,8 @@ impl Workspace {
                 deferred(
                     v_flex()
                         .id("layout-menu")
+            // 盖住下面的东西：点菜单不会顺带点到下面的画面 / 时间轴
+            .occlude()
                         .test_support()
                         .absolute()
                         .top(px(30.))
