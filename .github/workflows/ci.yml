@@ -39,6 +39,11 @@ jobs:
       - name: FFmpeg（固定版本，校验哈希）
         run: pwsh scripts/setup-ffmpeg.ps1 -Dest "$env:RUNNER_TEMP\ffmpeg"
 
+      # 临时诊断（PR #2）：视频防抖的 ffmpeg 在 CI 上偶尔无声失败，统计退出码；查清后删掉
+      - name: 诊断：防抖 ffmpeg 退出码
+        continue-on-error: true
+        run: pwsh scripts/diag-vidstab.ps1 -Runs 30
+
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny,cargo-machete,cargo-llvm-cov
