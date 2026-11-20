@@ -57,6 +57,18 @@ mod generated {
             Rotate90,
             ZoomToFit,
             Freeze,
+            SetInPoint,
+            SetOutPoint,
+            RangeFromClips,
+            ClearRange,
+            PlayRange,
+            SelectSameColor,
+            ReplaceClip,
+            SelectTool,
+            BladeTool,
+            TogglePreviewAxis,
+            Reverse,
+            ToggleRecord,
         ]
     );
 }
@@ -91,9 +103,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("home", GoStart, Some(NO_INPUT)),
         KeyBinding::new("end", GoEnd, Some(NO_INPUT)),
         // 剪映（FCP X 键位）：Ctrl+B 分割、Ctrl+Shift+B 批量分割、Q / W 向左 / 右裁剪、[ / ] 向左 / 右全选；
-        // S 是我们原来的分割键，先保留
+        // A / B 鼠标选择 / 分割模式，S 预览轴
         KeyBinding::new("ctrl-b", Split, Some(NO_INPUT)),
-        KeyBinding::new("s", Split, Some(NO_INPUT)),
+        KeyBinding::new("a", SelectTool, Some(NO_INPUT)),
+        KeyBinding::new("b", BladeTool, Some(NO_INPUT)),
+        KeyBinding::new("s", TogglePreviewAxis, Some(NO_INPUT)),
         KeyBinding::new("ctrl-shift-b", SplitAll, Some(NO_INPUT)),
         KeyBinding::new("q", TrimLeft, Some(NO_INPUT)),
         KeyBinding::new("w", TrimRight, Some(NO_INPUT)),
@@ -126,5 +140,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-m", NextMarker, Some(NO_INPUT)),
         KeyBinding::new("alt-shift-m", PrevMarker, Some(NO_INPUT)),
         KeyBinding::new("`", ToggleLinkage, Some(NO_INPUT)),
+        // 剪映：I / O 区域入点 / 出点，Shift+X 以片段选定区域，Alt+X 取消选定区域，Shift+Enter 播放出入点区域
+        KeyBinding::new("i", SetInPoint, Some(NO_INPUT)),
+        KeyBinding::new("o", SetOutPoint, Some(NO_INPUT)),
+        KeyBinding::new("shift-x", RangeFromClips, Some(NO_INPUT)),
+        KeyBinding::new("alt-x", ClearRange, Some(NO_INPUT)),
+        KeyBinding::new("shift-enter", PlayRange, Some(NO_INPUT)),
     ]);
 }

@@ -18,7 +18,7 @@ pub enum TrackKind {
 }
 
 /// 片段内容。
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ClipContent {
     /// 引用素材的一段，从 `source_in` 开始。
     Media {
@@ -34,6 +34,10 @@ pub enum ClipContent {
         /// 入场 / 出场动画（第 6 版工程文件加的；没有时不写）。
         #[serde(default, skip_serializing_if = "crate::TextMotion::is_none")]
         motion: crate::TextMotion,
+        /// 这一条自己的样式（剪映「应用到全部字幕」关着时改的）；`None` 用工程的字幕样式。
+        /// 第 7 版工程文件加的。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        style: Option<crate::SubtitleStyle>,
     },
     /// 调节（剪映素材面板「调节」的「自定义调节」）：放在视频轨上，用片段的调色参数给它下面所有轨道的
     /// 画面调色（调节层）。没有素材，长度随意。第 6 版工程文件加的。
@@ -78,7 +82,27 @@ pub struct Clip {
     /// 变速时保持音调（剪映「声音变调」关着）；`false` 时音调跟着快慢变。第 5 版工程文件加的。
     #[serde(default = "keep", skip_serializing_if = "is_kept")]
     pub keep_pitch: bool,
+    /// 颜色标签（剪映右键菜单的 8 个色点，`0..LABEL_COLORS`）；没有时不写进文件。第 7 版工程文件加的。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<u8>,
+    /// 外观：混合模式、圆角、描边、阴影、蒙版、色度抠图（只对视频轨上的媒体片段起作用）。第 7 版工程文件加的。
+    #[serde(default, skip_serializing_if = "crate::Look::is_default")]
+    pub look: crate::Look,
+    /// 倒放（剪映「倒放」）：现在用的素材是倒着生成的那一段；这里记着原来的素材和素材内起点，
+    /// 再点一次倒放就换回去。第 7 版工程文件加的。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reversed: Option<(AssetId, Time)>,
+    /// 曲线变速（剪映「曲线变速」）：片段里各处快慢不同；平均倍数仍是 [`Self::speed`]。
+    /// 第 7 版工程文件加的。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curve: Option<crate::SpeedCurve>,
+    /// 进阶调色（HSL、曲线、色轮、LUT）；没调时不写进文件。第 7 版工程文件加的。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grade: Option<Arc<crate::Grade>>,
 }
+
+/// 颜色标签的个数。
+pub const LABEL_COLORS: u8 = 8;
 
 const fn keep() -> bool {
     true
@@ -115,10 +139,81 @@ impl Clip {
         self.animation.apply(&self.transform, offset)
     }
 
+    /// 片段内 `offset` 时刻的调色：有关键帧的项按动画求值，其余用固定值。
+    #[must_use]
+    pub fn adjust_at(&self, offset: Time) -> crate::ColorAdjust {
+        self.animation.apply_adjust(&self.adjust, offset)
+    }
+
+    /// 片段内 `offset` 时刻的音量（dB）：有音量关键帧时按动画求值。
+    #[must_use]
+    pub fn gain_db_at(&self, offset: Time) -> f32 {
+        self.animation
+            .value_at(crate::Prop::Volume, offset)
+            .unwrap_or(self.gain_db)
+    }
+
+    /// 片段内 `offset` 时刻某个可打关键帧属性的值。
+    #[must_use]
+    pub fn value_at(&self, prop: crate::Prop, offset: Time) -> f32 {
+        if prop.is_transform() {
+            prop.get(&self.transform_at(offset))
+        } else if let Some(item) = prop.adjust_item() {
+            item.get(&self.adjust_at(offset))
+        } else {
+            self.gain_db_at(offset)
+        }
+    }
+
+    /// 改某个属性的固定值（没有关键帧时用的值）。
+    pub const fn set_base(&mut self, prop: crate::Prop, value: f32) {
+        if prop.is_transform() {
+            prop.set(&mut self.transform, value);
+        } else if let Some(item) = prop.adjust_item() {
+            item.set(&mut self.adjust, value);
+        } else {
+            self.gain_db = value;
+        }
+    }
+
     /// 片段内 `offset`（时间轴时间）对应的素材时间（算上变速）。
     #[must_use]
     pub fn source_at(&self, offset: Time) -> Time {
-        self.source_in() + offset.scaled(f64::from(self.speed))
+        let Some(curve) = &self.curve else {
+            return self.source_in() + offset.scaled(f64::from(self.speed));
+        };
+        // 曲线变速：素材进度按曲线积分；片段外面（转场越过边界时）按两头的倍数接着走
+        let mean = f64::from(curve.mean().max(1e-3));
+        let edge = |at: f32| f64::from(self.speed) * f64::from(curve.speed_at(at)) / mean;
+        if offset < Time::ZERO {
+            return self.source_in() + offset.scaled(edge(0.0));
+        }
+        if offset > self.duration {
+            return self.source_in()
+                + self.source_span()
+                + (offset - self.duration).scaled(edge(1.0));
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            reason = "进度只需 f32 精度"
+        )]
+        let u = (offset.0 as f64 / self.duration.0.max(1) as f64) as f32;
+        self.source_in() + self.source_span().scaled(curve.progress(u))
+    }
+
+    /// 片段内 `offset` 时刻素材走得多快（素材时间 / 时间轴时间）：没有曲线时就是 [`Self::speed`]。
+    #[must_use]
+    pub fn speed_at(&self, offset: Time) -> f32 {
+        self.curve.as_ref().map_or(self.speed, |c| {
+            #[expect(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                reason = "进度只需 f32 精度"
+            )]
+            let u = (offset.0 as f64 / self.duration.0.max(1) as f64) as f32;
+            self.speed * c.speed_at(u) / c.mean().max(1e-3)
+        })
     }
 
     /// 片段用掉的素材长度（算上变速）。
@@ -171,6 +266,15 @@ impl Clip {
     pub const fn text_motion(&self) -> Option<crate::TextMotion> {
         match &self.content {
             ClipContent::Subtitle { motion, .. } => Some(*motion),
+            _ => None,
+        }
+    }
+
+    /// 字幕自己的样式（没有时用工程的）。
+    #[must_use]
+    pub const fn own_subtitle_style(&self) -> Option<&crate::SubtitleStyle> {
+        match &self.content {
+            ClipContent::Subtitle { style, .. } => style.as_ref(),
             _ => None,
         }
     }
@@ -273,6 +377,21 @@ pub struct Timeline {
     /// 标记（剪映的 M），按时间排好、不重复；没有时不写进文件。第 5 版工程文件加的。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub markers: Vec<Time>,
+    /// 入出点区域（剪映 I / O）：`(入点, 出点)`，入点 < 出点；没有时不写进文件。第 7 版工程文件加的。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<(Time, Time)>,
+    /// 草稿封面（剪映主轨的「封面」）：没有时不写进文件。第 7 版工程文件加的。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover: Option<Cover>,
+}
+
+/// 草稿封面。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Cover {
+    /// 成片里这一刻的画面（时间轴时间）。
+    Frame(Time),
+    /// 一张本地图片。
+    Image(std::path::PathBuf),
 }
 
 /// 模型不变式被破坏。
@@ -312,6 +431,9 @@ pub enum InvariantError {
         /// 素材。
         asset: AssetId,
     },
+    /// 入出点区域不合法。
+    #[error("入出点区域不对（入点要在出点之前、不能是负数）")]
+    BadRange,
     /// 片段内容与轨道类型不符。
     #[error("片段 {clip:?} 放错了轨道")]
     WrongTrackKind {
@@ -351,6 +473,8 @@ impl Timeline {
                 Track::new(a, TrackKind::Audio),
             ],
             markers: Vec::new(),
+            range: None,
+            cover: None,
         }
     }
 
@@ -378,6 +502,32 @@ impl Timeline {
                 true
             }
         }
+    }
+
+    /// 设入点（I）：已有出点且在入点之后就保留，否则出点放到 `end`（时间轴末尾）。
+    /// `at` 不在 `end` 之前时什么都不做，返回 `false`。
+    pub fn set_in_point(&mut self, at: Time, end: Time) -> bool {
+        let out = self.range.map(|r| r.1).filter(|o| *o > at).unwrap_or(end);
+        if at < Time::ZERO || at >= out {
+            return false;
+        }
+        self.range = Some((at, out));
+        true
+    }
+
+    /// 设出点（O）：已有入点且在出点之前就保留，否则入点放到开头。
+    /// `at` 不在 0 之后时什么都不做，返回 `false`。
+    pub fn set_out_point(&mut self, at: Time) -> bool {
+        let start = self
+            .range
+            .map(|r| r.0)
+            .filter(|i| *i < at)
+            .unwrap_or(Time::ZERO);
+        if at <= start {
+            return false;
+        }
+        self.range = Some((start, at));
+        true
     }
 
     /// 把字幕轨挪到最前面（其余轨道的相对顺序不变），标记排好序去重。旧版工程文件里字幕轨在最后。
@@ -475,6 +625,11 @@ impl Timeline {
                 prev_end = Some(clip.end());
             }
         }
+        if self.range.is_some_and(|(a, b)| a < Time::ZERO || a >= b)
+            || matches!(self.cover, Some(Cover::Frame(t)) if t < Time::ZERO)
+        {
+            return Err(InvariantError::BadRange);
+        }
         Ok(())
     }
 }
@@ -491,12 +646,18 @@ fn check_clip(
     if clip.duration <= Time::ZERO {
         return Err(InvariantError::ZeroLength { clip: id });
     }
+    if clip.label.is_some_and(|l| l >= LABEL_COLORS) {
+        return Err(InvariantError::BadTransform { clip: clip.id });
+    }
     if !clip.gain_db.is_finite() {
         return Err(InvariantError::BadGain { clip: id });
     }
     if !clip.transform.is_valid()
         || !clip.animation.is_valid()
         || !clip.adjust.is_valid()
+        || !clip.look.is_valid()
+        || clip.curve.as_ref().is_some_and(|c| !c.is_valid())
+        || clip.grade.as_ref().is_some_and(|g| !g.is_valid())
         || !(SPEED_RANGE.0..=SPEED_RANGE.1).contains(&clip.speed)
     {
         return Err(InvariantError::BadTransform { clip: id });
@@ -806,6 +967,8 @@ mod tests {
         let (v2, v1, a1, s1) = (ids.track(), ids.track(), ids.track(), ids.track());
         let mut tl = Timeline {
             markers: Vec::new(),
+            range: None,
+            cover: None,
             tracks: vec![
                 Track::new(v2, TrackKind::Video),
                 Track::new(v1, TrackKind::Video),

@@ -73,6 +73,8 @@ impl Workspace {
             .gap_0p5()
             .border_b_1()
             .border_color(palette::divider())
+            .child(self.render_tool_button(cx))
+            .child(gap())
             .child(tool(
                 "tb-undo",
                 Lucide::Undo2,
@@ -134,6 +136,8 @@ impl Workspace {
                 cx,
             ))
             .child(div().flex_1())
+            .child(self.render_record_button(cx))
+            .child(gap())
             .child(self.render_toolbar_switches(cx))
     }
 
@@ -151,6 +155,16 @@ impl Workspace {
                     cx,
                 )
                 .disabled(!video_selected),
+            )
+            .child(
+                tool(
+                    "tb-reverse",
+                    Lucide::Rewind,
+                    "倒放：选中的片段倒着放（再点一次恢复）",
+                    || Box::new(act::Reverse),
+                    cx,
+                )
+                .disabled(self.reverse_target().is_none() || self.is_reversing()),
             )
             .child(
                 tool(
@@ -200,6 +214,14 @@ impl Workspace {
                 "联动（~）：主轨片段挪动时，压在上面的字幕跟着走",
                 self.doc.project.settings.linkage,
                 || Box::new(act::ToggleLinkage),
+                cx,
+            ))
+            .child(toggle(
+                "tb-preview-axis",
+                Lucide::ScanEye,
+                "预览轴（S）：鼠标在时间轴上悬停时，播放器显示那一刻的画面，播放头不动",
+                self.timeline.preview_axis,
+                || Box::new(act::TogglePreviewAxis),
                 cx,
             ))
             .child(gap())

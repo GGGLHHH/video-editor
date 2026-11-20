@@ -1,6 +1,6 @@
 //! 工程文件（JSON）读写。
 //!
-//! 顶层 `{"format":"ve-project","version":6,...}`（第 1–5 版也能读）。素材路径同时存绝对路径和
+//! 顶层 `{"format":"ve-project","version":7,...}`（第 1–6 版也能读）。素材路径同时存绝对路径和
 //! 相对工程文件的路径：整个文件夹搬走后仍能找到素材。
 
 use crate::{Asset, AssetId, IdGen, InvariantError, Project, ProjectSettings, Timeline};
@@ -12,9 +12,10 @@ use thiserror::Error;
 const FORMAT: &str = "ve-project";
 /// 当前写出的版本。第 2 版加了片段的 `transform`，第 3 版加了 `transform.rotation`，
 /// 第 4 版加了片段的关键帧动画 `animation`，第 5 版加了调色 `adjust`、停用 `disabled`、时间轴标记 `markers` 和字幕样式 `subtitle_style`，
-/// 第 6 版加了轨道的 `hidden` / `muted` / `locked`、画面属性的 `mirror`、调节片段 `Adjustment` 和字幕动画 `motion`。
+/// 第 6 版加了轨道的 `hidden` / `muted` / `locked`、画面属性的 `mirror`、调节片段 `Adjustment` 和字幕动画 `motion`，
+/// 第 7 版加了调色 / 音量关键帧、片段颜色标签 `label`、入出点区域 `range`。
 /// 升版本是为了让旧版程序拒绝读新文件，而不是悄悄丢掉它不认识的字段。
-const VERSION: u32 = 6;
+const VERSION: u32 = 7;
 /// 能读的最旧版本（缺的字段取默认值）。
 const OLDEST_READABLE: u32 = 1;
 
@@ -255,6 +256,53 @@ mod tests {
     }
 
     #[test]
+    fn version_7_fields_round_trip() {
+        use crate::edit::{
+            add_keyframe_props, apply_gain_at, set_in_point, set_label, set_look, set_out_point,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = project_in(dir.path());
+        let v1 = project
+            .timeline
+            .tracks
+            .iter()
+            .find(|t| t.kind == crate::TrackKind::Video)
+            .unwrap()
+            .clips[0]
+            .id;
+        set_label(&mut project, &[v1], Some(5)).unwrap();
+        set_look(
+            &mut project,
+            v1,
+            crate::Look {
+                blend: crate::BlendMode::Screen,
+                radius: 0.3,
+                stroke: Some(crate::Stroke::default()),
+                shadow: Some(crate::Shadow::default()),
+                mask: Some(crate::Mask::new(crate::MaskShape::Heart)),
+                chroma: Some(crate::ChromaKey::default()),
+            },
+        )
+        .unwrap();
+        add_keyframe_props(&mut project, v1, crate::Time::ZERO, &[crate::Prop::Tint]).unwrap();
+        add_keyframe_props(&mut project, v1, crate::Time::ZERO, &[crate::Prop::Volume]).unwrap();
+        apply_gain_at(&mut project, v1, crate::Time::from_secs(1), -6.0).unwrap();
+        set_in_point(&mut project, crate::Time::from_millis(200)).unwrap();
+        set_out_point(&mut project, crate::Time::from_millis(900)).unwrap();
+        let file = dir.path().join("v7.vep");
+        save_project(&project, &file).unwrap();
+        let loaded = load_project(&file).unwrap().project;
+        assert_eq!(loaded, project);
+        let text = fs::read_to_string(&file).unwrap();
+        assert!(
+            text.contains("\"Screen\"")
+                && text.contains("\"range\"")
+                && text.contains("\"Volume\""),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn subtitle_style_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let mut project = project_in(dir.path());
@@ -311,7 +359,7 @@ mod tests {
         save_project(&project, &file).unwrap();
         let mut json: serde_json::Value =
             serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
-        assert_eq!(json["version"], 6);
+        assert_eq!(json["version"], 7);
         // 第 2 版文件：transform 里没有 rotation，读进来是 0
         let mut v2 = json.clone();
         v2["version"] = 2.into();
@@ -343,7 +391,7 @@ mod tests {
         }
         save_project(&loaded, &file).unwrap();
         let again: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
-        assert_eq!(again["version"], 6);
+        assert_eq!(again["version"], 7);
     }
 
     #[test]

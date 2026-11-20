@@ -44,10 +44,20 @@ struct LayerFrame {
     source: (u32, u32),
     transform: Transform,
     color: ve_core::ColorMatrix,
+    look: ve_core::Look,
+    grades: ve_core::GradeChain,
 }
 
+/// 一层的画面属性、调色、外观和调色链。
+type Appearance = (
+    Transform,
+    ve_core::ColorMatrix,
+    ve_core::Look,
+    ve_core::GradeChain,
+);
+
 /// 一帧要合成的东西：各层画面（从下往上）和底色的调色。
-type FrameLayers = (Vec<LayerFrame>, ve_core::ColorMatrix);
+type FrameLayers = (Vec<LayerFrame>, (ve_core::ColorMatrix, ve_core::GradeChain));
 
 /// 按顺序读一个片段的画面：第一次定位，之后一直往后读。
 struct Stepper {
@@ -137,7 +147,11 @@ fn layer_frames(
     t: Time,
     steppers: &mut HashMap<Key, Stepper>,
 ) -> Result<FrameLayers, ExportError> {
-    let ve_core::compose::Composition { layers, background } = resolve_frame(project, t);
+    let ve_core::compose::Composition {
+        layers,
+        background,
+        background_grades,
+    } = resolve_frame(project, t);
     steppers.retain(|key, _| layers.iter().any(|l| (l.track, l.clip) == *key));
     let mut jobs = Vec::with_capacity(layers.len());
     for l in &layers {
@@ -170,16 +184,16 @@ fn layer_frames(
             stepper,
             l.source_time,
             source,
-            (l.transform, l.color),
+            (l.transform, l.color, l.look, l.grades.clone()),
             asset.name.clone(),
         ));
     }
-    let step = |(key, mut stepper, time, source, (transform, color), name): (
+    let step = |(key, mut stepper, time, source, (transform, color, look, grades), name): (
         Key,
         Stepper,
         Time,
         (u32, u32),
-        (Transform, ve_core::ColorMatrix),
+        Appearance,
         String,
     )| {
         let r = stepper.frame_at(time).map_err(|e| render_error(&name, &e));
@@ -191,6 +205,8 @@ fn layer_frames(
                 source,
                 transform,
                 color,
+                look,
+                grades,
             }),
         )
     };
@@ -216,7 +232,7 @@ fn layer_frames(
         steppers.insert(key, stepper);
         frames.push(r?);
     }
-    Ok((frames, background))
+    Ok((frames, (background, background_grades)))
 }
 
 fn render_error(name: &str, e: &MediaError) -> ExportError {
@@ -306,9 +322,11 @@ pub fn render_video(
                     geometry: layer_geometry(size, l.source, &l.transform),
                     opacity: l.transform.opacity,
                     color: l.color,
+                    look: l.look,
+                    grades: &l.grades,
                 })
                 .collect();
-            compositor.set_background(&background);
+            compositor.set_background_chain(&background.0, &background.1);
             if let Err(e) = compositor.submit_nv12(size, &gpu) {
                 outcome = Err(ExportError::Render(e.to_string()));
                 break;

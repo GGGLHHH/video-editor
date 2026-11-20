@@ -4,6 +4,7 @@ mod context_menu;
 pub mod geometry;
 pub mod interaction;
 mod toolbar;
+pub mod tools;
 pub mod tracks;
 pub mod view;
 

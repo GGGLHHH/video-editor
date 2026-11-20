@@ -31,6 +31,58 @@ pub enum Codec {
     Hevc,
 }
 
+/// 导出什么（剪映导出对话框的「视频导出」/「音频导出」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Output {
+    /// 视频（带声音）。
+    #[default]
+    Video,
+    /// 只有声音。
+    Audio(AudioFormat),
+}
+
+/// 音频导出格式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AudioFormat {
+    /// MP3（320 kbps）。
+    #[default]
+    Mp3,
+    /// WAV（16 位无损）。
+    Wav,
+    /// AAC（m4a，256 kbps）。
+    Aac,
+}
+
+impl AudioFormat {
+    /// 文件扩展名。
+    #[must_use]
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Mp3 => "mp3",
+            Self::Wav => "wav",
+            Self::Aac => "m4a",
+        }
+    }
+
+    /// 大致码率（kbps，估计大小用）。
+    #[must_use]
+    pub const fn kbps(self) -> u32 {
+        match self {
+            Self::Mp3 => 320,
+            Self::Wav => 1536,
+            Self::Aac => 256,
+        }
+    }
+
+    const fn codec_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Mp3 => &["-c:a", "libmp3lame", "-b:a", "320k"],
+            Self::Wav => &["-c:a", "pcm_s16le"],
+            Self::Aac => &["-c:a", "aac", "-b:a", "256k"],
+        }
+    }
+}
+
 /// 推荐码率（kbps）：按每像素每帧 0.15 比特估，720p30 约 4 Mbps、1080p30 约 9 Mbps；HEVC 再省三成。
 #[must_use]
 pub fn recommended_kbps(width: u32, height: u32, frame_rate: FrameRate, codec: Codec) -> u32 {
@@ -76,6 +128,12 @@ pub struct ExportSettings {
     pub codec: Codec,
     /// 画面合成器配置（测试里用软件显卡）。
     pub render: ve_render::RenderConfig,
+    /// 导出视频还是只导出声音。
+    pub output: Output,
+    /// 目标响度（LUFS，如 -14）；`None` 不调整。
+    pub loudness_lufs: Option<i8>,
+    /// 只导出时间轴上的这一段（入出点区域）；`None` 导出全部。
+    pub range: Option<(Time, Time)>,
 }
 
 /// 一次 ffmpeg 调用。
@@ -178,6 +236,7 @@ fn push_video_input(args: &mut Vec<OsString>, settings: &ExportSettings) {
 fn push_audio_inputs<'a>(
     project: &'a Project,
     clips: &[&'a Clip],
+    first_index: usize,
     args: &mut Vec<OsString>,
 ) -> Vec<AudioInput<'a>> {
     let mut audio_inputs = Vec::new();
@@ -192,29 +251,39 @@ fn push_audio_inputs<'a>(
         let Some(sound) = ve_core::compose::audio_span(project, clip.id) else {
             continue;
         };
-        args.extend([
-            "-ss".into(),
-            secs(clip.source_at(sound.start - clip.start).max(Time::ZERO)).into(),
-            "-t".into(),
-            // 变速：截取的是素材里用到的那一段
-            secs((sound.end - sound.start).scaled(f64::from(clip.speed))).into(),
-            "-i".into(),
-            asset.path.clone().into_os_string(),
-        ]);
-        audio_inputs.push(AudioInput {
-            index: audio_inputs.len() + 1,
-            clip,
-            sound,
-        });
+        // 曲线变速的片段分成若干小段（和预览同一套切法）
+        let pieces = ve_core::compose::audio_pieces(clip, &sound);
+        let whole = pieces.len() == 1;
+        for piece in pieces {
+            args.extend([
+                "-ss".into(),
+                secs(piece.source_start).into(),
+                "-t".into(),
+                // 变速：截取的是素材里用到的那一段
+                secs(piece.len.scaled(f64::from(piece.speed))).into(),
+                "-i".into(),
+                asset.path.clone().into_os_string(),
+            ]);
+            audio_inputs.push(AudioInput {
+                index: audio_inputs.len() + first_index,
+                clip,
+                sound,
+                piece,
+                whole,
+            });
+        }
     }
     audio_inputs
 }
 
-/// 一路音频输入：ffmpeg 输入序号、片段、声音实际放的那一段。
+/// 一路音频输入：ffmpeg 输入序号、片段、声音实际放的那一段、这一路是其中哪一小段。
 struct AudioInput<'a> {
     index: usize,
     clip: &'a Clip,
     sound: ve_core::compose::AudioSpan,
+    piece: ve_core::compose::AudioPiece,
+    /// 整段只有这一路（没有曲线变速）：淡入淡出用 afade；分了段时用音量表达式接起来。
+    whole: bool,
 }
 
 /// 视频链：合成好的画面直接用，有字幕时再烧录。
@@ -229,18 +298,18 @@ fn video_chain(graph: &mut String, with_subtitles: bool) {
 
 /// 变速的音频滤镜（原速是空串）。保持音调：`atempo`（每级只能 0.5–2，超出就等分成几级串起来）；
 /// 变调：把采样率当成「倍数 × 48k」再重采样回 48k，快慢和音调一起变。都和预览一致。
-fn speed_filter(clip: &Clip) -> String {
+fn speed_filter(clip: &Clip, speed: f32) -> String {
     #[expect(clippy::float_cmp, reason = "原速是精确的 1.0")]
-    if clip.speed == 1.0 {
+    if speed == 1.0 {
         return String::new();
     }
     if !clip.keep_pitch {
         return format!(
             ",asetrate={:.3},aresample={MIX_RATE}",
-            f64::from(MIX_RATE) * f64::from(clip.speed)
+            f64::from(MIX_RATE) * f64::from(speed)
         );
     }
-    let speed = f64::from(clip.speed);
+    let speed = f64::from(speed);
     // 每级最多 ×2 或 ÷2：级数 = ⌈|log2 倍数|⌉，每级一样大
     #[expect(clippy::cast_possible_truncation, reason = "倍数 0.1–10，最多 4 级")]
     let stages = (speed.log2().abs().ceil() as i32).max(1);
@@ -248,26 +317,112 @@ fn speed_filter(clip: &Clip) -> String {
     format!(",atempo={step:.6}").repeat(usize::try_from(stages).unwrap_or(1))
 }
 
-fn audio_chain(graph: &mut String, audio_inputs: &[AudioInput<'_>], duration: Time) {
+/// 音量滤镜：没有音量关键帧时是固定倍数；有的时候是按帧求值的表达式，和预览的
+/// [`ve_core::keyframe::value_of`] 同一套插值（dB 按缓动曲线插，再换成倍数）。
+/// 滤镜里的 `t` 从这一路声音开始放的时刻算起，`shift` 把它换成相对片段起点的时间。
+fn volume_filter(clip: &Clip, shift: Time) -> String {
+    volume_filter_with(clip, shift, None)
+}
+
+/// 同 [`volume_filter`]；`fade` 给了的时候（分段的声音），淡入淡出也写进表达式：
+/// （这一路开始的时刻离声音开始多远、声音总长、淡入、淡出）。
+fn volume_filter_with(clip: &Clip, shift: Time, fade: Option<(Time, Time, Time, Time)>) -> String {
+    let keys = clip.animation.keys(ve_core::Prop::Volume);
+    let envelope = fade.map(|(lead, total, fi, fo)| {
+        let at = format!("(t+{})", secs(lead));
+        let mut e = String::from("1");
+        if fi > Time::ZERO {
+            e = format!("min({e},max(0,{at}/{}))", secs(fi));
+        }
+        if fo > Time::ZERO {
+            e = format!("min({e},max(0,({}-{at})/{}))", secs(total), secs(fo));
+        }
+        e
+    });
+    if keys.is_empty() {
+        let gain = 10f64.powf(f64::from(clip.gain_db) / 20.0);
+        return envelope.map_or_else(
+            || format!("volume={gain:.6}"),
+            |e| format!("volume='{gain:.6}*{e}':eval=frame"),
+        );
+    }
+    let at = format!("(t+{})", secs(shift));
+    let mut expr = format!("{:.4}", keys[keys.len() - 1].value);
+    // 从后往前套：if(T<k[i+1].at, 第 i 段, 后面的)
+    for pair in keys.windows(2).rev() {
+        let (a, b) = (pair[0], pair[1]);
+        let u = format!("(({at}-{})/{})", secs(a.at), secs(b.at - a.at));
+        let eased = match a.easing {
+            ve_core::Easing::Linear => u,
+            ve_core::Easing::EaseIn => format!("pow({u},3)"),
+            ve_core::Easing::EaseOut => format!("(1-pow(1-{u},3))"),
+            ve_core::Easing::EaseInOut => {
+                format!("if(lt({u},0.5),4*pow({u},3),1-pow(2-2*{u},3)/2)")
+            }
+        };
+        expr = format!(
+            "if(lt({at},{}),{:.4}+({:.4})*{eased},{expr})",
+            secs(b.at),
+            a.value,
+            b.value - a.value
+        );
+    }
+    expr = format!(
+        "if(lt({at},{}),{:.4},{expr})",
+        secs(keys[0].at),
+        keys[0].value
+    );
+    envelope.map_or_else(
+        || format!("volume='pow(10,({expr})/20)':eval=frame"),
+        |e| format!("volume='pow(10,({expr})/20)*{e}':eval=frame"),
+    )
+}
+
+fn audio_chain(
+    graph: &mut String,
+    audio_inputs: &[AudioInput<'_>],
+    duration: Time,
+    loudness: Option<i8>,
+) {
     let _ = writeln!(
         graph,
         "anullsrc=r={MIX_RATE}:cl=stereo,atrim=duration={}[abase];",
         secs(duration)
     );
     let mut mix_labels = String::from("[abase]");
-    for &AudioInput { index, clip, sound } in audio_inputs {
-        let speed = speed_filter(clip);
+    for &AudioInput {
+        index,
+        clip,
+        sound,
+        piece,
+        whole,
+    } in audio_inputs
+    {
+        let speed = speed_filter(clip, piece.speed);
+        let (fade_in, fade_out) = (sound.fade_in, sound.fade_out);
+        let volume = if whole {
+            volume_filter(clip, sound.start - clip.start)
+        } else {
+            volume_filter_with(
+                clip,
+                piece.start - clip.start,
+                Some((
+                    piece.start - sound.start,
+                    sound.end - sound.start,
+                    fade_in,
+                    fade_out,
+                )),
+            )
+        };
         let _ = write!(
             graph,
-            "[{index}:a]aresample={MIX_RATE}{speed},aformat=sample_fmts=fltp:channel_layouts=stereo,volume={:.6}",
-            10f64.powf(f64::from(clip.gain_db) / 20.0)
+            "[{index}:a]aresample={MIX_RATE}{speed},aformat=sample_fmts=fltp:channel_layouts=stereo,{volume}"
         );
         // 和预览一样：转场处两段的声音叠在一起交叉淡化
-        let (fade_in, fade_out) = (sound.fade_in, sound.fade_out);
-        if fade_in > Time::ZERO {
+        if whole && fade_in > Time::ZERO {
             let _ = write!(graph, ",afade=t=in:st=0:d={}", secs(fade_in));
         }
-        if fade_out > Time::ZERO {
+        if whole && fade_out > Time::ZERO {
             let _ = write!(
                 graph,
                 ",afade=t=out:st={}:d={}",
@@ -278,24 +433,50 @@ fn audio_chain(graph: &mut String, audio_inputs: &[AudioInput<'_>], duration: Ti
         let _ = writeln!(
             graph,
             ",adelay=delays={}S:all=1[a{index}];",
-            sound.start.to_samples(MIX_RATE)
+            piece.start.to_samples(MIX_RATE)
         );
         let _ = write!(mix_labels, "[a{index}]");
     }
     if audio_inputs.is_empty() {
-        graph.push_str("[abase]anull[aout]");
+        graph.push_str("[abase]anull[amixed];");
     } else {
-        let _ = write!(
+        let _ = writeln!(
             graph,
-            "{mix_labels}amix=inputs={}:normalize=0:duration=first[aout]",
+            "{mix_labels}amix=inputs={}:normalize=0:duration=first[amixed];",
             audio_inputs.len() + 1
         );
+    }
+    // 目标响度（剪映导出的「目标响度」）：EBU R128 单遍，真峰值留 1.5 dB；loudnorm 会升到 192k，再降回来。
+    // 整段都是静音时 loudnorm 会算出 NaN（AAC 编码器直接报错）：没有声音输入就不做，
+    // 有输入也把 NaN 换成 0 兜底
+    match loudness.filter(|_| !audio_inputs.is_empty()) {
+        Some(lufs) => {
+            let _ = write!(
+                graph,
+                "[amixed]loudnorm=I={lufs}:TP=-1.5:LRA=11,aresample={MIX_RATE},\
+                 aeval=exprs='if(isnan(val(0)),0,val(0))|if(isnan(val(1)),0,val(1))':c=same[aout]"
+            );
+        }
+        None => graph.push_str("[amixed]anull[aout]"),
     }
 }
 
 /// 向下取偶数（至少 2）。
 fn rate_str(rate: FrameRate) -> String {
     format!("{}/{}", rate.num, rate.den)
+}
+
+/// 只有声音时的输出参数。
+fn push_audio_output(
+    args: &mut Vec<OsString>,
+    settings: &ExportSettings,
+    format: AudioFormat,
+    duration: Time,
+) {
+    args.extend(["-/filter_complex", "filter.txt", "-map", "[aout]", "-vn"].map(OsString::from));
+    args.extend(format.codec_args().iter().map(OsString::from));
+    args.extend(["-t".into(), secs(duration).into(), "-y".into()]);
+    args.push(settings.path.clone().into_os_string());
 }
 
 /// 输出参数：映射、编码器、码率、容器。
@@ -378,16 +559,24 @@ pub fn build_job(
         return Err(ExportError::EmptyTimeline);
     }
     let mut args: Vec<OsString> = ["-hide_banner", "-nostats"].map(OsString::from).to_vec();
-    push_video_input(&mut args, settings);
+    let with_video = settings.output == Output::Video;
+    if with_video {
+        push_video_input(&mut args, settings);
+    }
     // 声音：视频轨片段的原声在前，音频轨片段在后
     let video = media_clips(project, TrackKind::Video);
     let audio = media_clips(project, TrackKind::Audio);
     let all: Vec<&Clip> = video.iter().chain(audio.iter()).copied().collect();
-    let audio_inputs = push_audio_inputs(project, &all, &mut args);
+    let audio_inputs = push_audio_inputs(project, &all, usize::from(with_video), &mut args);
     let mut graph = String::new();
-    video_chain(&mut graph, with_subtitles);
-    audio_chain(&mut graph, &audio_inputs, duration);
-    push_output(&mut args, settings, duration);
+    if with_video {
+        video_chain(&mut graph, with_subtitles);
+    }
+    audio_chain(&mut graph, &audio_inputs, duration, settings.loudness_lufs);
+    match settings.output {
+        Output::Video => push_output(&mut args, settings, duration),
+        Output::Audio(format) => push_audio_output(&mut args, settings, format, duration),
+    }
     Ok(FfmpegJob {
         args,
         filter_graph: graph,
@@ -412,6 +601,9 @@ mod tests {
             encoder: Encoder::X264,
             codec: Codec::H264,
             render: ve_render::RenderConfig { software: true },
+            output: Output::Video,
+            loudness_lufs: None,
+            range: None,
         }
     }
 
@@ -465,11 +657,14 @@ mod tests {
         assert!(!graph.contains("asetrate"), "{graph}");
         let mut c = Clip::clone(p.timeline.find_clip(ids.v1).unwrap().1);
         c.speed = 0.25;
-        assert_eq!(speed_filter(&c), ",atempo=0.500000,atempo=0.500000");
+        assert_eq!(
+            speed_filter(&c, c.speed),
+            ",atempo=0.500000,atempo=0.500000"
+        );
         c.speed = 1.5;
-        assert_eq!(speed_filter(&c), ",atempo=1.500000");
+        assert_eq!(speed_filter(&c, c.speed), ",atempo=1.500000");
         c.speed = 1.0;
-        assert_eq!(speed_filter(&c), "");
+        assert_eq!(speed_filter(&c, c.speed), "");
     }
 
     #[test]
@@ -599,9 +794,10 @@ mod tests {
             "{g}"
         );
         assert!(
-            g.contains("[abase][a1][a2][a3]amix=inputs=4:normalize=0:duration=first[aout]"),
+            g.contains("[abase][a1][a2][a3]amix=inputs=4:normalize=0:duration=first[amixed];"),
             "{g}"
         );
+        assert!(g.ends_with("[amixed]anull[aout]"), "{g}");
     }
 
     #[test]
@@ -665,5 +861,73 @@ mod tests {
             build_job(&Project::new(), &s, false),
             Err(ExportError::EmptyTimeline)
         ));
+    }
+
+    /// 导出的音量表达式交给 ffmpeg 真算一遍，和预览的插值（dB 按缓动插、再换成倍数）对得上。
+    #[test]
+    fn volume_keyframes_export_like_the_preview() {
+        use ve_core::{Easing, Prop};
+        let (mut p, ids) = sample_project();
+        let a1 = ids.a1;
+        ve_core::edit::add_keyframe_props(&mut p, a1, Time::ZERO, &[Prop::Volume]).unwrap();
+        for (at, db) in [(0.5, -6.0), (1.0, -20.0), (1.5, -3.0), (2.0, 6.0)] {
+            ve_core::edit::apply_gain_at(&mut p, a1, Time::from_secs_f64(at), db).unwrap();
+        }
+        for (at, e) in [
+            (0.0, Easing::Linear),
+            (0.5, Easing::EaseIn),
+            (1.0, Easing::EaseOut),
+            (1.5, Easing::EaseInOut),
+        ] {
+            ve_core::edit::set_keyframe_easing(
+                &mut p,
+                a1,
+                Time::from_secs_f64(at),
+                &[Prop::Volume],
+                e,
+            )
+            .unwrap();
+        }
+        let clip = (**p.timeline.find_clip(a1).unwrap().1).clone();
+        // 这一路声音比片段早 0.25 秒开始放（转场时会这样）
+        let shift = Time::from_millis(-250);
+        let filter = volume_filter(&clip, shift);
+        let out = crate::run::ffmpeg_command(crate::run::ffmpeg_program())
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg("aevalsrc=1:s=48000:d=2.5")
+            .args([
+                "-af",
+                &format!("asetnsamples=n=64,{filter}"),
+                "-f",
+                "f32le",
+                "-ac",
+                "1",
+                "pipe:1",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let samples: Vec<f32> = out
+            .stdout
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        for i in (0..samples.len()).step_by(64 * 20) {
+            #[expect(clippy::cast_precision_loss, reason = "测试")]
+            let t = Time::from_secs_f64(i as f64 / 48_000.0) + shift;
+            let want = 10f32.powf(clip.gain_db_at(t) / 20.0);
+            let got = samples[i];
+            assert!(
+                (got - want).abs() <= want * 0.02 + 1e-4,
+                "片段内 {:.3} 秒：导出 {got}，预览 {want}",
+                t.as_secs_f64()
+            );
+        }
     }
 }

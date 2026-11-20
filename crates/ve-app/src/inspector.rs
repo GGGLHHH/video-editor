@@ -13,19 +13,19 @@ use gpui_kit::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
 };
-use ve_core::edit::{GAIN_RANGE_DB, set_fades, set_gain, set_subtitle_text};
+use ve_core::edit::{GAIN_RANGE_DB, apply_gain_at, set_fades, set_subtitle_text};
 use ve_core::{ClipContent, ClipId, Time, format_timecode};
 
 /// 属性面板控件状态。
 #[derive(Debug)]
 pub struct Inspector {
-    gain: Entity<SliderState>,
+    pub(crate) gain: Entity<SliderState>,
     fade_in: Entity<InputState>,
     fade_out: Entity<InputState>,
     pub(crate) text: Entity<TextareaState>,
     /// 控件当前对应的片段。
     pub(crate) bound: Option<ClipId>,
-    gain_gesture: bool,
+    pub(crate) gain_gesture: bool,
     /// 「画面」区。
     pub(crate) transform: crate::inspector_transform::TransformFields,
     /// 「调整」标签。
@@ -36,6 +36,14 @@ pub struct Inspector {
     pub(crate) anim_out: bool,
     /// 「动画」标签：预设时长（秒）。
     pub(crate) anim_secs: f64,
+    /// 折叠起来的属性组（按组编号）。
+    pub(crate) collapsed: std::collections::HashSet<&'static str>,
+    /// 外观（混合模式、描边、阴影、抠像、蒙版）的滑条和二级分段。
+    pub(crate) look: crate::inspector_look::LookFields,
+    /// 「变速」标签：常规 / 曲线、自定义曲线的滑条。
+    pub(crate) speed: crate::inspector_speed::SpeedFields,
+    /// 「调整」标签的进阶调色（HSL、曲线、色轮、LUT）。
+    pub(crate) grade: crate::inspector_grade::GradeFields,
 }
 
 /// 属性面板的一级标签。
@@ -142,6 +150,9 @@ impl Inspector {
         let (transform, transform_subs) =
             crate::inspector_transform::TransformFields::new(window, cx);
         let (adjust, adjust_subs) = crate::inspector_adjust::AdjustFields::new(window, cx);
+        let (look, look_subs) = crate::inspector_look::LookFields::new(window, cx);
+        let (speed, speed_subs) = crate::inspector_speed::SpeedFields::new(window, cx);
+        let (grade, grade_subs) = crate::inspector_grade::GradeFields::new(window, cx);
         let mut subs = vec![
             cx.subscribe_in(
                 &gain,
@@ -187,6 +198,9 @@ impl Inspector {
         ];
         subs.extend(transform_subs);
         subs.extend(adjust_subs);
+        subs.extend(look_subs);
+        subs.extend(speed_subs);
+        subs.extend(grade_subs);
         (
             Self {
                 gain,
@@ -198,6 +212,10 @@ impl Inspector {
                 tab: InspectorTab::default(),
                 anim_out: false,
                 anim_secs: 0.5,
+                collapsed: std::collections::HashSet::new(),
+                look,
+                speed,
+                grade,
                 transform,
                 adjust,
             },
@@ -216,6 +234,15 @@ impl Workspace {
         let Some(clip) = self.inspector.bound else {
             return;
         };
+        let Some(offset) = self
+            .doc
+            .project
+            .timeline
+            .find_clip(clip)
+            .map(|(_, c)| (self.playhead - c.start).clamp(Time::ZERO, c.duration))
+        else {
+            return;
+        };
         match e {
             SliderEvent::Change(v) => {
                 if !self.inspector.gain_gesture {
@@ -223,7 +250,7 @@ impl Workspace {
                     self.inspector.gain_gesture = true;
                 }
                 let db = v.start();
-                let _ = self.doc.edit(|p| set_gain(p, clip, db));
+                let _ = self.doc.edit(|p| apply_gain_at(p, clip, offset, db));
                 self.after_change(window, cx);
             }
             SliderEvent::Release(_) => {
@@ -233,6 +260,67 @@ impl Workspace {
                 }
             }
         }
+    }
+
+    /// 「音频」标签：音量（带关键帧）、淡入淡出，整组可以重置。
+    fn render_audio_props(
+        &self,
+        c: &ve_core::Clip,
+        cx: &Context<'_, Self>,
+    ) -> gpui_kit::AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let row = |label: &'static str, value: String| {
+            h_flex()
+                .justify_between()
+                .text_sm()
+                .child(div().text_color(muted).child(label))
+                .child(SharedString::from(value))
+        };
+        let body = v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(div().flex_1().child(row(
+                        "音量",
+                        format!(
+                            "{:+.1} dB",
+                            c.gain_db_at((self.playhead - c.start).clamp(Time::ZERO, c.duration))
+                        ),
+                    )))
+                    .child(self.render_group_keys(ve_core::KeyGroup::Volume, cx)),
+            )
+            .child(Slider::new(&self.inspector.gain))
+            .child(div().text_sm().text_color(muted).child("淡入（秒）"))
+            .child(Input::new(&self.inspector.fade_in).id("fade-in"))
+            .child(div().text_sm().text_color(muted).child("淡出（秒）"))
+            .child(Input::new(&self.inspector.fade_out))
+            .into_any_element();
+        v_flex()
+            .id("insp-audio")
+            .test_support()
+            .child(self.render_group(
+                crate::inspector_group::Group {
+                    id: "aud",
+                    title: "基础",
+                    check: None,
+                    reset: Some(Self::reset_audio),
+                    extra: None,
+                },
+                body,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    /// 「音频」组的 ↻：音量回到 0 dB（清掉音量关键帧）、没有淡入淡出。
+    fn reset_audio(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(clip) = self.inspector.bound else {
+            return;
+        };
+        self.apply(window, cx, |p| ve_core::edit::reset_audio(p, clip));
+        self.inspector.unbind();
+        self.sync_inspector(window, cx);
     }
 
     fn commit_fades(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -312,9 +400,11 @@ impl Workspace {
         };
         match &clip.content {
             ClipContent::Media { .. } => {
+                let offset = (self.playhead - clip.start).clamp(Time::ZERO, clip.duration);
+                let db = clip.gain_db_at(offset);
                 self.inspector
                     .gain
-                    .update(cx, |s, cx| s.set_value(clip.gain_db, window, cx));
+                    .update(cx, |s, cx| s.set_value(db, window, cx));
                 self.inspector
                     .fade_in
                     .update(cx, |s, cx| s.set_value(secs_text(clip.fade_in), window, cx));
@@ -323,7 +413,8 @@ impl Workspace {
                 });
                 if let Some((_, t, _)) = self.bound_video_clip() {
                     self.fill_transform(&t, window, cx);
-                    self.fill_adjust(&clip.adjust, window, cx);
+                    let offset = (self.playhead - clip.start).clamp(Time::ZERO, clip.duration);
+                    self.fill_adjust(&clip.adjust_at(offset), window, cx);
                 }
             }
             ClipContent::Subtitle { text, .. } => {
@@ -331,6 +422,9 @@ impl Workspace {
                 self.inspector
                     .text
                     .update(cx, |s, cx| s.set_value(text, window, cx));
+                if let Some((_, t, _)) = self.bound_visual_clip() {
+                    self.fill_transform(&t, window, cx);
+                }
             }
             ClipContent::Adjustment => self.fill_adjust(&clip.adjust, window, cx),
         }
@@ -415,6 +509,10 @@ impl Workspace {
         )
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "一整块面板的布局，拆开反而难对照界面"
+    )]
     pub(crate) fn render_inspector(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let rate = self.doc.project.settings.frame_rate;
@@ -462,25 +560,30 @@ impl Workspace {
                     .get(asset)
                     .map(|a| a.name.clone())
                     .unwrap_or_default();
+                let seg = match self.inspector.look.seg {
+                    crate::inspector_look::PictureSeg::Basic => v_flex()
+                        .gap_3()
+                        .child(div().text_sm().truncate().child(SharedString::from(name)))
+                        .child(timing)
+                        .children(self.render_transform_section(cx))
+                        .children(self.render_stroke_shadow(cx))
+                        .into_any_element(),
+                    crate::inspector_look::PictureSeg::Key => self
+                        .render_key_seg(cx)
+                        .unwrap_or_else(|| div().into_any_element()),
+                    crate::inspector_look::PictureSeg::Mask => self
+                        .render_mask_seg(cx)
+                        .unwrap_or_else(|| div().into_any_element()),
+                };
                 v_flex()
                     .gap_3()
-                    .child(chrome::segments(&[("基础", true)], cx))
-                    .child(div().text_sm().truncate().child(SharedString::from(name)))
-                    .child(timing)
-                    .children(self.render_transform_section(cx))
+                    .child(self.render_picture_segments(cx))
+                    .child(seg)
                     .into_any_element()
             }
-            (Some(InspectorTab::Audio), ClipContent::Media { .. }) => v_flex()
-                .id("insp-audio")
-                .test_support()
-                .gap_2()
-                .child(row("音量", format!("{:+.1} dB", c.gain_db)))
-                .child(Slider::new(&self.inspector.gain))
-                .child(div().text_sm().text_color(muted).child("淡入（秒）"))
-                .child(Input::new(&self.inspector.fade_in).id("fade-in"))
-                .child(div().text_sm().text_color(muted).child("淡出（秒）"))
-                .child(Input::new(&self.inspector.fade_out))
-                .into_any_element(),
+            (Some(InspectorTab::Audio), ClipContent::Media { .. }) => {
+                self.render_audio_props(&c, cx)
+            }
             (Some(InspectorTab::Subtitles), ClipContent::Subtitle { .. }) => {
                 self.render_subtitle_list(cx)
             }
@@ -488,6 +591,8 @@ impl Workspace {
                 .gap_3()
                 .child(timing)
                 .child(self.render_text_style_tab(cx))
+                // 剪映文字也有「位置大小」，能打关键帧
+                .children(self.render_transform_section(cx))
                 .into_any_element(),
             (Some(InspectorTab::Speed), ClipContent::Media { .. }) => {
                 self.render_speed_tab(&c, cx).into_any_element()
@@ -501,7 +606,22 @@ impl Workspace {
             (Some(InspectorTab::Adjust), _) => self.render_adjust_tab(cx).into_any_element(),
             _ => div().into_any_element(),
         };
-        inspector_frame(tabs, body)
+        // 数值框上拖动改值：拖出数值框也接着改，松开才结束
+        div()
+            .size_full()
+            .on_mouse_move(cx.listener(|this, e, window, cx| {
+                this.scrub_move(e, window, cx);
+                this.grade_drag_move(e, window, cx);
+            }))
+            .on_mouse_up(
+                gpui_kit::MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.scrub_up(window, cx);
+                    this.grade_drag_up();
+                }),
+            )
+            .child(inspector_frame(tabs, body))
+            .into_any_element()
     }
 }
 
@@ -522,6 +642,7 @@ fn inspector_frame(tabs: impl IntoElement, body: impl IntoElement) -> gpui_kit::
         .child(
             v_flex()
                 .id("inspector-body")
+                .test_support()
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scroll()

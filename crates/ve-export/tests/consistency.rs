@@ -66,7 +66,31 @@ fn three_layers(width: u32, height: u32) -> Project {
         let track = add_track(&mut p, TrackKind::Video).unwrap();
         let clip = insert_asset_at(&mut p, asset, track, Time::ZERO).unwrap();
         set_transform(&mut p, clip, t).unwrap();
+        if asset == red {
+            // 圆角 + 描边 + 阴影 + 圆形蒙版：导出和预览也得一致
+            let look = ve_core::Look {
+                radius: 0.3,
+                stroke: Some(ve_core::Stroke {
+                    color: 0xFF_FFFF,
+                    width: 0.02,
+                }),
+                shadow: Some(ve_core::Shadow::default()),
+                mask: Some(ve_core::Mask {
+                    width: 0.9,
+                    height: 0.9,
+                    ..ve_core::Mask::new(ve_core::MaskShape::Circle)
+                }),
+                ..ve_core::Look::NONE
+            };
+            ve_core::edit::set_look(&mut p, clip, look).unwrap();
+        }
         if asset == bars {
+            // 混合模式（读底图的那条路）
+            let screen = ve_core::Look {
+                blend: ve_core::BlendMode::Screen,
+                ..ve_core::Look::NONE
+            };
+            ve_core::edit::set_look(&mut p, clip, screen).unwrap();
             // 调过色的图层：导出和预览也得一致
             let adjust = ve_core::ColorAdjust {
                 saturation: -0.6,
@@ -112,6 +136,9 @@ fn exported_frame(p: &Project, width: u32, height: u32, t: Time) -> VideoFrame {
         encoder: Encoder::X264,
         codec: ve_export::Codec::H264,
         render: RenderConfig { software: true },
+        output: ve_export::Output::Video,
+        loudness_lufs: None,
+        range: None,
     };
     export(p, &settings, |_| {}, &AtomicBool::new(false)).unwrap();
     let mut d = VideoDecoder::open(

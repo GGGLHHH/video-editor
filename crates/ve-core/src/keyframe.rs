@@ -1,9 +1,9 @@
-//! 关键帧动画：片段的画面属性随时间变化。
+//! 关键帧动画：片段的画面属性、调色和音量随时间变化。
 //!
 //! 每个属性单独一串关键帧（时间相对片段起点）；没有关键帧的属性用片段原来的固定值。
 //! 求值是两端值按缓动曲线的凸组合，结果再整理成合法的画面属性（见 [`Animation::apply`]）。
 
-use crate::{Time, Transform};
+use crate::{AdjustItem, ColorAdjust, Time, Transform};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -74,6 +74,18 @@ pub enum Prop {
     CropRight,
     /// 下裁剪。
     CropBottom,
+    /// 亮度（调色，-1–1）。
+    Brightness,
+    /// 对比度。
+    Contrast,
+    /// 饱和度。
+    Saturation,
+    /// 色温。
+    Temperature,
+    /// 色调。
+    Tint,
+    /// 音量（dB，-60–12）。
+    Volume,
 }
 
 /// 属性面板里一行一个关键帧按钮（剪映电脑版按属性打帧）：位置（X、Y 一起）、缩放、旋转、
@@ -90,10 +102,14 @@ pub enum KeyGroup {
     Opacity,
     /// 裁剪。
     Crop,
+    /// 调色的一项（「调整」标签每个滑条一组）。
+    Adjust(AdjustItem),
+    /// 音量（「音频」标签）。
+    Volume,
 }
 
 impl KeyGroup {
-    /// 全部分组（属性面板里从上到下的顺序）。
+    /// 画面的分组（属性面板「画面」里从上到下的顺序）。
     pub const ALL: [Self; 5] = [
         Self::Scale,
         Self::Position,
@@ -116,6 +132,12 @@ impl KeyGroup {
                 Prop::CropRight,
                 Prop::CropBottom,
             ],
+            Self::Adjust(AdjustItem::Brightness) => &[Prop::Brightness],
+            Self::Adjust(AdjustItem::Contrast) => &[Prop::Contrast],
+            Self::Adjust(AdjustItem::Saturation) => &[Prop::Saturation],
+            Self::Adjust(AdjustItem::Temperature) => &[Prop::Temperature],
+            Self::Adjust(AdjustItem::Tint) => &[Prop::Tint],
+            Self::Volume => &[Prop::Volume],
         }
     }
 }
@@ -134,7 +156,43 @@ impl Prop {
         Self::CropBottom,
     ];
 
-    /// 从画面属性里读这个属性。
+    /// 调色的五项。
+    pub const ADJUST: [Self; 5] = [
+        Self::Brightness,
+        Self::Contrast,
+        Self::Saturation,
+        Self::Temperature,
+        Self::Tint,
+    ];
+
+    /// 对应的调色项（不是调色属性时 `None`）。
+    #[must_use]
+    pub const fn adjust_item(self) -> Option<AdjustItem> {
+        match self {
+            Self::Brightness => Some(AdjustItem::Brightness),
+            Self::Contrast => Some(AdjustItem::Contrast),
+            Self::Saturation => Some(AdjustItem::Saturation),
+            Self::Temperature => Some(AdjustItem::Temperature),
+            Self::Tint => Some(AdjustItem::Tint),
+            _ => None,
+        }
+    }
+
+    /// 是不是画面属性（位置、缩放、旋转、不透明度、裁剪）。
+    #[must_use]
+    pub const fn is_transform(self) -> bool {
+        !matches!(
+            self,
+            Self::Brightness
+                | Self::Contrast
+                | Self::Saturation
+                | Self::Temperature
+                | Self::Tint
+                | Self::Volume
+        )
+    }
+
+    /// 从画面属性里读这个属性（不是画面属性时返回 0）。
     #[must_use]
     pub const fn get(self, t: &Transform) -> f32 {
         match self {
@@ -147,10 +205,11 @@ impl Prop {
             Self::CropTop => t.crop.top,
             Self::CropRight => t.crop.right,
             Self::CropBottom => t.crop.bottom,
+            _ => 0.0,
         }
     }
 
-    /// 把值写进画面属性。
+    /// 把值写进画面属性（不是画面属性时什么都不做）。
     pub const fn set(self, t: &mut Transform, value: f32) {
         match self {
             Self::X => t.x = value,
@@ -162,6 +221,7 @@ impl Prop {
             Self::CropTop => t.crop.top = value,
             Self::CropRight => t.crop.right = value,
             Self::CropBottom => t.crop.bottom = value,
+            _ => {}
         }
     }
 
@@ -175,6 +235,12 @@ impl Prop {
                 Self::CropLeft | Self::CropTop | Self::CropRight | Self::CropBottom => {
                     (0.0..1.0).contains(&v)
                 }
+                Self::Brightness
+                | Self::Contrast
+                | Self::Saturation
+                | Self::Temperature
+                | Self::Tint => (-1.0..=1.0).contains(&v),
+                Self::Volume => (VOLUME_RANGE_DB.0..=VOLUME_RANGE_DB.1).contains(&v),
             }
     }
 }
@@ -224,24 +290,19 @@ impl Animation {
     /// 某个属性在 `at` 时刻的值；这个属性没有关键帧时返回 `None`。
     #[must_use]
     pub fn value_at(&self, prop: Prop, at: Time) -> Option<f32> {
-        let keys = self.tracks.get(&prop)?;
-        let (first, last) = (keys.first()?, keys.last()?);
-        if at <= first.at {
-            return Some(first.value);
+        value_of(self.tracks.get(&prop)?, at)
+    }
+
+    /// `at` 时刻的调色：有关键帧的项按时间插值，其余用 `base`。
+    #[must_use]
+    pub fn apply_adjust(&self, base: &ColorAdjust, at: Time) -> ColorAdjust {
+        let mut a = *base;
+        for prop in Prop::ADJUST {
+            if let (Some(item), Some(v)) = (prop.adjust_item(), self.value_at(prop, at)) {
+                item.set(&mut a, v);
+            }
         }
-        if at >= last.at {
-            return Some(last.value);
-        }
-        // 第一个时间大于 at 的关键帧；前一个就是这一段的起点
-        let next = keys.partition_point(|k| k.at <= at);
-        let (a, b) = (keys[next - 1], keys[next]);
-        #[expect(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            reason = "进度在 0–1 之间，f32 精度足够"
-        )]
-        let u = ((at - a.at).0 as f64 / (b.at - a.at).0 as f64) as f32;
-        Some((b.value - a.value).mul_add(a.easing.apply(u), a.value))
+        a
     }
 
     /// `at` 时刻的画面属性：有关键帧的属性按时间插值，其余用 `base`。结果总是合法的
@@ -249,7 +310,7 @@ impl Animation {
     #[must_use]
     pub fn apply(&self, base: &Transform, at: Time) -> Transform {
         let mut t = *base;
-        for &prop in self.tracks.keys() {
+        for &prop in self.tracks.keys().filter(|p| p.is_transform()) {
             if let Some(v) = self.value_at(prop, at) {
                 prop.set(&mut t, v);
             }
@@ -350,12 +411,30 @@ impl Animation {
             .map(|k| k.easing)
     }
 
+    /// 这些属性在 `at` 处关键帧的缓动（没有关键帧时 `None`）。
+    #[must_use]
+    pub fn easing_of(&self, props: &[Prop], at: Time) -> Option<Easing> {
+        props
+            .iter()
+            .flat_map(|p| self.keys(*p))
+            .find(|k| k.at == at)
+            .map(|k| k.easing)
+    }
+
     /// 把 `at` 处所有属性关键帧的缓动改成 `easing`，返回是否改了。
     pub fn set_easing(&mut self, at: Time, easing: Easing) -> bool {
+        let props: Vec<Prop> = self.props().collect();
+        self.set_easing_of(&props, at, easing)
+    }
+
+    /// 只改这些属性在 `at` 处关键帧的缓动，返回是否改了。
+    pub fn set_easing_of(&mut self, props: &[Prop], at: Time, easing: Easing) -> bool {
         let mut changed = false;
-        for k in self.tracks.values_mut().flatten().filter(|k| k.at == at) {
-            k.easing = easing;
-            changed = true;
+        for (_, keys) in self.tracks.iter_mut().filter(|(p, _)| props.contains(p)) {
+            for k in keys.iter_mut().filter(|k| k.at == at) {
+                k.easing = easing;
+                changed = true;
+            }
         }
         changed
     }
@@ -423,6 +502,32 @@ impl Animation {
 
 /// 两边裁剪加起来的上限（略小于 1，总留一点画面）。
 const MAX_CROP_SUM: f32 = 0.999;
+
+/// 音量的范围（dB）。
+pub const VOLUME_RANGE_DB: (f32, f32) = (-60.0, 12.0);
+
+/// 一串排好的关键帧在 `at` 时刻的值（没有关键帧时 `None`）：两端之外取端点的值，
+/// 中间按前一个关键帧的缓动插值。
+#[must_use]
+pub fn value_of(keys: &[Key], at: Time) -> Option<f32> {
+    let (first, last) = (keys.first()?, keys.last()?);
+    if at <= first.at {
+        return Some(first.value);
+    }
+    if at >= last.at {
+        return Some(last.value);
+    }
+    // 第一个时间大于 at 的关键帧；前一个就是这一段的起点
+    let next = keys.partition_point(|k| k.at <= at);
+    let (a, b) = (keys[next - 1], keys[next]);
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        reason = "进度在 0–1 之间，f32 精度足够"
+    )]
+    let u = ((at - a.at).0 as f64 / (b.at - a.at).0 as f64) as f32;
+    Some((b.value - a.value).mul_add(a.easing.apply(u), a.value))
+}
 
 #[cfg(test)]
 mod tests {

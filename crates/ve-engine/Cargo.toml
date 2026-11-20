@@ -28,3 +28,4 @@ thiserror.workspace = true
 [dev-dependencies]
 ve-core = { workspace = true, features = ["testing"] }
 ve-media = { workspace = true, features = ["test-fixtures"] }
+tempfile.workspace = true

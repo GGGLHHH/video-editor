@@ -67,6 +67,8 @@ struct Worker<'a> {
     /// 合成器（第一次用到时创建）；创建失败后退回只显示最上层。
     compositor: Option<Compositor>,
     compositor_failed: bool,
+    /// 现在按多大解码（画质切换时变，变了就重开解码器、清帧缓存）。
+    preview_max: ve_media::ScaleTarget,
 }
 
 pub(crate) fn run(shared: &Shared) {
@@ -82,6 +84,7 @@ pub(crate) fn run(shared: &Shared) {
         reverse: None,
         compositor: None,
         compositor_failed: false,
+        preview_max: shared.preview_max,
     };
     while !shared.is_shutdown() {
         w.step();
@@ -90,7 +93,7 @@ pub(crate) fn run(shared: &Shared) {
 
 impl Worker<'_> {
     fn step(&mut self) {
-        let (project, playing, generation, seek, revision, play_rate) = {
+        let (project, playing, generation, seek, revision, play_rate, preview_max) = {
             let mut c = self.shared.control();
             (
                 Arc::clone(&c.project),
@@ -99,8 +102,15 @@ impl Worker<'_> {
                 c.seek.take(),
                 c.revision,
                 c.rate,
+                c.preview_max,
             )
         };
+        if preview_max != self.preview_max {
+            self.preview_max = preview_max;
+            self.decoders.clear();
+            self.cache = FrameCache::new(self.shared.cache_bytes);
+            self.cached.clear();
+        }
         if self.generation != Some(generation) || self.revision != Some(revision) {
             self.generation = Some(generation);
             self.revision = Some(revision);
@@ -300,13 +310,19 @@ impl Worker<'_> {
     /// 合成时间点 `t` 的预览画面；没有任何画面（空隙或全都解不出）、也没有调节片段把黑底调色时
     /// 返回 `None`。
     fn render(&mut self, project: &Project, t: Time) -> Option<Arc<VideoFrame>> {
-        let ve_core::compose::Composition { layers, background } =
-            ve_core::compose::resolve_frame(project, t);
+        let ve_core::compose::Composition {
+            layers,
+            background,
+            background_grades,
+        } = ve_core::compose::resolve_frame(project, t);
         let frames = self.layer_frames(project, &layers);
-        if frames.iter().all(Option::is_none) && background.is_identity() {
+        if frames.iter().all(Option::is_none)
+            && background.is_identity()
+            && background_grades.is_empty()
+        {
             return None;
         }
-        let canvas = preview_canvas(&project.settings, self.shared.preview_max);
+        let canvas = preview_canvas(&project.settings, self.preview_max);
         if self.compositor.is_none() && !self.compositor_failed {
             match Compositor::new(&self.shared.render) {
                 Ok(c) => {
@@ -343,10 +359,12 @@ impl Worker<'_> {
                     geometry: ve_core::layer_geometry(canvas, source, &l.transform),
                     opacity: l.transform.opacity,
                     color: l.color,
+                    look: l.look,
+                    grades: &l.grades,
                 })
             })
             .collect();
-        compositor.set_background(&background);
+        compositor.set_background_chain(&background, &background_grades);
         let mut data = Vec::new();
         match compositor.compose_bgra(canvas, &gpu_layers, &mut data) {
             Ok(()) => Some(Arc::new(VideoFrame {
@@ -401,7 +419,7 @@ impl Worker<'_> {
                 .get(&key)
                 .is_none_or(|(p, _)| *p != asset.path)
             {
-                match VideoDecoder::open(&asset.path, self.shared.preview_max) {
+                match VideoDecoder::open(&asset.path, self.preview_max) {
                     Ok(d) => {
                         self.decoders.insert(key, (asset.path.clone(), d));
                     }

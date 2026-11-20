@@ -7983,6 +7983,7 @@ dependencies = [
  "lru",
  "rtrb",
  "smol",
+ "tempfile",
  "thiserror 2.0.21",
  "ve-core",
  "ve-media",

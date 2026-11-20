@@ -1,5 +1,6 @@
-//! 导出界面（剪映式）：选输出文件 → 导出对话框（分辨率 / 帧率 / 码率 / 编码，高级里选编码器，
-//! 底部实时显示时长和估计大小）→ 后台导出，顶栏显示进度和取消。
+//! 导出界面（剪映式）：选输出文件 → 导出对话框（视频导出：分辨率 / 帧率 / 码率 / 编码；
+//! 音频导出：格式；封面；目标响度；导出范围；高级里选编码器；底部实时显示时长和估计大小）
+//! → 后台依次导出，顶栏显示进度和取消。
 
 use crate::actions as act;
 use crate::chrome;
@@ -20,7 +21,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use ve_core::{FrameRate, ProjectSettings, Time, format_timecode};
-use ve_export::{Codec, Encoder, ExportSettings, estimated_bytes, recommended_kbps};
+use ve_export::{
+    AudioFormat, Codec, Encoder, ExportSettings, Output, estimated_bytes, recommended_kbps,
+};
 
 /// 进行中的导出。
 #[derive(Debug)]
@@ -94,6 +97,36 @@ pub struct ExportChoices {
     pub codec: Codec,
     /// 编码器。
     pub encoder: Encoder,
+    /// 导出视频（剪映「视频导出」）。
+    pub video: bool,
+    /// 另外导出一份声音（剪映「音频导出」）及其格式。
+    pub audio: Option<AudioFormat>,
+    /// 目标响度（LUFS）。
+    pub loudness: Option<i8>,
+    /// 只导出入出点区域。
+    pub only_range: bool,
+    /// 封面：导出时取成片的一帧存成图片。
+    pub cover: Option<CoverAt>,
+}
+
+/// 封面取哪一帧。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverAt {
+    /// 草稿封面（主轨上设的）。
+    Draft,
+    /// 第一帧。
+    First,
+    /// 播放头那一帧。
+    Playhead,
+}
+
+/// 一次导出要做的事：依次导出这些文件，最后（有的话）从视频里取封面。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportPlan {
+    /// 要导出的文件。
+    pub jobs: Vec<ExportSettings>,
+    /// 封面：（从哪个视频取，成片里的时间，存到哪）。
+    pub cover: Option<(PathBuf, Time, PathBuf)>,
 }
 
 impl Default for ExportChoices {
@@ -105,6 +138,11 @@ impl Default for ExportChoices {
             custom_kbps: 12_000,
             codec: Codec::H264,
             encoder: Encoder::Nvenc,
+            video: true,
+            audio: None,
+            loudness: None,
+            only_range: false,
+            cover: None,
         }
     }
 }
@@ -131,7 +169,77 @@ impl ExportChoices {
             encoder: self.encoder,
             codec: self.codec,
             render: ve_export::RenderConfig::default(),
+            output: Output::Video,
+            loudness_lufs: self.loudness,
+            range: None,
         }
+    }
+
+    /// 整次导出：视频写到 `path`，音频写到同名、换扩展名的文件，封面是 `名字_封面.png`。
+    /// `range` 是时间轴的入出点区域（勾了「只导出区域」才用），`playhead` 用来取封面。
+    ///
+    /// # Errors
+    /// 视频和音频都没勾。
+    pub fn plan(
+        &self,
+        path: &std::path::Path,
+        project: &ProjectSettings,
+        range: Option<(Time, Time)>,
+        playhead: Time,
+    ) -> Result<ExportPlan, &'static str> {
+        self.plan_with_cover(path, project, range, playhead, None)
+    }
+
+    /// 同 [`Self::plan`]，带上草稿封面（[`CoverAt::Draft`] 用）。
+    ///
+    /// # Errors
+    /// 视频和音频都没勾。
+    pub fn plan_with_cover(
+        &self,
+        path: &std::path::Path,
+        project: &ProjectSettings,
+        range: Option<(Time, Time)>,
+        playhead: Time,
+        draft: Option<&ve_core::Cover>,
+    ) -> Result<ExportPlan, &'static str> {
+        let range = range.filter(|_| self.only_range);
+        let mut jobs = Vec::new();
+        let video_path = path.to_path_buf();
+        if self.video {
+            jobs.push(ExportSettings {
+                range,
+                ..self.settings(video_path.clone(), project)
+            });
+        }
+        if let Some(format) = self.audio {
+            jobs.push(ExportSettings {
+                path: path.with_extension(format.extension()),
+                output: Output::Audio(format),
+                range,
+                ..self.settings(video_path.clone(), project)
+            });
+        }
+        if jobs.is_empty() {
+            return Err("视频导出和音频导出至少选一个");
+        }
+        let offset = range.map_or(Time::ZERO, |r| r.0);
+        let cover = self.cover.filter(|_| self.video).and_then(|at| {
+            let (from, t) = match (at, draft) {
+                (CoverAt::First, _) => (video_path.clone(), Time::ZERO),
+                (CoverAt::Playhead, _) => (video_path.clone(), (playhead - offset).max(Time::ZERO)),
+                (CoverAt::Draft, Some(ve_core::Cover::Frame(t))) => {
+                    (video_path.clone(), (*t - offset).max(Time::ZERO))
+                }
+                (CoverAt::Draft, Some(ve_core::Cover::Image(img))) => (img.clone(), Time::ZERO),
+                (CoverAt::Draft, None) => return None,
+            };
+            let stem = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            Some((from, t, path.with_file_name(format!("{stem}_封面.png"))))
+        });
+        Ok(ExportPlan { jobs, cover })
     }
 }
 
@@ -147,12 +255,26 @@ pub fn size_text(bytes: u64) -> String {
     }
 }
 
+/// 打开导出对话框要的：工程设置、时长、入出点区域、播放头、草稿封面。
+type DialogInput = (
+    ProjectSettings,
+    Time,
+    Option<(Time, Time)>,
+    Time,
+    Option<ve_core::Cover>,
+);
+
 /// 导出选项表单。
 #[derive(Debug)]
 pub struct ExportForm {
     path: PathBuf,
     project: ProjectSettings,
     duration: Time,
+    /// 时间轴的入出点区域。
+    range: Option<(Time, Time)>,
+    playhead: Time,
+    /// 草稿封面。
+    draft_cover: Option<ve_core::Cover>,
     choices: ExportChoices,
     custom: Entity<InputState>,
     advanced: bool,
@@ -161,28 +283,59 @@ pub struct ExportForm {
 impl ExportForm {
     fn new(
         path: PathBuf,
-        project: ProjectSettings,
-        duration: Time,
+        timeline: DialogInput,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
+        let (project, duration, range, playhead, draft_cover) = timeline;
         let custom = cx.new(|cx| InputState::new(window, cx).default_value("12000"));
         Self {
             path,
             project,
             duration,
-            choices: ExportChoices::default(),
+            range,
+            playhead,
+            choices: ExportChoices {
+                // 有入出点区域时默认只导出区域（剪映的入出点就是为这个）
+                only_range: range.is_some(),
+                // 设了草稿封面就默认一起导出
+                cover: draft_cover.as_ref().map(|_| CoverAt::Draft),
+                ..ExportChoices::default()
+            },
+            draft_cover,
             custom,
             advanced: false,
         }
     }
 
-    fn settings(&self, cx: &gpui_kit::App) -> ExportSettings {
+    fn choices(&self, cx: &gpui_kit::App) -> ExportChoices {
         let mut c = self.choices;
         if let Ok(v) = self.custom.read(cx).value().trim().parse() {
             c.custom_kbps = v;
         }
-        c.settings(self.path.clone(), &self.project)
+        c
+    }
+
+    fn settings(&self, cx: &gpui_kit::App) -> ExportSettings {
+        self.choices(cx).settings(self.path.clone(), &self.project)
+    }
+
+    fn plan(&self, cx: &gpui_kit::App) -> Result<ExportPlan, &'static str> {
+        self.choices(cx).plan_with_cover(
+            &self.path,
+            &self.project,
+            self.range,
+            self.playhead,
+            self.draft_cover.as_ref(),
+        )
+    }
+
+    /// 实际导出的长度（只导出区域时是区域长度）。
+    fn out_duration(&self) -> Time {
+        match self.range.filter(|_| self.choices.only_range) {
+            Some((a, b)) => b - a,
+            None => self.duration,
+        }
     }
 
     /// 一个选项小块：点了就改 `choices`。
@@ -294,6 +447,132 @@ impl ExportForm {
         (res_items, fps_items, br_items, codec_items, enc_items)
     }
 
+    /// 估计大小：视频（含 192k 声音）加上单独导出的音频。
+    fn size_estimate(&self, preview: &ExportSettings) -> String {
+        let d = self.out_duration();
+        let c = self.choices;
+        let mut parts = Vec::new();
+        if c.video {
+            parts.push(format!(
+                "视频 {}（码率 {} kbps）",
+                size_text(estimated_bytes(preview.video_bitrate_kbps, d)),
+                preview.video_bitrate_kbps
+            ));
+        }
+        if let Some(f) = c.audio {
+            // estimated_bytes 会加 192k 的声音，这里减掉
+            let kbps = f.kbps().saturating_sub(192);
+            parts.push(format!("音频 {}", size_text(estimated_bytes(kbps, d))));
+        }
+        if parts.is_empty() {
+            "视频导出和音频导出至少选一个".to_owned()
+        } else {
+            format!("大小 {}（估计）", parts.join(" + "))
+        }
+    }
+
+    /// 视频导出 / 音频导出 / 封面 / 响度 / 范围这几行。
+    fn render_outputs(&self, cx: &Context<'_, Self>) -> Vec<AnyElement> {
+        let c = self.choices;
+        let check =
+            |id: &'static str, label: &'static str, on: bool, change: fn(&mut ExportChoices)| {
+                Self::pick(
+                    id,
+                    format!("{} {label}", if on { "☑" } else { "☐" }),
+                    on,
+                    change,
+                    cx,
+                )
+            };
+        let mut rows = vec![
+            row(
+                "导出",
+                vec![
+                    check("export-video", "视频导出", c.video, |ch| {
+                        ch.video = !ch.video;
+                    }),
+                    check("export-audio", "音频导出", c.audio.is_some(), |ch| {
+                        ch.audio = match ch.audio {
+                            Some(_) => None,
+                            None => Some(AudioFormat::Mp3),
+                        };
+                    }),
+                ],
+                cx,
+            )
+            .into_any_element(),
+        ];
+        if c.audio.is_some() {
+            let items = [
+                ("afmt-mp3", "MP3", AudioFormat::Mp3),
+                ("afmt-wav", "WAV", AudioFormat::Wav),
+                ("afmt-aac", "AAC", AudioFormat::Aac),
+            ]
+            .map(|(id, label, f)| {
+                Self::pick(
+                    id,
+                    label,
+                    c.audio == Some(f),
+                    move |ch| ch.audio = Some(f),
+                    cx,
+                )
+            })
+            .into();
+            rows.push(row("音频格式", items, cx).into_any_element());
+        }
+        if c.video {
+            let mut options = vec![("cover-none", "不导出", None)];
+            if self.draft_cover.is_some() {
+                options.push(("cover-draft", "草稿封面", Some(CoverAt::Draft)));
+            }
+            options.extend([
+                ("cover-first", "第一帧", Some(CoverAt::First)),
+                ("cover-playhead", "播放头这一帧", Some(CoverAt::Playhead)),
+            ]);
+            let items = options
+                .into_iter()
+                .map(|(id, label, at)| {
+                    Self::pick(id, label, c.cover == at, move |ch| ch.cover = at, cx)
+                })
+                .collect();
+            rows.push(row("封面", items, cx).into_any_element());
+        }
+        let loud = [
+            ("loud-off", "关", None),
+            ("loud-14", "-14 LUFS（短视频平台）", Some(-14)),
+            ("loud-16", "-16 LUFS", Some(-16)),
+            ("loud-23", "-23 LUFS（广播）", Some(-23)),
+        ]
+        .map(|(id, label, l)| Self::pick(id, label, c.loudness == l, move |ch| ch.loudness = l, cx))
+        .into();
+        rows.push(row("目标响度", loud, cx).into_any_element());
+        if let Some((a, b)) = self.range {
+            let rate = self.project.frame_rate;
+            let items = vec![
+                Self::pick(
+                    "range-all",
+                    "全部",
+                    !c.only_range,
+                    |ch| ch.only_range = false,
+                    cx,
+                ),
+                Self::pick(
+                    "range-only",
+                    format!(
+                        "选定区域 {}–{}",
+                        format_timecode(a, rate),
+                        format_timecode(b, rate)
+                    ),
+                    c.only_range,
+                    |ch| ch.only_range = true,
+                    cx,
+                ),
+            ];
+            rows.push(row("导出范围", items, cx).into_any_element());
+        }
+        rows
+    }
+
     /// 底部：时长和估计大小。
     fn render_estimate(
         &self,
@@ -311,14 +590,10 @@ impl ExportForm {
             .text_color(cx.theme().muted_foreground)
             .child(SharedString::from(format!(
                 "时长 {}",
-                format_timecode(self.duration, preview.frame_rate)
+                format_timecode(self.out_duration(), preview.frame_rate)
             )))
             .child("｜")
-            .child(SharedString::from(format!(
-                "大小 {}（估计，码率 {} kbps）",
-                size_text(estimated_bytes(preview.video_bitrate_kbps, self.duration)),
-                preview.video_bitrate_kbps
-            )))
+            .child(SharedString::from(self.size_estimate(preview)))
     }
 }
 
@@ -347,27 +622,32 @@ impl Render for ExportForm {
                             .child(SharedString::from(self.path.display().to_string())),
                     ),
             )
-            .child(row("分辨率", res_items, cx))
-            .child(
-                div()
-                    .pl(px(80.))
-                    .text_xs()
-                    .text_color(muted)
-                    .child(SharedString::from(format!(
-                        "输出 {}×{}（按工程比例换算）",
-                        preview.width, preview.height
-                    ))),
-            )
-            .child(row("帧率", fps_items, cx))
-            .child(row("码率", br_items, cx))
-            .children((c.bitrate == Bitrate::Custom).then(|| {
-                h_flex()
-                    .pl(px(80.))
-                    .gap_2()
-                    .child(div().w(px(120.)).child(Input::new(&self.custom)))
-                    .child(div().text_sm().text_color(muted).child("kbps"))
+            .children(self.render_outputs(cx))
+            .children(c.video.then(|| {
+                v_flex()
+                    .gap_3()
+                    .child(row("分辨率", res_items, cx))
+                    .child(
+                        div()
+                            .pl(px(80.))
+                            .text_xs()
+                            .text_color(muted)
+                            .child(SharedString::from(format!(
+                                "输出 {}×{}（按工程比例换算）",
+                                preview.width, preview.height
+                            ))),
+                    )
+                    .child(row("帧率", fps_items, cx))
+                    .child(row("码率", br_items, cx))
+                    .children((c.bitrate == Bitrate::Custom).then(|| {
+                        h_flex()
+                            .pl(px(80.))
+                            .gap_2()
+                            .child(div().w(px(120.)).child(Input::new(&self.custom)))
+                            .child(div().text_sm().text_color(muted).child("kbps"))
+                    }))
+                    .child(row("视频编码", codec_items, cx))
             }))
-            .child(row("视频编码", codec_items, cx))
             .child(
                 div()
                     .id("export-advanced")
@@ -410,6 +690,32 @@ enum Msg {
     Done(Result<(), String>),
 }
 
+/// 依次导出计划里的文件（进度按文件个数平分），再从视频里取封面。
+fn run_plan(
+    project: &ve_core::Project,
+    plan: &ExportPlan,
+    tx: &smol::channel::Sender<Msg>,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    #[expect(clippy::cast_precision_loss, reason = "文件个数很少")]
+    let n = plan.jobs.len().max(1) as f32;
+    for (i, job) in plan.jobs.iter().enumerate() {
+        #[expect(clippy::cast_precision_loss, reason = "文件个数很少")]
+        let base = i as f32;
+        ve_export::export(
+            project,
+            job,
+            |p| drop(tx.try_send(Msg::Progress((base + p) / n))),
+            cancel,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if let Some((video, at, out)) = &plan.cover {
+        ve_export::grab_frame(video, *at, out).map_err(|e| format!("取封面失败：{e}"))?;
+    }
+    Ok(())
+}
+
 impl Workspace {
     pub(crate) fn export(
         &mut self,
@@ -433,9 +739,14 @@ impl Workspace {
         self.tasks.push(cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(path))) = rx.await {
                 let _ignored = this.update_in(cx, |this, window, cx| {
-                    let project = this.doc.project.settings;
-                    let duration = this.doc.project.timeline.duration();
-                    Self::open_export_dialog(path, project, duration, window, cx);
+                    let timeline = (
+                        this.doc.project.settings,
+                        this.doc.project.timeline.duration(),
+                        this.doc.project.timeline.range,
+                        this.playhead,
+                        this.doc.project.timeline.cover.clone(),
+                    );
+                    Self::open_export_dialog(path, timeline, window, cx);
                 });
             }
         }));
@@ -443,12 +754,11 @@ impl Workspace {
 
     fn open_export_dialog(
         path: PathBuf,
-        project: ProjectSettings,
-        duration: Time,
+        timeline: DialogInput,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let form = cx.new(|cx| ExportForm::new(path, project, duration, window, cx));
+        let form = cx.new(|cx| ExportForm::new(path, timeline, window, cx));
         let ws = cx.entity();
         window.open_dialog(cx, move |dialog, _, _| {
             let form = form.clone();
@@ -470,26 +780,48 @@ impl Workspace {
                             Button::new("export-confirm").primary().label("开始导出"),
                         )),
                 )
-                .on_ok(move |_, window, cx| {
-                    let settings = form.read(cx).settings(cx);
-                    ws.update(cx, |this, cx| this.start_export(settings, window, cx));
-                    true
+                .on_ok(move |_, window, cx| match form.read(cx).plan(cx) {
+                    Ok(plan) => {
+                        ws.update(cx, |this, cx| this.start_export_plan(plan, window, cx));
+                        true
+                    }
+                    Err(e) => {
+                        crate::workspace::notify(Notification::warning(e), window, cx);
+                        false
+                    }
                 })
         });
     }
 
-    /// 后台导出；进度显示在工具栏。
+    /// 后台导出一个文件；进度显示在工具栏。
     pub fn start_export(
         &mut self,
         settings: ExportSettings,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let plan = ExportPlan {
+            jobs: vec![settings],
+            cover: None,
+        };
+        self.start_export_plan(plan, window, cx);
+    }
+
+    /// 后台依次导出计划里的文件，最后取封面；进度显示在工具栏。
+    pub fn start_export_plan(
+        &mut self,
+        plan: ExportPlan,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(first) = plan.jobs.first() else {
+            return;
+        };
         let cancel = Arc::new(AtomicBool::new(false));
         self.export = Some(ExportProgress {
             progress: 0.0,
             cancel: Arc::clone(&cancel),
-            path: settings.path.clone(),
+            path: first.path.clone(),
         });
         let project = self.doc.project.clone();
         let (tx, rx) = smol::channel::unbounded::<Msg>();
@@ -498,13 +830,7 @@ impl Workspace {
             .spawn(move || {
                 // 导出里任何意外的 panic 也要变成失败消息，否则界面会一直停在某个进度
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    ve_export::export(
-                        &project,
-                        &settings,
-                        |p| drop(tx.try_send(Msg::Progress(p))),
-                        &cancel,
-                    )
-                    .map_err(|e| e.to_string())
+                    run_plan(&project, &plan, &tx, &cancel)
                 }))
                 .unwrap_or_else(|_| Err("导出时出现内部错误".to_owned()));
                 drop(tx.try_send(Msg::Done(result)));
@@ -664,9 +990,81 @@ mod tests {
             custom_kbps: 3,
             ..ExportChoices::default()
         }
-        .settings(path, &project);
+        .settings(path.clone(), &project);
         assert_eq!(custom.video_bitrate_kbps, 100, "夹到最小值");
         assert_eq!(size_text(12_345_678), "约 12.3 MB");
+        // 音频导出、封面、区域、响度
+        let range = Some((Time::from_secs(2), Time::from_secs(5)));
+        let all = ExportChoices {
+            audio: Some(AudioFormat::Wav),
+            cover: Some(CoverAt::Playhead),
+            loudness: Some(-14),
+            only_range: true,
+            ..ExportChoices::default()
+        }
+        .plan(
+            &PathBuf::from("d/片子.mp4"),
+            &project,
+            range,
+            Time::from_secs(3),
+        )
+        .unwrap();
+        assert_eq!(all.jobs.len(), 2);
+        assert_eq!(all.jobs[0].output, Output::Video);
+        assert_eq!(all.jobs[1].output, Output::Audio(AudioFormat::Wav));
+        assert_eq!(all.jobs[1].path, PathBuf::from("d/片子.wav"));
+        assert!(
+            all.jobs
+                .iter()
+                .all(|j| j.range == range && j.loudness_lufs == Some(-14))
+        );
+        assert_eq!(
+            all.cover,
+            Some((
+                PathBuf::from("d/片子.mp4"),
+                Time::from_secs(1),
+                PathBuf::from("d/片子_封面.png")
+            )),
+            "封面取成片里播放头那一刻（区域从 2 秒开始）"
+        );
+        let none = ExportChoices {
+            video: false,
+            ..ExportChoices::default()
+        };
+        assert!(none.plan(&path, &project, None, Time::ZERO).is_err());
+        let audio_only = ExportChoices {
+            video: false,
+            audio: Some(AudioFormat::Mp3),
+            cover: Some(CoverAt::First),
+            ..ExportChoices::default()
+        }
+        .plan(&path, &project, range, Time::ZERO)
+        .unwrap();
+        assert_eq!(audio_only.cover, None, "没导出视频就没有封面");
+        assert_eq!(audio_only.jobs[0].range, None, "没勾「只导出区域」");
+        // 草稿封面：帧按区域换算；图片直接用
+        let draft = ExportChoices {
+            cover: Some(CoverAt::Draft),
+            only_range: true,
+            ..ExportChoices::default()
+        };
+        let frame = ve_core::Cover::Frame(Time::from_secs(4));
+        let p = draft
+            .plan_with_cover(&path, &project, range, Time::ZERO, Some(&frame))
+            .unwrap();
+        assert_eq!(p.cover.unwrap().1, Time::from_secs(2));
+        let img = ve_core::Cover::Image(PathBuf::from("c.jpg"));
+        let p = draft
+            .plan_with_cover(&path, &project, range, Time::ZERO, Some(&img))
+            .unwrap();
+        assert_eq!(p.cover.unwrap().0, PathBuf::from("c.jpg"));
+        assert_eq!(
+            draft
+                .plan(&path, &project, range, Time::ZERO)
+                .unwrap()
+                .cover,
+            None
+        );
         assert_eq!(size_text(2_500_000_000), "约 2.50 GB");
     }
 }

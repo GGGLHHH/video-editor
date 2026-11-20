@@ -1,6 +1,7 @@
 //! 执行导出：写临时文件、启动 ffmpeg、逐帧渲染画面写进它的标准输入、取消、NVENC 失败退回 x264。
 
 use crate::{Encoder, ExportError, ExportSettings, build_job, has_subtitles, write_ass};
+use std::fmt::Write as _;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,13 +9,13 @@ use ve_core::Project;
 
 /// ffmpeg 可执行文件：环境变量 `VE_FFMPEG` 优先，否则 PATH 上的 `ffmpeg`
 /// （Windows 上先找程序自己所在的目录，打包时 ffmpeg.exe 就放在那里）。
-fn ffmpeg_program() -> std::ffi::OsString {
+pub(crate) fn ffmpeg_program() -> std::ffi::OsString {
     std::env::var_os("VE_FFMPEG").unwrap_or_else(|| "ffmpeg".into())
 }
 
 /// 启动 ffmpeg 的命令：Windows 上不弹命令行窗口（发布版是图形程序，没有自己的控制台，
 /// 不加这个标志每次导出都会冒出一个黑窗口）。
-fn ffmpeg_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+pub(crate) fn ffmpeg_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut cmd = Command::new(program);
     #[cfg(windows)]
     {
@@ -66,13 +67,121 @@ pub fn grab_frame(
     Ok(())
 }
 
+/// 倒放时每段的长度：`reverse` 滤镜要把整段的帧都存在内存里，分段倒、再倒着拼起来。
+const REVERSE_CHUNK: ve_core::Time = ve_core::Time::from_secs(10);
+
+/// 跑一次 ffmpeg，失败时带上它的报错。
+fn run_ffmpeg(args: &[std::ffi::OsString]) -> Result<(), String> {
+    let output = ffmpeg_command(ffmpeg_program())
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => "找不到 ffmpeg".to_owned(),
+            _ => e.to_string(),
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
+}
+
+/// 倒放（剪映「倒放」）：把素材 `input` 里 `[from, from + len)` 这一段倒着生成到 `out`
+/// （视频 H.264 + AAC 的 mp4；`video` 为假时只有声音，写 m4a）。按 10 秒一段倒，再倒着拼起来。
+///
+/// # Errors
+/// 找不到 ffmpeg、ffmpeg 失败、读写临时文件失败。
+pub fn reverse_segment(
+    input: &std::path::Path,
+    from: ve_core::Time,
+    len: ve_core::Time,
+    video: bool,
+    audio: bool,
+    out: &std::path::Path,
+) -> Result<(), String> {
+    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let secs = |t: ve_core::Time| format!("{:.6}", t.as_secs_f64().max(0.0));
+    let ext = if video { "mp4" } else { "m4a" };
+    let mut parts = Vec::new();
+    let mut at = ve_core::Time::ZERO;
+    while at < len {
+        let piece = REVERSE_CHUNK.min(len - at);
+        let part = dir.path().join(format!("{}.{ext}", parts.len()));
+        let mut args: Vec<std::ffi::OsString> = vec![
+            "-ss".into(),
+            secs(from + at).into(),
+            "-t".into(),
+            secs(piece).into(),
+            "-i".into(),
+            input.as_os_str().to_owned(),
+        ];
+        if video {
+            args.extend(
+                [
+                    "-vf", "reverse", "-c:v", "libx264", "-preset", "veryfast", "-crf", "16",
+                    "-pix_fmt", "yuv420p",
+                ]
+                .map(std::ffi::OsString::from),
+            );
+        } else {
+            args.push("-vn".into());
+        }
+        if audio {
+            args.extend(
+                ["-af", "areverse", "-c:a", "aac", "-b:a", "256k"].map(std::ffi::OsString::from),
+            );
+        } else {
+            args.push("-an".into());
+        }
+        args.push(part.clone().into_os_string());
+        run_ffmpeg(&args)?;
+        parts.push(part);
+        at += piece;
+    }
+    // 倒着拼：最后一段（倒过来以后）放最前面
+    let list = dir.path().join("list.txt");
+    let mut text = String::new();
+    for p in parts.iter().rev() {
+        let _ = writeln!(
+            text,
+            "file '{}'",
+            p.display().to_string().replace('\'', "'\\''")
+        );
+    }
+    std::fs::write(&list, text).map_err(|e| e.to_string())?;
+    let args: Vec<std::ffi::OsString> = vec![
+        "-f".into(),
+        "concat".into(),
+        "-safe".into(),
+        "0".into(),
+        "-i".into(),
+        list.into_os_string(),
+        "-c".into(),
+        "copy".into(),
+        out.as_os_str().to_owned(),
+    ];
+    run_ffmpeg(&args)?;
+    if out.is_file() {
+        Ok(())
+    } else {
+        Err("ffmpeg 没有写出倒放文件".to_owned())
+    }
+}
+
 /// 导出前检查并准备：路径转绝对（ffmpeg 在临时目录里运行），素材都在，输出不是素材本身。
 /// 返回（绝对路径版工程，最终输出路径，临时输出路径）。
 fn prepare(
     project: &Project,
     settings: &ExportSettings,
 ) -> Result<(Project, std::path::PathBuf, std::path::PathBuf), ExportError> {
-    let mut project = project.clone();
+    // 只导出入出点区域：先把那一段切出来挪到从 0 开始
+    let mut project = match settings.range {
+        Some((from, to)) => ve_core::edit::extract_range(project, from, to)
+            .map_err(|_| ExportError::EmptyTimeline)?,
+        None => project.clone(),
+    };
     for asset in project.assets.values_mut() {
         asset.path = std::path::absolute(&asset.path)?;
     }
@@ -149,7 +258,9 @@ fn export_with(
     let mut progress = Monotonic::new(&mut on_progress);
     let mut report = |p| progress.report(p);
     match run_once(program, project, settings, &mut report, cancel) {
-        Err(ExportError::Ffmpeg { message, .. }) if settings.encoder == Encoder::Nvenc => {
+        Err(ExportError::Ffmpeg { message, .. })
+            if settings.encoder == Encoder::Nvenc && settings.output == crate::Output::Video =>
+        {
             log::warn!("NVENC 导出失败，改用 x264 重试：{message}");
             let fallback = ExportSettings {
                 encoder: Encoder::X264,
@@ -203,10 +314,15 @@ fn run_once(
     if cancel.load(Ordering::Acquire) {
         return Err(ExportError::Cancelled);
     }
+    let with_video = settings.output == crate::Output::Video;
     let mut child = ffmpeg_command(program)
         .args(&job.args)
         .current_dir(dir.path())
-        .stdin(Stdio::piped())
+        .stdin(if with_video {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -232,9 +348,14 @@ fn run_once(
         let p = (done as f64 / total.max(1) as f64 * 0.99) as f32;
         on_progress(p);
     };
-    let rendered = child.stdin.take().map_or(Ok(false), |stdin| {
-        crate::render::render_video(project, settings, stdin, &mut on_frame, cancel)
-    });
+    // 只导出声音时没有画面要渲染：ffmpeg 自己读素材
+    let rendered = if with_video {
+        child.stdin.take().map_or(Ok(false), |stdin| {
+            crate::render::render_video(project, settings, stdin, &mut on_frame, cancel)
+        })
+    } else {
+        Ok(true)
+    };
     if rendered.is_err() {
         drop(child.kill());
     }
@@ -284,6 +405,9 @@ pub const fn default_settings(project: &Project, path: std::path::PathBuf) -> Ex
         encoder: Encoder::Nvenc,
         codec: crate::Codec::H264,
         render: ve_render::RenderConfig { software: false },
+        output: crate::Output::Video,
+        loudness_lufs: None,
+        range: None,
     }
 }
 
@@ -326,6 +450,9 @@ mod tests {
             encoder,
             codec: crate::Codec::H264,
             render: ve_render::RenderConfig { software: true },
+            output: crate::Output::Video,
+            loudness_lufs: None,
+            range: None,
         }
     }
 
@@ -352,6 +479,207 @@ mod tests {
         assert!(r.audio.is_some());
         assert_eq!(progress.last().copied(), Some(1.0));
         assert!(progress.windows(2).all(|w| w[0] <= w[1]), "{progress:?}");
+    }
+
+    /// 整段的积分响度（LUFS），用 ffmpeg 的 ebur128 量。
+    fn integrated_lufs(path: &std::path::Path) -> f64 {
+        let out = ffmpeg_command(ffmpeg_program())
+            .args(["-hide_banner", "-nostats", "-i"])
+            .arg(path)
+            .args(["-af", "ebur128", "-f", "null", "-"])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stderr);
+        let summary = &text[text.rfind("Summary").unwrap()..];
+        let line = summary
+            .lines()
+            .find(|l| l.trim_start().starts_with("I:"))
+            .unwrap();
+        line.trim_start()[2..]
+            .trim()
+            .trim_end_matches("LUFS")
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn audio_only_export_writes_just_the_sound_at_the_target_loudness() {
+        let dir = tempfile::tempdir().unwrap();
+        for (format, lufs) in [
+            (crate::AudioFormat::Wav, -14),
+            (crate::AudioFormat::Mp3, -23),
+            (crate::AudioFormat::Aac, -16),
+        ] {
+            let s = ExportSettings {
+                path: dir.path().join(format!("out.{}", format.extension())),
+                output: crate::Output::Audio(format),
+                loudness_lufs: Some(lufs),
+                ..settings(dir.path(), Encoder::Nvenc)
+            };
+            let mut progress = Vec::new();
+            export(
+                &project(),
+                &s,
+                |p| progress.push(p),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            let r = ve_media::probe(&s.path).unwrap();
+            assert!(r.video.is_none(), "{format:?} 不该有画面");
+            assert!(r.audio.is_some());
+            assert!(
+                (r.duration - Time::from_secs(2)).0.abs() <= Time::from_millis(60).0,
+                "{:?}",
+                r.duration
+            );
+            let got = integrated_lufs(&s.path);
+            assert!(
+                (got - f64::from(lufs)).abs() < 1.5,
+                "{format:?}：目标 {lufs}，实际 {got}"
+            );
+            assert_eq!(progress.last().copied(), Some(1.0));
+        }
+    }
+
+    #[test]
+    fn video_export_with_target_loudness_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ExportSettings {
+            loudness_lufs: Some(-14),
+            ..settings(dir.path(), Encoder::X264)
+        };
+        export(&project(), &s, |_| {}, &AtomicBool::new(false)).unwrap();
+        assert!(ve_media::probe(&s.path).unwrap().video.is_some());
+        assert!((integrated_lufs(&s.path) + 14.0).abs() < 1.5);
+    }
+
+    #[test]
+    fn curve_speed_export_keeps_the_timeline_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = settings(dir.path(), Encoder::X264);
+        let mut p = project();
+        p.settings.main_magnet = false;
+        let clips: Vec<_> = p
+            .timeline
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter().filter(|c| c.asset().is_some()).map(|c| c.id))
+            .collect();
+        for c in clips {
+            ve_core::edit::set_speed_curve(&mut p, c, Some(ve_core::CurvePreset::Montage.curve()))
+                .unwrap();
+        }
+        let want = p.timeline.duration();
+        export(&p, &s, |_| {}, &AtomicBool::new(false)).unwrap();
+        let r = ve_media::probe(&s.path).unwrap();
+        assert!(
+            (r.duration - want).0.abs() <= FrameRate::new(30, 1).frame_duration().0 * 2,
+            "{:?} / {want:?}",
+            r.duration
+        );
+        assert!(r.audio.is_some());
+    }
+
+    /// 字幕位置的关键帧真的被 libass 照着画：匀速往右移，中途那一帧字的重心在预览算出来的位置。
+    #[test]
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "测试里的工程 p、帧 f、坐标 x/y"
+    )]
+    fn subtitle_keyframes_render_where_the_preview_puts_them() {
+        use ve_core::edit::{add_keyframe_props, apply_transform_at, set_keyframe_easing};
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = project();
+        p.settings.width = 320;
+        p.settings.height = 180;
+        let sub = p
+            .timeline
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .find(|c| c.subtitle_text().is_some())
+            .unwrap()
+            .id;
+        ve_core::edit::set_subtitle_text(&mut p, sub, "口口".into()).unwrap();
+        add_keyframe_props(&mut p, sub, Time::ZERO, &[ve_core::Prop::X]).unwrap();
+        let right = ve_core::Transform {
+            x: 0.3,
+            ..ve_core::Transform::default()
+        };
+        apply_transform_at(&mut p, sub, Time::from_secs(1), right).unwrap();
+        set_keyframe_easing(
+            &mut p,
+            sub,
+            Time::ZERO,
+            &[ve_core::Prop::X],
+            ve_core::Easing::Linear,
+        )
+        .unwrap();
+        let s = ExportSettings {
+            width: 320,
+            height: 180,
+            ..settings(dir.path(), Encoder::X264)
+        };
+        export(&p, &s, |_| {}, &AtomicBool::new(false)).unwrap();
+        let target = ve_media::ScaleTarget {
+            max_width: 320,
+            max_height: 180,
+        };
+        let mut d = ve_media::VideoDecoder::open(&s.path, target).unwrap();
+        let f = d.seek_to(Time::from_millis(500)).unwrap();
+        // 白字（三个通道都亮；10 像素的细笔画抗锯齿后没有纯白）的横向重心
+        let (mut sum, mut n) = (0.0f64, 0.0f64);
+        for y in 0..f.height {
+            for x in 0..f.width {
+                let i = ((y * f.width + x) * 4) as usize;
+                if f.data[i..i + 3].iter().all(|v| *v > 140) {
+                    sum += f64::from(x);
+                    n += 1.0;
+                }
+            }
+        }
+        assert!(n > 5.0, "没找到字");
+        let clip = Arc::clone(p.timeline.find_clip(sub).unwrap().1);
+        let state = ve_core::text_state(&clip, Time::from_millis(500));
+        let want = 320.0 * (0.5 + f64::from(state.x));
+        let got = sum / n;
+        assert!(
+            (got - want).abs() < 4.0,
+            "字的重心 {got:.1}，预览算出来 {want:.1}"
+        );
+    }
+
+    #[test]
+    fn range_export_keeps_only_the_marked_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ExportSettings {
+            range: Some((Time::from_millis(500), Time::from_millis(1500))),
+            ..settings(dir.path(), Encoder::X264)
+        };
+        export(&project(), &s, |_| {}, &AtomicBool::new(false)).unwrap();
+        let r = ve_media::probe(&s.path).unwrap();
+        assert!(
+            (r.duration - Time::from_secs(1)).0.abs() <= FrameRate::new(30, 1).frame_duration().0,
+            "{:?}",
+            r.duration
+        );
+        // 第 0 帧是原来的第 15 帧（灰度 = 帧号）
+        let target = ve_media::ScaleTarget {
+            max_width: 64,
+            max_height: 36,
+        };
+        let frame = ve_media::VideoDecoder::open(&s.path, target)
+            .unwrap()
+            .next_frame()
+            .unwrap()
+            .unwrap();
+        let i = ((18 * frame.width + 32) * 4) as usize;
+        assert_eq!(
+            ve_media::testing::frame_index_from_gray(f64::from(frame.data[i])),
+            15,
+            "导出的第一帧是区域起点那一帧"
+        );
     }
 
     #[test]
@@ -602,6 +930,39 @@ mod tests {
         // 素材不存在：带上 ffmpeg 的报错
         let err = grab_frame(&dir.path().join("nope.mp4"), Time::ZERO, &out).unwrap_err();
         assert_ne!(err, "");
+    }
+
+    #[test]
+    fn reverse_segment_plays_the_frames_backwards() {
+        use ve_media::testing::frame_index_from_gray;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("rev.mp4");
+        // 第 10 帧到第 40 帧（1 秒）倒过来：第一帧是原来的第 39 帧
+        reverse_segment(
+            &fixture(Fixture::FrameIndexed30),
+            FrameRate::new(30, 1).time_of_frame(10),
+            Time::from_secs(1),
+            true,
+            false,
+            &out,
+        )
+        .unwrap();
+        let r = ve_media::probe(&out).unwrap();
+        assert!(
+            (r.duration - Time::from_secs(1)).0.abs() <= FrameRate::new(30, 1).frame_duration().0
+        );
+        let target = ve_media::ScaleTarget {
+            max_width: 64,
+            max_height: 36,
+        };
+        let mut d = ve_media::VideoDecoder::open(&out, target).unwrap();
+        let i = ((18 * 64 + 32) * 4) as usize;
+        let first = d.next_frame().unwrap().unwrap();
+        let first = frame_index_from_gray(f64::from(first.data[i]));
+        assert!((38..=40).contains(&first), "第一帧是原来的第 {first} 帧");
+        let last = d.seek_to(Time::from_millis(960)).unwrap();
+        let last = frame_index_from_gray(f64::from(last.data[i]));
+        assert!((9..=12).contains(&last), "最后一帧是原来的第 {last} 帧");
     }
 
     #[test]

@@ -7,10 +7,12 @@ use ve_core::Time;
 
 const CHANNELS: usize = 2;
 
-/// 时间轴时刻 `t` 处这段音频的增益（片段增益 × 淡入淡出线性包络）。
+/// 时间轴时刻 `t` 处这段音频的增益（片段增益或音量关键帧 × 淡入淡出线性包络）。
 #[must_use]
 #[expect(clippy::cast_possible_truncation, reason = "包络在 0..=1 之间")]
 pub fn gain_at(seg: &AudioSegment, t: Time) -> f32 {
+    let gain = ve_core::keyframe::value_of(&seg.volume, t - seg.clip_start)
+        .map_or(seg.gain, crate::resolve::db_to_gain);
     let mut env = 1.0f64;
     if seg.fade_in > Time::ZERO {
         env = env.min((t - seg.sound_start).as_secs_f64() / seg.fade_in.as_secs_f64());
@@ -18,7 +20,7 @@ pub fn gain_at(seg: &AudioSegment, t: Time) -> f32 {
     if seg.fade_out > Time::ZERO {
         env = env.min((seg.sound_end - t).as_secs_f64() / seg.fade_out.as_secs_f64());
     }
-    seg.gain * env.clamp(0.0, 1.0) as f32
+    gain * env.clamp(0.0, 1.0) as f32
 }
 
 /// 把 `samples`（从 `seg.timeline_start` 开始）乘增益后累加进 `out`（从 `out_start` 开始），
@@ -35,7 +37,7 @@ pub fn mix_into(
     // 只遍历和输出重叠的那部分样本帧
     let first = (-offset).max(0);
     let last = (out_frames - offset).min(i64::try_from(samples.len() / CHANNELS).unwrap_or(0));
-    let flat = seg.fade_in == Time::ZERO && seg.fade_out == Time::ZERO;
+    let flat = seg.fade_in == Time::ZERO && seg.fade_out == Time::ZERO && seg.volume.is_empty();
     for i in first..last {
         let gain = if flat {
             seg.gain
@@ -114,7 +116,44 @@ mod tests {
             sound_end: ms(start_ms + dur_ms),
             speed: 1.0,
             keep_pitch: true,
+            clip_start: ms(start_ms),
+            volume: Vec::new(),
         }
+    }
+
+    #[test]
+    fn volume_keyframes_shape_the_gain() {
+        let mut s = seg(1000, 2000, 1.0, 0, 0);
+        // 片段内 0 秒 0 dB，匀速降到 1 秒 -20 dB
+        s.volume = vec![
+            ve_core::Key {
+                at: Time::ZERO,
+                value: 0.0,
+                easing: ve_core::Easing::Linear,
+            },
+            ve_core::Key {
+                at: Time::from_secs(1),
+                value: -20.0,
+                easing: ve_core::Easing::Linear,
+            },
+        ];
+        let ms = Time::from_millis;
+        assert!((gain_at(&s, ms(1000)) - 1.0).abs() < 1e-6);
+        assert!(
+            (gain_at(&s, ms(1500)) - 10f32.powf(-0.5)).abs() < 1e-4,
+            "中间 -10 dB"
+        );
+        assert!(
+            (gain_at(&s, ms(2500)) - 0.1).abs() < 1e-5,
+            "最后一帧之后保持 -20 dB"
+        );
+        let samples = vec![1.0f32; 2 * 96_000];
+        let mut out = vec![0.0f32; 2 * 48_000];
+        mix_into(&mut out, &samples, &s, ms(2000), 48_000);
+        assert!(
+            (out[0] - 0.1).abs() < 1e-4,
+            "混音也按关键帧走，不是固定增益"
+        );
     }
 
     #[test]

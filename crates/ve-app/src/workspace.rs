@@ -47,6 +47,8 @@ pub enum Popup {
     Layout,
     /// 快捷键一览。
     Shortcuts,
+    /// 播放器标题右边的 ≡ 菜单。
+    Player,
 }
 
 impl Workspace {
@@ -110,6 +112,10 @@ pub struct Workspace {
     pub(crate) transition_secs: f64,
     /// 布局模式。
     pub(crate) layout: crate::layout::LayoutMode,
+    /// 快捷键一览里正在改的键位（等用户按新键）。
+    pub(crate) recording_key: Option<String>,
+    /// 改键后的提示（比如新键原来用于别的操作，已经从那里去掉）。
+    pub(crate) shortcut_note: Option<String>,
     /// 片段 / 属性剪贴板。
     pub(crate) clipboard: crate::clip_ops::ClipBoard,
     /// 自动保存（正式启动的程序才打开）。
@@ -126,6 +132,16 @@ pub struct Workspace {
     pub(crate) zoom_slider: Entity<gpui_kit::component::slider::SliderState>,
     /// 定格图片存放的目录。
     pub(crate) freeze_dir: std::path::PathBuf,
+    /// 播放入出点区域时，播到这里停（Shift+Enter）。
+    pub(crate) play_until: Option<Time>,
+    /// 倒放文件的目录。
+    pub(crate) reverse_dir: std::path::PathBuf,
+    /// 正在后台生成倒放文件。
+    pub(crate) reversing: bool,
+    /// 正在录音：录音器和从时间轴哪里开始录的。
+    pub(crate) recording: Option<(ve_engine::Recorder, Time)>,
+    /// 录音文件的目录。
+    pub(crate) record_dir: std::path::PathBuf,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -140,6 +156,8 @@ impl std::fmt::Debug for Workspace {
 impl Workspace {
     /// 新建主窗口视图（空工程）。
     pub fn new(engine: Engine, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
+        // 默认原画质（剪映播放器底栏的「原画」）
+        engine.set_preview_max(crate::preview::Quality::default().target());
         let events = engine.events();
         // 引擎事件用定时轮询（不 await 跨线程的通道）：引擎线程不直接唤醒界面任务，
         // 测试调度器才能保持确定性；空闲开销是每秒几十次 try_recv。
@@ -184,6 +202,19 @@ impl Workspace {
                 }
             },
         ));
+        // 改快捷键：在快捷键匹配之前截住按下的键
+        let weak = cx.entity().downgrade();
+        subscriptions.push(cx.intercept_keystrokes(move |e, _, cx| {
+            let Some(ws) = weak.upgrade() else {
+                return;
+            };
+            if ws.read(cx).recording_key.is_none() || e.keystroke.is_modifier_key() {
+                return;
+            }
+            cx.stop_propagation();
+            let key = e.keystroke.unparse(cx.platform_info().os);
+            ws.update(cx, |w, cx| w.finish_recording(&key, cx));
+        }));
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         let doc = Document::new();
@@ -210,11 +241,18 @@ impl Workspace {
             autosave: None,
             clipboard: crate::clip_ops::ClipBoard::default(),
             layout: crate::layout::LayoutMode::default(),
+            recording_key: None,
+            shortcut_note: None,
             transition_secs: 1.0,
             title: String::new(),
             tasks: vec![listen],
             zoom_slider,
             freeze_dir: crate::freeze::default_dir(),
+            play_until: None,
+            reverse_dir: crate::reverse::default_dir(),
+            reversing: false,
+            recording: None,
+            record_dir: crate::record::default_dir(),
             _subscriptions: subscriptions,
         }
     }
@@ -297,6 +335,7 @@ impl Workspace {
     }
 
     pub(crate) fn seek(&mut self, t: Time, cx: &mut Context<'_, Self>) {
+        self.timeline.axis_anchor = None;
         self.engine.seek(t);
         self.playhead = self.engine.position();
         cx.notify();
@@ -305,6 +344,7 @@ impl Workspace {
     // ---- 播放控制 ----
 
     fn play_pause(&mut self, _: &act::PlayPause, _: &mut Window, cx: &mut Context<'_, Self>) {
+        self.end_preview_axis();
         if self.engine.is_playing() {
             self.engine.pause();
         } else {
@@ -478,9 +518,13 @@ impl Workspace {
         self.after_change(window, cx);
     }
 
-    /// Esc：正在拖动（时间轴或预览）时取消这次拖动、回到按下前，不记撤销；
-    /// 正在框选时回到框之前的选择；否则取消选择。
+    /// Esc：开着弹出框（菜单、布局、快捷键）时先关掉它；正在拖动（时间轴或预览）时取消这次拖动、
+    /// 回到按下前，不记撤销；正在框选时回到框之前的选择；否则取消选择。
     fn cancel(&mut self, _: &act::Cancel, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.popup.take().is_some() {
+            cx.notify();
+            return;
+        }
         // 全屏时 Esc 先退出全屏
         if self.preview.fullscreen {
             self.set_fullscreen(false, window, cx);
@@ -720,6 +764,18 @@ impl Workspace {
             .on_action(cx.listener(Self::rotate_90))
             .on_action(cx.listener(Self::zoom_to_fit))
             .on_action(cx.listener(Self::freeze))
+            .on_action(cx.listener(Self::set_in))
+            .on_action(cx.listener(Self::set_out))
+            .on_action(cx.listener(Self::range_from_selection))
+            .on_action(cx.listener(Self::clear_range))
+            .on_action(cx.listener(Self::play_range))
+            .on_action(cx.listener(Self::select_same_color))
+            .on_action(cx.listener(Self::replace_clip))
+            .on_action(cx.listener(Self::select_tool))
+            .on_action(cx.listener(Self::blade_tool))
+            .on_action(cx.listener(Self::toggle_preview_axis))
+            .on_action(cx.listener(Self::reverse))
+            .on_action(cx.listener(Self::toggle_record))
     }
 }
 
@@ -728,10 +784,20 @@ impl Render for Workspace {
         self.sync_engine();
         self.pull_frame(window, cx);
         self.measure_subtitle_font(window);
-        self.playhead = self.engine.position();
+        self.stop_at_range_end(cx);
+        // 预览轴在预览别处时，播放头还是原来的位置
+        self.playhead = self
+            .timeline
+            .axis_anchor
+            .unwrap_or_else(|| self.engine.position());
         self.follow_playhead_in_inspector(window, cx);
+        self.refresh_animated_sliders(false, window, cx);
+        self.refresh_look_sliders(window, cx);
+        self.refresh_curve_sliders(window, cx);
+        self.refresh_grade_sliders(window, cx);
         self.sync_zoom_slider(window, cx);
-        if self.engine.is_playing() {
+        // 播放中、录音中一直刷新
+        if self.engine.is_playing() || self.recording.is_some() {
             window.request_animation_frame();
         }
         let title = format!("{} — 视频剪辑器", self.doc.title());

@@ -228,7 +228,7 @@ fn split_key_splits_at_playhead_and_delete_removes_selection(cx: &mut TestAppCon
     ui.view
         .read_with(cx, |w, _| w.engine().seek(Time::from_secs(1)));
     frame(cx, &ui);
-    press(cx, &ui, "s");
+    press(cx, &ui, "ctrl-b");
     assert_eq!(clips(cx, &ui, TrackKind::Video), 2);
     // 单击时间轴上第一段（0–1 秒）选中，再按 Delete
     cx.update_window(ui.win, |_, window, cx| {
@@ -363,6 +363,9 @@ fn export_runs_and_reports_done(cx: &mut TestAppContext) {
         encoder: ve_export::Encoder::X264,
         codec: ve_export::Codec::H264,
         render: ve_export::RenderConfig { software: true },
+        output: ve_export::Output::Video,
+        loudness_lufs: None,
+        range: None,
     };
     cx.update_window(ui.win, |_, window, cx| {
         ui.view
@@ -883,6 +886,8 @@ fn opacity_slider_drag_is_one_undo_step(cx: &mut TestAppContext) {
     .unwrap();
     cx.run_until_parked();
     frame(cx, &ui);
+    // 「混合」组在面板可见范围下面：先折起「位置大小」
+    click(cx, &ui, "tf-title");
     let bounds = cx
         .update_window(ui.win, |_, window, _| window.find("tf-opacity").bounds())
         .unwrap();
@@ -1286,7 +1291,7 @@ fn ctrl_a_selects_all_and_ctrl_shift_a_clears(cx: &mut TestAppContext) {
     ui.view
         .read_with(cx, |w, _| w.engine().seek(Time::from_secs(1)));
     frame(cx, &ui);
-    press(cx, &ui, "s");
+    press(cx, &ui, "ctrl-b");
     let total: usize = ui.view.read_with(cx, |w, _| {
         w.document()
             .project
@@ -1366,7 +1371,7 @@ fn three_clips(cx: &mut TestAppContext, ui: &Ui) -> Vec<ve_core::ClipId> {
     ui.view
         .read_with(cx, |w, _| w.engine().seek(Time::from_secs(1)));
     frame(cx, ui);
-    press(cx, ui, "s");
+    press(cx, ui, "ctrl-b");
     let ids: Vec<_> = video_clips(cx, ui).into_iter().map(|(c, _)| c).collect();
     assert_eq!(ids.len(), 3);
     press(cx, ui, "escape");
@@ -2423,6 +2428,126 @@ fn portrait_layout_puts_the_player_in_a_full_height_column(cx: &mut TestAppConte
 }
 
 #[gpui_kit::test]
+fn shortcuts_can_be_rebound_and_reset(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    let tracks = |app: &TestAppContext| {
+        // 字幕片段数（T 在播放头加一条字幕）
+        ui.view.read_with(app, |w, _| {
+            w.document()
+                .project
+                .timeline
+                .tracks
+                .iter()
+                .map(|t| t.clips.len())
+                .sum::<usize>()
+        })
+    };
+    // 把「加字幕」从 T 改成 Ctrl+K
+    click(cx, &ui, "tb-shortcuts");
+    click(cx, &ui, "sc-t");
+    press(cx, &ui, "ctrl-k");
+    let before = tracks(cx);
+    press(cx, &ui, "escape");
+    press(cx, &ui, "t");
+    assert_eq!(tracks(cx), before, "T 不再加字幕");
+    press(cx, &ui, "ctrl-k");
+    assert_eq!(tracks(cx), before + 1, "Ctrl+K 加字幕");
+    // 把「停用片段」(V) 改成 Ctrl+K：加字幕的 Ctrl+K 被去掉
+    click(cx, &ui, "tb-shortcuts");
+    click(cx, &ui, "sc-v");
+    press(cx, &ui, "ctrl-k");
+    let note = ui
+        .view
+        .read_with(cx, |w, _| w.shortcut_note().map(str::to_owned));
+    assert!(note.is_some_and(|n| n.contains("Ctrl+K")));
+    press(cx, &ui, "escape");
+    let n = tracks(cx);
+    press(cx, &ui, "ctrl-k");
+    assert_eq!(tracks(cx), n, "Ctrl+K 现在是停用片段，不加字幕");
+    // 正在改时按 Esc：不改
+    click(cx, &ui, "tb-shortcuts");
+    click(cx, &ui, "sc-ctrl-b");
+    press(cx, &ui, "escape");
+    assert_eq!(
+        cx.update(|cx| ve_app::keymap::current(cx, "editor::Split|ctrl-b")),
+        "ctrl-b"
+    );
+    // 恢复默认
+    click(cx, &ui, "shortcuts-reset");
+    press(cx, &ui, "escape");
+    // 播放头挪到已有那条字幕后面（同一处已经有字幕时加不了）
+    press(cx, &ui, "end");
+    let after_reset = tracks(cx);
+    press(cx, &ui, "t");
+    assert_eq!(tracks(cx), after_reset + 1, "T 又能加字幕");
+}
+
+#[gpui_kit::test]
+fn player_title_and_menu(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    click(cx, &ui, "player-menu-btn");
+    click(cx, &ui, "player-quality-smooth");
+    assert_eq!(
+        ui.view
+            .read_with(cx, |w, _| w.engine().preview_max().max_width),
+        1280,
+        "清晰画质"
+    );
+    assert!(!exists(cx, &ui, "player-menu"), "选了就关");
+    click(cx, &ui, "player-menu-btn");
+    click(cx, &ui, "player-axis");
+    assert!(ui.view.read_with(cx, |w, _| w.preview_axis_on()));
+    // Esc 关菜单
+    click(cx, &ui, "player-menu-btn");
+    press(cx, &ui, "escape");
+    assert!(!exists(cx, &ui, "player-menu"));
+}
+
+#[gpui_kit::test]
+fn media_inspector_and_audio_layouts(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    let bounds = |app: &mut TestAppContext, id: &'static str| {
+        app.update_window(ui.win, |_, window, _| window.find(id).bounds())
+            .unwrap()
+    };
+    let pick = |app: &mut TestAppContext, id: &'static str| {
+        click(app, &ui, "tb-layout");
+        click(app, &ui, id);
+        frame(app, &ui);
+    };
+    let default_timeline = bounds(cx, "timeline");
+    // 媒体素材优先：素材从上到下占满，时间轴在它右边
+    pick(cx, "layout-media");
+    let bin = bounds(cx, "media-bin");
+    let tl = bounds(cx, "timeline");
+    assert!(
+        bin.size.height > tl.origin.y - bin.origin.y,
+        "素材比时间轴顶边还长"
+    );
+    assert!(
+        tl.origin.x > bin.origin.x + bin.size.width - px(1.0),
+        "时间轴在素材右边"
+    );
+    // 属性调节优先：属性占满右边，时间轴在它左边
+    pick(cx, "layout-inspector");
+    let insp = bounds(cx, "inspector");
+    let left_tl = bounds(cx, "timeline");
+    assert!(insp.size.height > left_tl.origin.y - insp.origin.y);
+    assert!(
+        left_tl.origin.x + left_tl.size.width < insp.origin.x + px(1.0),
+        "时间轴在属性左边"
+    );
+    // 音频创作：时间轴更高，素材栏切到音频
+    pick(cx, "layout-audio");
+    let audio_tl = bounds(cx, "timeline");
+    assert!(
+        audio_tl.size.height > default_timeline.size.height * 1.3,
+        "{audio_tl:?} / {default_timeline:?}"
+    );
+    assert!(exists(cx, &ui, "bin-audio"), "素材栏切到音频");
+}
+
+#[gpui_kit::test]
 fn transitions_tab_puts_a_transition_on_the_selected_clip(cx: &mut TestAppContext) {
     let ui = open(cx);
     import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
@@ -2875,6 +3000,7 @@ fn subtitle_animation_tab_sets_intro_outro_and_applies_to_all(cx: &mut TestAppCo
     let want = ve_core::TextMotion {
         intro: ve_core::TextIn::SlideUp,
         outro: ve_core::TextOut::FadeOut,
+        ..ve_core::TextMotion::default()
     };
     assert_eq!(
         motions(cx),
@@ -2883,4 +3009,720 @@ fn subtitle_animation_tab_sets_intro_outro_and_applies_to_all(cx: &mut TestAppCo
     );
     click(cx, &ui, "text-motion-all");
     assert_eq!(motions(cx), [want, want]);
+}
+
+#[gpui_kit::test]
+fn adjust_and_volume_rows_have_their_own_keyframes(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click_timeline(cx, &ui, 0.5, 1.0, gpui_kit::Modifiers::default());
+    click(cx, &ui, "insp-tab-adjust");
+    seek_to(cx, &ui, Time::ZERO);
+    click(cx, &ui, "tf-key-saturation");
+    let keys = |app: &mut TestAppContext, prop: ve_core::Prop| {
+        first_video_clip(app, &ui).animation.keys(prop).len()
+    };
+    assert_eq!(keys(cx, ve_core::Prop::Saturation), 1, "只给饱和度打了一个");
+    assert_eq!(keys(cx, ve_core::Prop::Brightness), 0);
+    // 换个时刻拖饱和度：自动在那一刻打关键帧
+    seek_to(cx, &ui, Time::from_millis(500));
+    let bounds = cx
+        .update_window(ui.win, |_, window, _| {
+            window.find("adj-saturation").bounds()
+        })
+        .unwrap();
+    let y = bounds.origin.y + bounds.size.height / 2.0;
+    let from = point(bounds.origin.x + bounds.size.width / 2.0, y);
+    let to = point(bounds.origin.x + px(1.0), y);
+    cx.update_window(ui.win, |_, window, cx| window.drag(from, to, cx))
+        .unwrap();
+    cx.run_until_parked();
+    let c = first_video_clip(cx, &ui);
+    assert_eq!(c.animation.keys(ve_core::Prop::Saturation).len(), 2);
+    assert!(
+        c.adjust_at(Time::ZERO).saturation.abs() < 1e-6,
+        "0 秒还是不调"
+    );
+    assert!(c.adjust_at(Time::from_millis(500)).saturation < -0.9);
+    // 音量那一行也有 ◇
+    click(cx, &ui, "insp-tab-audio");
+    click(cx, &ui, "tf-key-volume");
+    assert_eq!(keys(cx, ve_core::Prop::Volume), 1);
+    // 再点一次删掉
+    click(cx, &ui, "tf-key-volume");
+    assert_eq!(keys(cx, ve_core::Prop::Volume), 0);
+}
+
+fn range(cx: &TestAppContext, ui: &Ui) -> Option<(Time, Time)> {
+    ui.view
+        .read_with(cx, |w, _| w.document().project.timeline.range)
+}
+
+#[gpui_kit::test]
+fn in_out_points_mark_a_range_that_can_be_played_and_cleared(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    seek_to(cx, &ui, Time::from_millis(500));
+    press(cx, &ui, "i");
+    assert_eq!(
+        range(cx, &ui),
+        Some((Time::from_millis(500), Time::from_secs(2)))
+    );
+    seek_to(cx, &ui, Time::from_millis(1500));
+    press(cx, &ui, "o");
+    assert_eq!(
+        range(cx, &ui),
+        Some((Time::from_millis(500), Time::from_millis(1500)))
+    );
+    // 一步撤销
+    press(cx, &ui, "ctrl-z");
+    assert_eq!(
+        range(cx, &ui),
+        Some((Time::from_millis(500), Time::from_secs(2)))
+    );
+    press(cx, &ui, "ctrl-y");
+    // Shift+Enter：从入点开始播
+    press(cx, &ui, "shift-enter");
+    assert!(ui.view.read_with(cx, |w, _| w.engine().is_playing()));
+    assert!(ui.view.read_with(cx, |w, _| w.engine().position()) >= Time::from_millis(500));
+    press(cx, &ui, "k");
+    press(cx, &ui, "alt-x");
+    assert_eq!(range(cx, &ui), None);
+    // Shift+X：以选中的片段选定区域
+    press(cx, &ui, "ctrl-a");
+    press(cx, &ui, "shift-x");
+    assert_eq!(range(cx, &ui), Some((Time::ZERO, Time::from_secs(2))));
+    assert!(exists(cx, &ui, "timeline"));
+}
+
+fn clip_label(cx: &TestAppContext, ui: &Ui, id: ve_core::ClipId) -> Option<u8> {
+    ui.view.read_with(cx, |w, _| {
+        w.document().project.timeline.find_clip(id).unwrap().1.label
+    })
+}
+
+#[gpui_kit::test]
+fn context_menu_labels_clips_and_selects_same_color(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    let clips = three_clips(cx, &ui);
+    // 第一段和第三段标成绿色
+    for secs in [0.5, 3.0] {
+        right_click_timeline(cx, &ui, secs, 1.0);
+        assert!(exists(cx, &ui, "cm-label-3"));
+        click(cx, &ui, "cm-label-3");
+    }
+    assert_eq!(clip_label(cx, &ui, clips[0]), Some(3));
+    assert_eq!(clip_label(cx, &ui, clips[1]), None);
+    assert_eq!(clip_label(cx, &ui, clips[2]), Some(3));
+    // 选中同色片段
+    right_click_timeline(cx, &ui, 0.5, 1.0);
+    click(cx, &ui, "cm-same-color");
+    assert_eq!(ids(selected(cx, &ui)), ids(vec![clips[0], clips[2]]));
+    // 还原
+    right_click_timeline(cx, &ui, 0.5, 1.0);
+    click(cx, &ui, "cm-label-clear");
+    assert_eq!(clip_label(cx, &ui, clips[0]), None);
+}
+
+#[gpui_kit::test]
+fn replace_clip_keeps_position_and_attributes(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    let (id, before) = ui.view.read_with(cx, |w, _| {
+        let tr = w
+            .document()
+            .project
+            .timeline
+            .video_tracks_bottom_up()
+            .next()
+            .unwrap();
+        (tr.clips[0].id, (*tr.clips[0]).clone())
+    });
+    right_click_timeline(cx, &ui, 0.5, 1.0);
+    assert!(exists(cx, &ui, "cm-replace"));
+    cx.update_window(ui.win, |_, window, cx| {
+        ui.view.update(cx, |w, cx| {
+            w.replace_clip_with(id, fixture(Fixture::VideoWithAudio), window, cx);
+        });
+    })
+    .unwrap();
+    wait(&mut *cx, &ui, |w| {
+        w.document()
+            .project
+            .timeline
+            .find_clip(id)
+            .unwrap()
+            .1
+            .asset()
+            != before.asset()
+    });
+    let after = ui.view.read_with(cx, |w, _| {
+        (**w.document().project.timeline.find_clip(id).unwrap().1).clone()
+    });
+    assert_eq!(
+        (after.start, after.duration),
+        (before.start, before.duration)
+    );
+    assert_eq!(after.transform, before.transform);
+    // 一步撤销回到原素材
+    press(cx, &ui, "ctrl-z");
+    let undone = ui.view.read_with(cx, |w, _| {
+        w.document()
+            .project
+            .timeline
+            .find_clip(id)
+            .unwrap()
+            .1
+            .asset()
+    });
+    assert_eq!(undone, before.asset());
+}
+
+#[gpui_kit::test]
+fn export_dialog_also_writes_audio_and_cover(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("成片.mp4");
+    open_export_dialog(cx, &ui, &out);
+    for id in ["export-audio", "afmt-wav", "cover-first", "loud-14"] {
+        cx.update_window(ui.win, |_, window, cx| window.click(id, cx))
+            .unwrap();
+        cx.run_until_parked();
+        frame(cx, &ui);
+    }
+    cx.update_window(ui.win, |_, window, cx| window.click("export-confirm", cx))
+        .unwrap();
+    cx.run_until_parked();
+    wait(&mut *cx, &ui, |w| !w.is_exporting());
+    assert!(out.exists());
+    let wav = dir.path().join("成片.wav");
+    let probe = ve_media::probe(&wav).unwrap();
+    assert!(probe.video.is_none() && probe.audio.is_some());
+    assert!(dir.path().join("成片_封面.png").exists());
+}
+
+#[gpui_kit::test]
+fn quality_menu_switches_preview_resolution(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    let max = |app: &TestAppContext| {
+        ui.view
+            .read_with(app, |w, _| w.engine().preview_max().max_width)
+    };
+    assert_eq!(max(cx), 3840, "默认原画质");
+    click(cx, &ui, "tr-quality");
+    click(cx, &ui, "quality-smooth");
+    assert_eq!(max(cx), 1280);
+    assert!(!exists(cx, &ui, "quality-menu"));
+}
+
+#[gpui_kit::test]
+fn property_groups_fold_and_blend_check_resets_opacity(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click_timeline(cx, &ui, 0.5, 1.0, gpui_kit::Modifiers::default());
+    assert!(exists(cx, &ui, "tf-scale"));
+    click(cx, &ui, "tf-title");
+    assert!(!exists(cx, &ui, "tf-scale"), "折叠「位置大小」");
+    click(cx, &ui, "tf-title");
+    assert!(exists(cx, &ui, "tf-scale"));
+    // 改了不透明度，「混合」自动勾上；取消勾选回到 100%（「混合」在可见范围下面，先折起「位置大小」）
+    click(cx, &ui, "tf-title");
+    let bounds = cx
+        .update_window(ui.win, |_, window, _| window.find("tf-opacity").bounds())
+        .unwrap();
+    let y = bounds.origin.y + bounds.size.height / 2.0;
+    cx.update_window(ui.win, |_, window, cx| {
+        window.drag(
+            point(bounds.origin.x + bounds.size.width - px(2.0), y),
+            point(bounds.origin.x + bounds.size.width / 2.0, y),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(first_video_transform(cx, &ui).opacity < 0.9);
+    click(cx, &ui, "tf-blend-check");
+    assert!((first_video_transform(cx, &ui).opacity - 1.0).abs() < 1e-6);
+}
+
+#[gpui_kit::test]
+fn dragging_sideways_on_a_number_box_changes_the_value(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click_timeline(cx, &ui, 0.5, 1.0, gpui_kit::Modifiers::default());
+    let bounds = cx
+        .update_window(ui.win, |_, window, _| window.find("tf-rotation").bounds())
+        .unwrap();
+    let from = bounds.center();
+    let to = point(from.x + px(30.0), from.y);
+    press_and_move(cx, &ui, from, to);
+    release(cx, &ui, to);
+    let rot = first_video_transform(cx, &ui).rotation;
+    assert!((rot - 30.0).abs() < 1.0, "拖 30 像素 = 30°，实际 {rot}");
+    // 整次拖动一步撤销
+    press(cx, &ui, "ctrl-z");
+    assert!(first_video_transform(cx, &ui).rotation.abs() < 1e-6);
+}
+
+fn first_video_look(cx: &TestAppContext, ui: &Ui) -> ve_core::Look {
+    first_video_clip(cx, ui).look
+}
+
+#[gpui_kit::test]
+fn picture_segments_set_blend_stroke_mask_and_chroma(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click_timeline(cx, &ui, 0.5, 1.0, gpui_kit::Modifiers::default());
+    // 基础：混合模式（「混合」组在面板下面，先折起「位置大小」）
+    click(cx, &ui, "tf-title");
+    click(cx, &ui, "blend-4");
+    assert_eq!(
+        first_video_look(cx, &ui).blend,
+        ve_core::BlendMode::Multiply
+    );
+    // 取消勾选「混合」：回到正常
+    click(cx, &ui, "tf-blend-check");
+    assert_eq!(first_video_look(cx, &ui).blend, ve_core::BlendMode::Normal);
+    // 描边：勾上、换颜色
+    click(cx, &ui, "look-stroke-check");
+    assert!(first_video_look(cx, &ui).stroke.is_some());
+    click(cx, &ui, "stroke-color-2");
+    assert_eq!(first_video_look(cx, &ui).stroke.unwrap().color, 0xE5_484D);
+    press(cx, &ui, "ctrl-z");
+    assert_eq!(
+        first_video_look(cx, &ui).stroke.unwrap().color,
+        0xFF_FFFF,
+        "一步撤销"
+    );
+    // 蒙版
+    click(cx, &ui, "seg-mask");
+    assert!(exists(cx, &ui, "insp-mask"));
+    click(cx, &ui, "mask-2");
+    assert_eq!(
+        first_video_look(cx, &ui).mask.map(|m| m.shape),
+        Some(ve_core::MaskShape::Circle)
+    );
+    click(cx, &ui, "mask-invert");
+    assert!(first_video_look(cx, &ui).mask.unwrap().invert);
+    assert!(exists(cx, &ui, "look-mask-feather"));
+    click(cx, &ui, "mask-none");
+    assert_eq!(first_video_look(cx, &ui).mask, None);
+    // 抠像：勾上色度抠图，换蓝幕，取色器在播放器上点一下取色
+    click(cx, &ui, "seg-key");
+    click(cx, &ui, "look-key-check");
+    assert_eq!(first_video_look(cx, &ui).chroma.unwrap().color, 0x00_FF00);
+    click(cx, &ui, "key-blue");
+    assert_eq!(first_video_look(cx, &ui).chroma.unwrap().color, 0x00_00FF);
+    click(cx, &ui, "key-pick");
+    wait(&mut *cx, &ui, Workspace::showing_frame);
+    let at = preview_center(cx, &ui);
+    let origin = cx
+        .update_window(ui.win, |_, window, _| {
+            window.find("preview").bounds().origin
+        })
+        .unwrap();
+    cx.update_window(ui.win, |_, window, cx| {
+        window.click_at("preview", at - origin, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    wait(&mut *cx, &ui, |w| {
+        w.document()
+            .project
+            .timeline
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .any(|c| c.look.chroma.is_some_and(|k| k.color != 0x00_00FF))
+    });
+    let picked = first_video_look(cx, &ui).chroma.unwrap().color;
+    let [r, g, b] = [picked >> 16, (picked >> 8) & 0xFF, picked & 0xFF];
+    assert!(r == g && g == b, "灰度素材取到的是灰色：{picked:06X}");
+    assert_eq!(selected(cx, &ui).len(), 1, "取色那一下没有改选择");
+}
+
+#[gpui_kit::test]
+fn blade_mode_splits_where_clicked(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    press(cx, &ui, "b");
+    click_timeline(cx, &ui, 0.5, 1.0, gpui_kit::Modifiers::default());
+    let spans = video_spans(cx, &ui);
+    assert_eq!(spans.len(), 2, "点一下切成两段：{spans:?}");
+    let cut = spans[0].1;
+    assert!(
+        (cut.as_secs_f64() - 0.5).abs() < 0.05,
+        "切在点的地方：{cut:?}"
+    );
+    // 回到选择模式：点一下只是选中
+    press(cx, &ui, "a");
+    click_timeline(cx, &ui, 1.5, 1.0, gpui_kit::Modifiers::default());
+    assert_eq!(video_spans(cx, &ui).len(), 2);
+    // 工具栏菜单也能切
+    click(cx, &ui, "tb-tool");
+    click(cx, &ui, "tool-blade");
+    click_timeline(cx, &ui, 1.5, 1.0, gpui_kit::Modifiers::default());
+    assert_eq!(video_spans(cx, &ui).len(), 3);
+}
+
+#[gpui_kit::test]
+fn preview_axis_shows_the_hovered_frame_without_moving_the_playhead(cx: &mut TestAppContext) {
+    use gpui_kit::{InputEvent as _, MouseMoveEvent};
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    seek_to(cx, &ui, Time::from_millis(200));
+    press(cx, &ui, "s");
+    let origin = cx
+        .update_window(ui.win, |_, window, _| {
+            window.find("timeline").bounds().origin
+        })
+        .unwrap();
+    let at = origin + timeline_point(1.5, 1.0);
+    cx.update_window(ui.win, |_, window, cx| {
+        window.dispatch_event(
+            MouseMoveEvent {
+                position: at,
+                pressed_button: None,
+                modifiers: gpui_kit::Modifiers::default(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    frame(cx, &ui);
+    let (engine_at, playhead) = ui
+        .view
+        .read_with(cx, |w, _| (w.engine().position(), w.playhead()));
+    assert!(
+        (engine_at.as_secs_f64() - 1.5).abs() < 0.05,
+        "播放器在鼠标那一刻：{engine_at:?}"
+    );
+    assert_eq!(playhead, Time::from_millis(200), "播放头不动");
+    // 关掉预览轴：回到播放头
+    press(cx, &ui, "s");
+    assert_eq!(
+        ui.view.read_with(cx, |w, _| w.engine().position()),
+        Time::from_millis(200)
+    );
+}
+
+#[gpui_kit::test]
+fn reverse_plays_the_clip_backwards_and_toggles_back(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    let dir = tempfile::tempdir().unwrap();
+    let rev_dir = dir.path().to_path_buf();
+    ui.view.update(cx, |w, _| w.use_reverse_dir(rev_dir));
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click_timeline(cx, &ui, 0.5, 1.0, gpui_kit::Modifiers::default());
+    let original = first_video_clip(cx, &ui);
+    click(cx, &ui, "tb-reverse");
+    wait(&mut *cx, &ui, |w| !w.is_reversing());
+    let reversed = first_video_clip(cx, &ui);
+    assert_ne!(reversed.asset(), original.asset(), "换成了倒放的文件");
+    assert_eq!(
+        reversed.reversed,
+        Some((original.asset().unwrap(), original.source_in()))
+    );
+    assert_eq!(
+        (reversed.start, reversed.duration),
+        (original.start, original.duration)
+    );
+    // 片段开头放的是原片的最后一帧
+    let first = ui.view.read_with(cx, |w, _| {
+        let p = &w.document().project;
+        p.assets[&reversed.asset().unwrap()].path.clone()
+    });
+    let mut d = ve_media::VideoDecoder::open(
+        &first,
+        ve_media::ScaleTarget {
+            max_width: 64,
+            max_height: 36,
+        },
+    )
+    .unwrap();
+    let f = d.next_frame().unwrap().unwrap();
+    let idx =
+        ve_media::testing::frame_index_from_gray(f64::from(f.data[((18 * 64 + 32) * 4) as usize]));
+    assert!(idx >= 57, "倒放文件第一帧是原来的第 {idx} 帧");
+    // 再点一次：换回原来的
+    click(cx, &ui, "tb-reverse");
+    assert_eq!(first_video_clip(cx, &ui), original);
+}
+
+#[gpui_kit::test]
+fn curve_speed_presets_and_custom_points(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click_timeline(cx, &ui, 0.5, 1.0, gpui_kit::Modifiers::default());
+    click(cx, &ui, "insp-tab-speed");
+    click(cx, &ui, "speed-seg-curve");
+    click(cx, &ui, "curve-hero");
+    let c = first_video_clip(cx, &ui);
+    assert_eq!(c.curve, Some(ve_core::CurvePreset::Hero.curve()));
+    // 自定义：五个滑条，拖第一个点
+    click(cx, &ui, "curve-custom");
+    assert!(exists(cx, &ui, "curve-point-0"));
+    let bounds = cx
+        .update_window(ui.win, |_, window, _| window.find("curve-point-0").bounds())
+        .unwrap();
+    let y = bounds.origin.y + bounds.size.height / 2.0;
+    cx.update_window(ui.win, |_, window, cx| {
+        window.drag(
+            point(bounds.origin.x + bounds.size.width / 2.0, y),
+            point(bounds.origin.x + bounds.size.width - px(1.0), y),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let custom = first_video_clip(cx, &ui);
+    let first = custom.curve.as_ref().unwrap().speed_at(0.0);
+    assert!(first > 5.0, "第一个点拖到最右接近 10x：{first}");
+    // 回到「无」：去掉曲线
+    click(cx, &ui, "curve-none");
+    assert!(first_video_clip(cx, &ui).curve.is_none());
+}
+
+#[gpui_kit::test]
+fn a_finished_recording_lands_at_the_start_on_a_free_audio_track(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(
+        cx,
+        &ui,
+        vec![
+            fixture(Fixture::FrameIndexed30),
+            fixture(Fixture::ToneStereo48k),
+        ],
+        true,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let wav = dir.path().join("rec.wav");
+    let samples: Vec<f32> = (0..48_000u16)
+        .map(|i| (f32::from(i) * 0.05).sin() * 0.3)
+        .collect();
+    ve_engine::write_wav(&wav, &samples, 48_000, 2).unwrap();
+    let audio_tracks = |app: &TestAppContext| track_count(app, &ui, TrackKind::Audio);
+    let before = audio_tracks(cx);
+    cx.update_window(ui.win, |_, window, cx| {
+        ui.view.update(cx, |w, cx| {
+            w.place_recording(wav, Time::from_millis(500), window, cx);
+        });
+    })
+    .unwrap();
+    wait(&mut *cx, &ui, |w| w.document().project.assets.len() == 3);
+    assert_eq!(
+        audio_tracks(cx),
+        before + 1,
+        "原来的音频轨在 0.5 秒有声音：新建一条"
+    );
+    let placed = ui.view.read_with(cx, |w, _| {
+        let tl = &w.document().project.timeline;
+        tl.tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Audio)
+            .flat_map(|t| t.clips.iter())
+            .find(|c| c.start == Time::from_millis(500))
+            .map(|c| c.duration)
+    });
+    let len = placed.expect("录音放在 0.5 秒");
+    assert!(
+        (len - Time::from_millis(500)).0.abs() <= Time::from_millis(30).0,
+        "{len:?}"
+    );
+    assert!(exists(cx, &ui, "tb-record"));
+}
+
+#[gpui_kit::test]
+fn main_track_cover_is_used_by_export(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("带封面.mp4");
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    seek_to(cx, &ui, Time::from_secs(1));
+    click(cx, &ui, "track-cover");
+    click(cx, &ui, "cover-use-frame");
+    let cover = ui
+        .view
+        .read_with(cx, |w, _| w.document().project.timeline.cover.clone());
+    assert_eq!(cover, Some(ve_core::Cover::Frame(Time::from_secs(1))));
+    // 导出对话框默认带上草稿封面
+    press(cx, &ui, "ctrl-e");
+    cx.simulate_new_path_selection(move |_| Some(out));
+    cx.run_until_parked();
+    frame(cx, &ui);
+    assert!(exists(cx, &ui, "cover-draft"));
+    cx.update_window(ui.win, |_, window, cx| window.click("export-confirm", cx))
+        .unwrap();
+    cx.run_until_parked();
+    wait(&mut *cx, &ui, |w| !w.is_exporting());
+    let png = dir.path().join("带封面_封面.png");
+    assert!(png.exists());
+    // 封面是第 1 秒那一帧（第 30 帧）
+    let mut d = ve_media::VideoDecoder::open(
+        &png,
+        ve_media::ScaleTarget {
+            max_width: 64,
+            max_height: 36,
+        },
+    )
+    .unwrap();
+    let f = d.next_frame().unwrap().unwrap();
+    let idx =
+        ve_media::testing::frame_index_from_gray(f64::from(f.data[((18 * 64 + 32) * 4) as usize]));
+    assert!((29..=31).contains(&idx), "封面是第 {idx} 帧");
+    // 清除
+    click(cx, &ui, "track-cover");
+    click(cx, &ui, "cover-clear");
+    assert!(
+        ui.view
+            .read_with(cx, |w, _| w.document().project.timeline.cover.is_none())
+    );
+}
+
+#[gpui_kit::test]
+fn advanced_grading_hsl_curves_wheels_and_lut(cx: &mut TestAppContext) {
+    use std::fmt::Write as _;
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click_timeline(cx, &ui, 0.5, 1.0, gpui_kit::Modifiers::default());
+    click(cx, &ui, "insp-tab-adjust");
+    let grade = |app: &TestAppContext| first_video_clip(app, &ui).grade.as_deref().cloned();
+    let drag_right = |app: &mut TestAppContext, id: &'static str| {
+        let b = app
+            .update_window(ui.win, |_, window, _| window.find(id).bounds())
+            .unwrap();
+        let y = b.origin.y + b.size.height / 2.0;
+        app.update_window(ui.win, |_, window, inner| {
+            window.drag(
+                point(b.origin.x + b.size.width / 2.0, y),
+                point(b.origin.x + b.size.width - px(1.0), y),
+                inner,
+            );
+        })
+        .unwrap();
+        app.run_until_parked();
+    };
+    // HSL：选绿色，饱和度拉满
+    click(cx, &ui, "adj-seg-hsl");
+    click(cx, &ui, "hsl-3");
+    drag_right(cx, "hsl-sat");
+    let g = grade(cx).unwrap();
+    assert!(
+        g.hsl[ve_core::HslBand::Green.index()].saturation > 0.9,
+        "{g:?}"
+    );
+    // 一次拖动一步撤销
+    press(cx, &ui, "ctrl-z");
+    assert!(grade(cx).is_none());
+    // 曲线：点一下加一个点
+    click(cx, &ui, "adj-seg-curves");
+    let b = cx
+        .update_window(ui.win, |_, window, _| window.find("curve-editor").bounds())
+        .unwrap();
+    let at = point(
+        b.origin.x + b.size.width / 2.0,
+        b.origin.y + b.size.height / 4.0,
+    );
+    press_and_move(cx, &ui, at, at);
+    release(cx, &ui, at);
+    let pts = grade(cx).unwrap().curves.luma;
+    assert_eq!(pts.len(), 1, "{pts:?}");
+    assert!(
+        (pts[0].0 - 0.5).abs() < 0.02 && (pts[0].1 - 0.75).abs() < 0.02,
+        "{pts:?}"
+    );
+    // 色轮：暗部往右拖（偏红；第一排，在面板可见范围里）
+    click(cx, &ui, "adj-seg-wheels");
+    let wheel = cx
+        .update_window(ui.win, |_, window, _| window.find("wheel-shadows").bounds())
+        .unwrap();
+    let c = wheel.center();
+    press_and_move(cx, &ui, c, point(c.x + wheel.size.width / 2.0, c.y));
+    release(cx, &ui, point(c.x + wheel.size.width / 2.0, c.y));
+    let shadows = grade(cx).unwrap().wheels.shadows;
+    assert!(
+        shadows[0] > shadows[1] && shadows[0] > shadows[2],
+        "{shadows:?}"
+    );
+    // LUT
+    let dir = tempfile::tempdir().unwrap();
+    let cube = dir.path().join("x.cube");
+    let mut text = String::from("LUT_3D_SIZE 2\n");
+    for blue in 0..2 {
+        for green in 0..2 {
+            for red in 0..2 {
+                let _ = writeln!(text, "{red} {green} {blue}");
+            }
+        }
+    }
+    std::fs::write(&cube, text).unwrap();
+    click(cx, &ui, "adj-seg-basic");
+    cx.update_window(ui.win, |_, window, cx| {
+        ui.view
+            .update(cx, |w, cx| w.use_lut(cube.clone(), window, cx));
+    })
+    .unwrap();
+    assert_eq!(grade(cx).unwrap().lut.map(|l| l.path), Some(cube));
+    assert!(exists(cx, &ui, "lut-intensity"));
+}
+
+#[gpui_kit::test]
+fn subtitle_own_style_position_keyframes_and_loops(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    press(cx, &ui, "t");
+    let sub = |app: &TestAppContext| {
+        ui.view.read_with(app, |w, _| {
+            (*w.document().project.timeline.tracks[0].clips[0]).clone()
+        })
+    };
+    click(cx, &ui, "insp-tab-text");
+    // 关掉「应用到全部字幕」：改字号只改这一条
+    click(cx, &ui, "ts-apply-all");
+    assert!(sub(cx).own_subtitle_style().is_some());
+    let shared = ui
+        .view
+        .read_with(cx, |w, _| w.document().project.subtitle_style.clone());
+    let big = cx
+        .update_window(ui.win, |_, window, _| {
+            window.try_find("ts-size-xl").is_some()
+        })
+        .unwrap();
+    assert!(big);
+    click(cx, &ui, "ts-size-xl");
+    let own = sub(cx).own_subtitle_style().cloned().unwrap();
+    assert_ne!(own.size_ratio, shared.size_ratio, "这一条变了");
+    assert_eq!(
+        ui.view
+            .read_with(cx, |w, _| w.document().project.subtitle_style.clone()),
+        shared,
+        "共用的样式没变"
+    );
+    // 位置大小：字幕也有，能打关键帧（在「文本」标签下面，先往下滚）
+    assert!(exists(cx, &ui, "tf-y"));
+    cx.update_window(ui.win, |_, window, cx| {
+        window.scroll(
+            "inspector-body",
+            ScrollDelta::Pixels(point(px(0.), px(-600.))),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    frame(cx, &ui);
+    click(cx, &ui, "tf-key-pos");
+    assert_eq!(sub(cx).animation.keys(ve_core::Prop::X).len(), 1);
+    // 循环动画
+    click(cx, &ui, "insp-tab-animation");
+    click(cx, &ui, "text-loop-1");
+    assert_eq!(
+        sub(cx).text_motion().unwrap().looping,
+        ve_core::TextLoop::Breathe
+    );
+    click(cx, &ui, "text-in-4");
+    assert_eq!(
+        sub(cx).text_motion().unwrap().intro,
+        ve_core::TextIn::Typewriter
+    );
 }

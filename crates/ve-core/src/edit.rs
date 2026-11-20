@@ -41,10 +41,13 @@ pub enum EditError {
     /// 要改的片段在锁定的轨道上。
     #[error("轨道已锁定，先在轨道头解锁")]
     TrackLocked,
+    /// 换上的素材不够长。
+    #[error("素材时长不足，换不上这个片段")]
+    SourceTooShort,
 }
 
 /// 增益范围（dB）。
-pub const GAIN_RANGE_DB: (f32, f32) = (-60.0, 12.0);
+pub const GAIN_RANGE_DB: (f32, f32) = crate::keyframe::VOLUME_RANGE_DB;
 
 /// 在时间轴副本上执行 `f`，成功后写回。
 fn with_timeline<T>(
@@ -143,6 +146,11 @@ fn new_media_clip(
         transition_in: None,
         speed: 1.0,
         keep_pitch: true,
+        label: None,
+        look: crate::Look::NONE,
+        reversed: None,
+        curve: None,
+        grade: None,
     })
 }
 
@@ -425,6 +433,7 @@ fn split_in(
     let (left_anim, right_anim) = original.animation.split(at - original.start);
     left.animation = left_anim;
     right.animation = right_anim;
+    let cut_source = original.source_at(at - original.start);
     left.duration = at - left.start;
     left.fade_out = Time::ZERO;
     clamp_fades(&mut left);
@@ -434,9 +443,30 @@ fn split_in(
     right.start = at;
     right.duration = original.end() - at;
     right.fade_in = Time::ZERO;
-    let speed = f64::from(right.speed);
+    if let Some(curve) = &original.curve {
+        // 曲线变速：在切点把曲线切开，两半各自的平均倍数就是各自的 speed
+        #[expect(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            reason = "进度"
+        )]
+        let u = ((at - original.start).0 as f64 / original.duration.0.max(1) as f64) as f32;
+        let (l, r) = curve.split(u);
+        let src_left = cut_source - original.source_in();
+        let src_right = original.source_in() + original.source_span() - cut_source;
+        #[expect(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            reason = "倍数"
+        )]
+        let rate = |src: Time, len: Time| (src.0 as f64 / len.0.max(1) as f64) as f32;
+        left.speed = rate(src_left, left.duration);
+        right.speed = rate(src_right, right.duration);
+        left.curve = Some(l);
+        right.curve = Some(r);
+    }
     if let ClipContent::Media { source_in, .. } = &mut right.content {
-        *source_in += left.duration.scaled(speed);
+        *source_in = cut_source;
     }
     clamp_fades(&mut right);
     let clips = &mut tl.tracks[ti].clips;
@@ -544,6 +574,21 @@ pub fn set_gain(project: &mut Project, clip: ClipId, gain_db: f32) -> Result<(),
     }
     update_clip(project, clip, |c| {
         c.gain_db = gain_db.clamp(GAIN_RANGE_DB.0, GAIN_RANGE_DB.1);
+        Ok(())
+    })
+}
+
+/// 重置声音（属性面板「音频」组的 ↻）：0 dB、清掉音量关键帧、没有淡入淡出。
+///
+/// # Errors
+/// 片段不存在。
+pub fn reset_audio(project: &mut Project, clip: ClipId) -> Result<(), EditError> {
+    update_clip(project, clip, |c| {
+        c.gain_db = 0.0;
+        c.fade_in = Time::ZERO;
+        c.fade_out = Time::ZERO;
+        c.animation
+            .remove_between(crate::Prop::Volume, Time::ZERO, Time(i64::MAX));
         Ok(())
     })
 }
@@ -789,7 +834,7 @@ pub fn set_transform(project: &mut Project, clip: ClipId, t: Transform) -> Resul
     if !t.is_valid() {
         return Err(EditError::InvalidValue);
     }
-    ensure_video(project, clip)?;
+    ensure_visual(project, clip)?;
     update_clip(project, clip, |c| {
         c.transform = t;
         Ok(())
@@ -797,6 +842,18 @@ pub fn set_transform(project: &mut Project, clip: ClipId, t: Transform) -> Resul
 }
 
 /// 片段要在视频轨上（画面属性和关键帧只对视频轨有意义）。
+/// 视频轨或字幕轨上的片段（能改位置、大小、打画面关键帧的）。
+fn ensure_visual(project: &Project, clip: ClipId) -> Result<(), EditError> {
+    let (track, _) = project
+        .timeline
+        .find_clip(clip)
+        .ok_or(EditError::ClipNotFound(clip))?;
+    match project.timeline.track(track).map(|t| t.kind) {
+        Some(TrackKind::Video | TrackKind::Subtitle) => Ok(()),
+        _ => Err(EditError::WrongTrackKind),
+    }
+}
+
 fn ensure_video(project: &Project, clip: ClipId) -> Result<(), EditError> {
     let (track, _) = project
         .timeline
@@ -809,7 +866,7 @@ fn ensure_video(project: &Project, clip: ClipId) -> Result<(), EditError> {
     }
 }
 
-/// 设置片段的调色（剪映「调整」）。
+/// 设置片段的调色（剪映「调整」）；整套换掉（滤镜、重置），调色关键帧一起清掉。
 ///
 /// # Errors
 /// 片段不存在、不是视频轨上的片段、有超出 -1–1 或不是有限数的项。
@@ -824,6 +881,64 @@ pub fn set_adjust(
     ensure_video(project, clip)?;
     update_clip(project, clip, |c| {
         c.adjust = adjust;
+        for prop in crate::Prop::ADJUST {
+            c.animation.remove_between(prop, Time::ZERO, Time(i64::MAX));
+        }
+        Ok(())
+    })
+}
+
+/// 界面拖调色滑条走这里：有关键帧的项在 `at`（相对片段起点）新建或更新关键帧，其余改固定值。
+///
+/// # Errors
+/// 片段不存在、不是视频轨上的片段、有超出 -1–1 或不是有限数的项。
+pub fn apply_adjust_at(
+    project: &mut Project,
+    clip: ClipId,
+    at: Time,
+    adjust: crate::ColorAdjust,
+) -> Result<(), EditError> {
+    if !adjust.is_valid() {
+        return Err(EditError::InvalidValue);
+    }
+    ensure_video(project, clip)?;
+    update_clip(project, clip, |c| {
+        for prop in crate::Prop::ADJUST {
+            let Some(item) = prop.adjust_item() else {
+                continue;
+            };
+            let value = item.get(&adjust);
+            if c.animation.keys(prop).is_empty() {
+                item.set(&mut c.adjust, value);
+            } else {
+                c.animation.upsert(prop, at, value);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// 界面拖音量滑条走这里：有音量关键帧时在 `at`（相对片段起点）新建或更新关键帧，否则改固定值。
+/// 夹到 [`GAIN_RANGE_DB`]。
+///
+/// # Errors
+/// 片段不存在或数值不是有限数。
+pub fn apply_gain_at(
+    project: &mut Project,
+    clip: ClipId,
+    at: Time,
+    gain_db: f32,
+) -> Result<(), EditError> {
+    if !gain_db.is_finite() {
+        return Err(EditError::InvalidValue);
+    }
+    let db = gain_db.clamp(GAIN_RANGE_DB.0, GAIN_RANGE_DB.1);
+    update_clip(project, clip, |c| {
+        if c.animation.keys(crate::Prop::Volume).is_empty() {
+            c.gain_db = db;
+        } else {
+            c.animation.upsert(crate::Prop::Volume, at, db);
+        }
         Ok(())
     })
 }
@@ -929,6 +1044,10 @@ pub struct Attributes {
     pub animation: crate::Animation,
     /// 调色。
     pub adjust: crate::ColorAdjust,
+    /// 进阶调色。
+    pub grade: Option<Arc<crate::Grade>>,
+    /// 外观（混合模式、蒙版、描边…）。
+    pub look: crate::Look,
 }
 
 /// 复制属性（Ctrl+Shift+C）。
@@ -945,6 +1064,8 @@ pub fn copy_attributes(project: &Project, clip: ClipId) -> Result<Attributes, Ed
         transform: c.transform,
         animation: c.animation.clone(),
         adjust: c.adjust,
+        grade: c.grade.clone(),
+        look: c.look,
     })
 }
 
@@ -969,6 +1090,10 @@ pub fn paste_attributes(
             c.transform = attrs.transform;
             c.animation = attrs.animation.clone();
             c.adjust = attrs.adjust;
+            c.grade.clone_from(&attrs.grade);
+            if c.asset().is_some() {
+                c.look = attrs.look;
+            }
             Ok(())
         })?;
         n += 1;
@@ -998,6 +1123,41 @@ pub fn set_subtitle_style(
 /// # Errors
 /// 片段不存在、是字幕、倍数超出 0.1–10、变长后和后面的片段重叠（不在磁吸的主轨上时）。
 pub fn set_speed(project: &mut Project, clip: ClipId, speed: f32) -> Result<(), EditError> {
+    set_speed_with(project, clip, speed, None)
+}
+
+/// 曲线变速：套上曲线（`None` 去掉曲线、回到常规变速，长度不变）。用掉的素材长度不变，
+/// 片段长度按曲线的平均倍数换算（和 [`set_speed`] 一样，后面的片段跟着挪）。
+///
+/// # Errors
+/// 片段不存在、不是素材片段、曲线不合法、变长后压到同轨后面的片段（没开主轨磁吸时）。
+pub fn set_speed_curve(
+    project: &mut Project,
+    clip: ClipId,
+    curve: Option<crate::SpeedCurve>,
+) -> Result<(), EditError> {
+    let Some(curve) = curve else {
+        return update_clip(project, clip, |c| {
+            c.curve = None;
+            Ok(())
+        });
+    };
+    if !curve.is_valid() {
+        return Err(EditError::InvalidValue);
+    }
+    let mean = curve.mean().clamp(
+        crate::timeline::SPEED_RANGE.0,
+        crate::timeline::SPEED_RANGE.1,
+    );
+    set_speed_with(project, clip, mean, Some(curve))
+}
+
+fn set_speed_with(
+    project: &mut Project,
+    clip: ClipId,
+    speed: f32,
+    curve: Option<crate::SpeedCurve>,
+) -> Result<(), EditError> {
     if !(crate::timeline::SPEED_RANGE.0..=crate::timeline::SPEED_RANGE.1).contains(&speed) {
         return Err(EditError::InvalidValue);
     }
@@ -1023,6 +1183,8 @@ pub fn set_speed(project: &mut Project, clip: ClipId, speed: f32) -> Result<(), 
         let ratio = f64::from(old.1) / f64::from(speed);
         c.speed = speed;
         c.duration = duration;
+        // 常规变速去掉曲线
+        c.curve = curve;
         c.animation.scale_times(ratio);
         clamp_fades(&mut c);
         let delta = duration - old.0;
@@ -1190,7 +1352,7 @@ pub fn set_disabled(
 /// # Errors
 /// 片段不存在、不是视频轨上的片段。
 pub fn reset_transform(project: &mut Project, clip: ClipId) -> Result<(), EditError> {
-    ensure_video(project, clip)?;
+    ensure_visual(project, clip)?;
     update_clip(project, clip, |c| {
         c.transform = Transform::default();
         c.animation = crate::Animation::default();
@@ -1203,7 +1365,7 @@ pub fn reset_transform(project: &mut Project, clip: ClipId) -> Result<(), EditEr
 /// # Errors
 /// 片段不存在、不是视频轨上的片段。
 pub fn add_keyframe(project: &mut Project, clip: ClipId, at: Time) -> Result<(), EditError> {
-    ensure_video(project, clip)?;
+    ensure_visual(project, clip)?;
     update_clip(project, clip, |c| {
         let now = c.transform_at(at);
         for prop in crate::Prop::TRANSFORM {
@@ -1223,11 +1385,21 @@ pub fn add_keyframe_props(
     at: Time,
     props: &[crate::Prop],
 ) -> Result<(), EditError> {
-    ensure_video(project, clip)?;
+    if props
+        .iter()
+        .any(|p| !p.is_transform() && *p != crate::Prop::Volume)
+    {
+        ensure_video(project, clip)?;
+    } else if props.iter().any(|p| p.is_transform()) {
+        ensure_visual(project, clip)?;
+    }
     update_clip(project, clip, |c| {
-        let now = c.transform_at(at);
-        for prop in props {
-            c.animation.upsert(*prop, at, prop.get(&now));
+        if props.contains(&crate::Prop::Volume) && c.asset().is_none() {
+            return Err(EditError::WrongTrackKind);
+        }
+        let now: Vec<f32> = props.iter().map(|p| c.value_at(*p, at)).collect();
+        for (prop, value) in props.iter().zip(now) {
+            c.animation.upsert(*prop, at, value);
         }
         Ok(())
     })
@@ -1244,13 +1416,13 @@ pub fn remove_keyframe_props(
     props: &[crate::Prop],
 ) -> Result<(), EditError> {
     update_clip(project, clip, |c| {
-        let now = c.transform_at(at);
+        let now: Vec<f32> = props.iter().map(|p| c.value_at(*p, at)).collect();
         if !c.animation.remove_props_at(props, at) {
             return Err(EditError::NoKeyframe);
         }
-        for prop in props {
+        for (prop, value) in props.iter().zip(now) {
             if c.animation.keys(*prop).is_empty() {
-                prop.set(&mut c.transform, prop.get(&now));
+                c.set_base(*prop, value);
             }
         }
         Ok(())
@@ -1271,7 +1443,7 @@ pub fn apply_transform_at(
     if !t.is_valid() {
         return Err(EditError::InvalidValue);
     }
-    ensure_video(project, clip)?;
+    ensure_visual(project, clip)?;
     update_clip(project, clip, |c| {
         for prop in crate::Prop::TRANSFORM {
             let value = prop.get(&t);
@@ -1285,21 +1457,13 @@ pub fn apply_transform_at(
     })
 }
 
-/// 删掉片段内 `at` 时刻的关键帧。删完一个都不剩时，固定值取删之前那一刻的值，画面不跳。
+/// 删掉片段内 `at` 时刻画面属性的关键帧（调色、音量的不动）。某个属性删光了，
+/// 固定值取删之前那一刻的值，画面不跳。
 ///
 /// # Errors
-/// 片段不存在、那一刻没有关键帧。
+/// 片段不存在、那一刻没有画面属性的关键帧。
 pub fn remove_keyframe(project: &mut Project, clip: ClipId, at: Time) -> Result<(), EditError> {
-    update_clip(project, clip, |c| {
-        let now = c.transform_at(at);
-        if !c.animation.remove_at(at) {
-            return Err(EditError::NoKeyframe);
-        }
-        if c.animation.is_empty() {
-            c.transform = now;
-        }
-        Ok(())
-    })
+    remove_keyframe_props(project, clip, at, &crate::Prop::TRANSFORM)
 }
 
 /// 设置片段内 `at` 时刻关键帧的缓动（作用在它到下一个关键帧这一段）。
@@ -1310,15 +1474,294 @@ pub fn set_keyframe_easing(
     project: &mut Project,
     clip: ClipId,
     at: Time,
+    props: &[crate::Prop],
     easing: crate::Easing,
 ) -> Result<(), EditError> {
     update_clip(project, clip, |c| {
-        if c.animation.set_easing(at, easing) {
+        if c.animation.set_easing_of(props, at, easing) {
             Ok(())
         } else {
             Err(EditError::NoKeyframe)
         }
     })
+}
+
+/// 把音频素材放在 `start`（录音）：放进第一条那段时间空着的音频轨，都占了就新建一条。返回新片段。
+///
+/// # Errors
+/// 素材不存在、没有声音、长度为零。
+pub fn place_audio(
+    project: &mut Project,
+    asset: AssetId,
+    start: Time,
+) -> Result<ClipId, EditError> {
+    let len = project
+        .assets
+        .get(&asset)
+        .ok_or(EditError::AssetNotFound(asset))?
+        .duration;
+    let end = start + len;
+    let free = project
+        .timeline
+        .tracks
+        .iter()
+        .find(|t| t.kind == TrackKind::Audio && !t.locked && t.is_free(start, end, &[]))
+        .map(|t| t.id);
+    let track = match free {
+        Some(t) => t,
+        None => add_track(project, TrackKind::Audio)?,
+    };
+    insert_asset_at(project, asset, track, start)
+}
+
+/// 设置片段的进阶调色（HSL、曲线、色轮、LUT）；`None` 或什么都没调时清掉。
+///
+/// # Errors
+/// 片段不存在、不是视频轨上的片段、数值超出范围。
+pub fn set_grade(
+    project: &mut Project,
+    clip: ClipId,
+    grade: Option<crate::Grade>,
+) -> Result<(), EditError> {
+    if grade.as_ref().is_some_and(|g| !g.is_valid()) {
+        return Err(EditError::InvalidValue);
+    }
+    ensure_video(project, clip)?;
+    update_clip(project, clip, |c| {
+        c.grade = grade.filter(|g| !g.is_identity()).map(Arc::new);
+        Ok(())
+    })
+}
+
+/// 设置片段的外观（混合模式、圆角、描边、阴影、蒙版、色度抠图）。
+///
+/// # Errors
+/// 片段不存在、不是视频轨上的媒体片段、数值超出范围。
+pub fn set_look(project: &mut Project, clip: ClipId, look: crate::Look) -> Result<(), EditError> {
+    if !look.is_valid() {
+        return Err(EditError::InvalidValue);
+    }
+    ensure_video(project, clip)?;
+    update_clip(project, clip, |c| {
+        if c.asset().is_none() {
+            return Err(EditError::WrongTrackKind);
+        }
+        c.look = look;
+        Ok(())
+    })
+}
+
+/// 倒放：片段换成 `reversed` 这个素材（片段原来用的那一段倒着生成的文件，长度等于用掉的素材长度），
+/// 从它开头取；记下原来的素材，[`unreverse_clip`] 换回去。位置、长度、变速、属性都不变。
+///
+/// # Errors
+/// 片段不存在、不是素材片段、已经倒放过、素材不存在或不够长。
+pub fn reverse_clip(
+    project: &mut Project,
+    clip: ClipId,
+    reversed: AssetId,
+) -> Result<(), EditError> {
+    let (_, c) = project
+        .timeline
+        .find_clip(clip)
+        .ok_or(EditError::ClipNotFound(clip))?;
+    let ClipContent::Media { asset, source_in } = c.content else {
+        return Err(EditError::WrongTrackKind);
+    };
+    if c.reversed.is_some() {
+        return Err(EditError::InvalidValue);
+    }
+    let span = c.source_span();
+    let limit = project
+        .assets
+        .get(&reversed)
+        .ok_or(EditError::AssetNotFound(reversed))?
+        .source_limit();
+    // 生成的文件可能比要的短一两帧（编码器取整）：差一帧以内也接受，片段终点夹进素材范围
+    let frame = min_len(project);
+    if limit + frame < span {
+        return Err(EditError::SourceTooShort);
+    }
+    update_clip(project, clip, |slot| {
+        slot.content = ClipContent::Media {
+            asset: reversed,
+            source_in: Time::ZERO,
+        };
+        slot.reversed = Some((asset, source_in));
+        if limit < span {
+            slot.duration = slot.duration.min(limit.scaled(1.0 / f64::from(slot.speed)));
+            clamp_fades(slot);
+        }
+        Ok(())
+    })
+}
+
+/// 取消倒放：换回原来的素材和素材内起点。
+///
+/// # Errors
+/// 片段不存在、没有倒放过。
+pub fn unreverse_clip(project: &mut Project, clip: ClipId) -> Result<(), EditError> {
+    update_clip(project, clip, |c| {
+        let (asset, source_in) = c.reversed.take().ok_or(EditError::InvalidValue)?;
+        c.content = ClipContent::Media { asset, source_in };
+        Ok(())
+    })
+}
+
+/// 给片段标颜色（剪映右键菜单的色点）；`None` 去掉颜色。
+///
+/// # Errors
+/// 任一片段不存在、颜色超出 [`crate::timeline::LABEL_COLORS`]。
+pub fn set_label(
+    project: &mut Project,
+    clips: &[ClipId],
+    label: Option<u8>,
+) -> Result<(), EditError> {
+    if label.is_some_and(|l| l >= crate::timeline::LABEL_COLORS) {
+        return Err(EditError::InvalidValue);
+    }
+    for &c in clips {
+        update_clip(project, c, |clip| {
+            clip.label = label;
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+/// 替换片段（剪映「替换片段」）：换成另一个素材，位置、长度、变速和所有属性都不变。
+/// 原来的素材内起点放得下就保留，否则从新素材开头取。
+///
+/// # Errors
+/// 片段不存在、不是素材片段、素材不存在、素材放不到这条轨道上、素材不够长（[`EditError::SourceTooShort`]）。
+pub fn replace_asset(project: &mut Project, clip: ClipId, asset: AssetId) -> Result<(), EditError> {
+    let (track, c) = project
+        .timeline
+        .find_clip(clip)
+        .ok_or(EditError::ClipNotFound(clip))?;
+    let kind = project
+        .timeline
+        .track(track)
+        .ok_or(EditError::TrackNotFound(track))?
+        .kind;
+    let ClipContent::Media { source_in, .. } = c.content else {
+        return Err(EditError::WrongTrackKind);
+    };
+    let limit = project
+        .assets
+        .get(&asset)
+        .ok_or(EditError::AssetNotFound(asset))?
+        .source_limit();
+    let content = ClipContent::Media {
+        asset,
+        source_in: Time::ZERO,
+    };
+    if !fits(project, &content, kind) {
+        return Err(EditError::WrongTrackKind);
+    }
+    let span = c.source_span();
+    let source_in = if source_in + span <= limit {
+        source_in
+    } else if span <= limit {
+        Time::ZERO
+    } else {
+        return Err(EditError::SourceTooShort);
+    };
+    update_clip(project, clip, |slot| {
+        slot.content = ClipContent::Media { asset, source_in };
+        Ok(())
+    })
+}
+
+/// 设入点（I）在 `at`，见 [`Timeline::set_in_point`]。
+///
+/// # Errors
+/// `at` 不在时间轴末尾之前（或在出点之后且没有内容可以放出点）。
+pub fn set_in_point(project: &mut Project, at: Time) -> Result<(), EditError> {
+    let end = project.timeline.duration();
+    if project.timeline.set_in_point(at, end) {
+        Ok(())
+    } else {
+        Err(EditError::ZeroLength)
+    }
+}
+
+/// 设出点（O）在 `at`，见 [`Timeline::set_out_point`]。
+///
+/// # Errors
+/// `at` 不在入点之后。
+pub fn set_out_point(project: &mut Project, at: Time) -> Result<(), EditError> {
+    if project.timeline.set_out_point(at) {
+        Ok(())
+    } else {
+        Err(EditError::ZeroLength)
+    }
+}
+
+/// 以片段选定区域（Shift+X）：区域设成这些片段从最早的起点到最晚的终点。
+///
+/// # Errors
+/// 没有片段或有片段不存在。
+pub fn range_from_clips(project: &mut Project, clips: &[ClipId]) -> Result<(), EditError> {
+    let mut span: Option<(Time, Time)> = None;
+    for &id in clips {
+        let (_, c) = project
+            .timeline
+            .find_clip(id)
+            .ok_or(EditError::ClipNotFound(id))?;
+        span = Some(span.map_or_else(
+            || (c.start, c.end()),
+            |(a, b)| (a.min(c.start), b.max(c.end())),
+        ));
+    }
+    project.timeline.range = Some(span.ok_or(EditError::ZeroLength)?);
+    Ok(())
+}
+
+/// 只留下时间轴上 `[from, to)` 这一段，整体挪到从 0 开始（导出选定区域用）。
+/// 跨过边界的片段在边界处切开，标记跟着挪，区域清掉。
+///
+/// # Errors
+/// `from >= to`。
+pub fn extract_range(project: &Project, from: Time, to: Time) -> Result<Project, EditError> {
+    if from >= to {
+        return Err(EditError::ZeroLength);
+    }
+    let mut out = project.clone();
+    for at in [from, to] {
+        let crossing: Vec<ClipId> = out
+            .timeline
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .filter(|c| c.start < at && at < c.end())
+            .map(|c| c.id)
+            .collect();
+        for c in crossing {
+            split_at(&mut out, c, at)?;
+        }
+    }
+    for track in &mut out.timeline.tracks {
+        track.clips.retain(|c| c.start >= from && c.end() <= to);
+        for c in &mut track.clips {
+            let mut moved = (**c).clone();
+            moved.start -= from;
+            *c = Arc::new(moved);
+        }
+    }
+    out.timeline.markers = out
+        .timeline
+        .markers
+        .iter()
+        .filter(|m| **m >= from && **m < to)
+        .map(|m| *m - from)
+        .collect();
+    out.timeline.range = None;
+    // 封面帧跟着挪；落在区域外面就不要了
+    if let Some(crate::Cover::Frame(t)) = out.timeline.cover {
+        out.timeline.cover = (t >= from && t < to).then(|| crate::Cover::Frame(t - from));
+    }
+    Ok(out)
 }
 
 /// 调节片段的默认长度（剪映「自定义调节」是 3 秒）。
@@ -1367,6 +1810,11 @@ pub fn add_adjustment(
         transition_in: None,
         speed: 1.0,
         keep_pitch: true,
+        label: None,
+        look: crate::Look::NONE,
+        reversed: None,
+        curve: None,
+        grade: None,
     };
     let ti = track_index(&next.timeline, track)?;
     next.timeline.tracks[ti].insert_sorted(Arc::new(clip));
@@ -1405,6 +1853,7 @@ pub fn add_subtitle(
         content: ClipContent::Subtitle {
             text,
             motion: crate::TextMotion::default(),
+            style: None,
         },
         gain_db: 0.0,
         fade_in: Time::ZERO,
@@ -1416,6 +1865,11 @@ pub fn add_subtitle(
         transition_in: None,
         speed: 1.0,
         keep_pitch: true,
+        label: None,
+        look: crate::Look::NONE,
+        reversed: None,
+        curve: None,
+        grade: None,
     };
     project.timeline.tracks[ti].insert_sorted(Arc::new(clip));
     Ok(id)
@@ -1436,6 +1890,32 @@ pub fn set_text_motion(
             let mut c = (*tl.tracks[ti].clips[ci]).clone();
             match &mut c.content {
                 ClipContent::Subtitle { motion: m, .. } => *m = motion,
+                _ => return Err(EditError::WrongTrackKind),
+            }
+            tl.tracks[ti].clips[ci] = Arc::new(c);
+        }
+        Ok(())
+    })
+}
+
+/// 给几条字幕设自己的样式（剪映关掉「应用到全部字幕」再改）；`None` 回到工程的字幕样式。
+///
+/// # Errors
+/// 片段不存在、不是字幕、样式不合法。
+pub fn set_own_subtitle_style(
+    project: &mut Project,
+    clips: &[ClipId],
+    own: Option<&crate::SubtitleStyle>,
+) -> Result<(), EditError> {
+    if own.is_some_and(|s| !s.is_valid()) {
+        return Err(EditError::InvalidValue);
+    }
+    with_timeline(project, |_, tl| {
+        for &id in clips {
+            let (ti, ci) = locate(tl, id)?;
+            let mut c = (*tl.tracks[ti].clips[ci]).clone();
+            match &mut c.content {
+                ClipContent::Subtitle { style, .. } => *style = own.cloned(),
                 _ => return Err(EditError::WrongTrackKind),
             }
             tl.tracks[ti].clips[ci] = Arc::new(c);
@@ -1900,11 +2380,49 @@ mod tests {
     }
 
     #[test]
+    fn subtitles_get_their_own_style_position_and_keyframes() {
+        let (mut p, ids) = sample_project();
+        let mut big = p.subtitle_style.clone();
+        big.size_ratio = 0.1;
+        set_own_subtitle_style(&mut p, &[ids.s1], Some(&big)).unwrap();
+        assert_eq!(clip(&p, ids.s1).own_subtitle_style(), Some(&big));
+        assert_eq!(
+            set_own_subtitle_style(&mut p, &[ids.v1], Some(&big)),
+            Err(EditError::WrongTrackKind)
+        );
+        set_own_subtitle_style(&mut p, &[ids.s1], None).unwrap();
+        assert_eq!(clip(&p, ids.s1).own_subtitle_style(), None);
+        // 位置、大小和关键帧
+        add_keyframe_props(&mut p, ids.s1, Time::ZERO, &[crate::Prop::Y]).unwrap();
+        let up = Transform {
+            y: -0.3,
+            scale: 1.5,
+            ..Transform::default()
+        };
+        apply_transform_at(&mut p, ids.s1, secs(1), up).unwrap();
+        let c = clip(&p, ids.s1);
+        assert!((c.transform_at(secs(1)).y + 0.3).abs() < 1e-6);
+        assert!(
+            (c.transform.scale - 1.5).abs() < 1e-6,
+            "缩放没打关键帧：改的是固定值"
+        );
+        let st = crate::text_state(&c, secs(1));
+        assert!((st.y + 0.3).abs() < 1e-6 && (st.scale - 1.5).abs() < 1e-6);
+        // 音频片段还是不行
+        assert_eq!(
+            add_keyframe_props(&mut p, ids.a1, Time::ZERO, &[crate::Prop::Y]),
+            Err(EditError::WrongTrackKind)
+        );
+        assert_valid(&p);
+    }
+
+    #[test]
     fn text_motion_only_on_subtitles() {
         let (mut p, ids) = sample_project();
         let m = crate::TextMotion {
             intro: crate::TextIn::FadeIn,
             outro: crate::TextOut::SlideDown,
+            ..crate::TextMotion::default()
         };
         set_text_motion(&mut p, &[ids.s1], m).unwrap();
         assert_eq!(clip(&p, ids.s1).text_motion(), Some(m));
@@ -2060,7 +2578,7 @@ mod tests {
     }
 
     #[test]
-    fn set_transform_validates_and_targets_video_only() {
+    fn set_transform_validates_and_targets_video_and_subtitles() {
         let (mut p, ids) = sample_project();
         let t = Transform {
             x: 0.25,
@@ -2074,10 +2592,9 @@ mod tests {
             set_transform(&mut p, ids.a1, t),
             Err(EditError::WrongTrackKind)
         );
-        assert_eq!(
-            set_transform(&mut p, ids.s1, t),
-            Err(EditError::WrongTrackKind)
-        );
+        // 字幕也有位置、大小（剪映文字的「位置大小」）
+        set_transform(&mut p, ids.s1, t).unwrap();
+        assert_eq!(clip(&p, ids.s1).transform, t);
         let bad = Transform {
             scale: 0.0,
             ..Transform::default()
@@ -2175,13 +2692,26 @@ mod tests {
     fn keyframe_easing_and_reset() {
         let (mut p, ids) = sample_project();
         add_keyframe(&mut p, ids.v1, Time::ZERO).unwrap();
-        set_keyframe_easing(&mut p, ids.v1, Time::ZERO, crate::Easing::Linear).unwrap();
+        set_keyframe_easing(
+            &mut p,
+            ids.v1,
+            Time::ZERO,
+            &crate::Prop::TRANSFORM,
+            crate::Easing::Linear,
+        )
+        .unwrap();
         assert_eq!(
             clip(&p, ids.v1).animation.easing_at(Time::ZERO),
             Some(crate::Easing::Linear)
         );
         assert_eq!(
-            set_keyframe_easing(&mut p, ids.v1, Time::from_secs(3), crate::Easing::Linear),
+            set_keyframe_easing(
+                &mut p,
+                ids.v1,
+                Time::from_secs(3),
+                &crate::Prop::TRANSFORM,
+                crate::Easing::Linear
+            ),
             Err(EditError::NoKeyframe)
         );
         // 重置：画面属性回默认，动画清掉
@@ -2208,7 +2738,7 @@ mod tests {
         add_keyframe(p, id, from).unwrap();
         apply_transform_at(p, id, from, at(a)).unwrap();
         apply_transform_at(p, id, to, at(b)).unwrap();
-        set_keyframe_easing(p, id, from, crate::Easing::Linear).unwrap();
+        set_keyframe_easing(p, id, from, &crate::Prop::TRANSFORM, crate::Easing::Linear).unwrap();
     }
 
     #[test]
@@ -2712,6 +3242,343 @@ mod tests {
         add_keyframe(&mut p, ids.v2, secs(2)).unwrap();
         set_speed(&mut p, ids.v2, 2.0).unwrap();
         assert_eq!(clip(&p, ids.v2).animation.times(), [secs(1)]);
+    }
+
+    #[test]
+    fn colour_keyframes_animate_the_adjustment() {
+        let (mut p, ids) = sample_project();
+        let warm = crate::ColorAdjust {
+            temperature: 0.8,
+            ..crate::ColorAdjust::NONE
+        };
+        // 色温这一项：0 秒不调，2 秒偏暖；其余项还是固定值
+        add_keyframe_props(&mut p, ids.v1, secs(0), &[crate::Prop::Temperature]).unwrap();
+        apply_adjust_at(&mut p, ids.v1, secs(2), warm).unwrap();
+        set_keyframe_easing(
+            &mut p,
+            ids.v1,
+            secs(0),
+            &[crate::Prop::Temperature],
+            crate::Easing::Linear,
+        )
+        .unwrap();
+        let c = clip(&p, ids.v1);
+        assert!(c.adjust_at(secs(0)).temperature.abs() < 1e-6);
+        assert!((c.adjust_at(Time::from_secs_f64(1.0)).temperature - 0.4).abs() < 1e-5);
+        assert!((c.adjust_at(secs(3)).temperature - 0.8).abs() < 1e-6);
+        assert!(
+            c.transform_at(secs(1)).is_default(),
+            "调色关键帧不影响画面属性"
+        );
+        assert_eq!(c.animation.times_of(&crate::Prop::TRANSFORM), []);
+        // 没打关键帧的项改的是固定值
+        let bright = crate::ColorAdjust {
+            brightness: 0.5,
+            temperature: 0.8,
+            ..crate::ColorAdjust::NONE
+        };
+        apply_adjust_at(&mut p, ids.v1, secs(2), bright).unwrap();
+        assert!((clip(&p, ids.v1).adjust.brightness - 0.5).abs() < 1e-6);
+        assert_eq!(clip(&p, ids.v1).animation.keys(crate::Prop::Brightness), []);
+        // 画面的 ◆（全部画面属性）不碰调色关键帧
+        add_keyframe(&mut p, ids.v1, secs(1)).unwrap();
+        remove_keyframe(&mut p, ids.v1, secs(1)).unwrap();
+        assert_eq!(
+            clip(&p, ids.v1)
+                .animation
+                .keys(crate::Prop::Temperature)
+                .len(),
+            2
+        );
+        // 删掉最后的色温关键帧：固定值取那一刻的值，画面不跳
+        remove_keyframe_props(&mut p, ids.v1, secs(0), &[crate::Prop::Temperature]).unwrap();
+        remove_keyframe_props(&mut p, ids.v1, secs(2), &[crate::Prop::Temperature]).unwrap();
+        assert!((clip(&p, ids.v1).adjust.temperature - 0.8).abs() < 1e-6);
+        assert!(clip(&p, ids.v1).animation.is_empty());
+        // 整套换掉（滤镜、重置）清掉调色关键帧
+        add_keyframe_props(&mut p, ids.v1, secs(0), &[crate::Prop::Tint]).unwrap();
+        set_adjust(&mut p, ids.v1, crate::ColorAdjust::NONE).unwrap();
+        assert!(clip(&p, ids.v1).animation.is_empty());
+        assert_valid(&p);
+    }
+
+    #[test]
+    fn volume_keyframes_work_on_audio_clips() {
+        let (mut p, ids) = sample_project();
+        add_keyframe_props(&mut p, ids.a1, secs(0), &[crate::Prop::Volume]).unwrap();
+        apply_gain_at(&mut p, ids.a1, secs(2), -20.0).unwrap();
+        let c = clip(&p, ids.a1);
+        assert!(c.gain_db_at(secs(0)).abs() < 1e-6);
+        assert!((c.gain_db_at(secs(2)) + 20.0).abs() < 1e-6);
+        assert!(c.gain_db.abs() < 1e-6, "有关键帧时固定值不动");
+        // 夹到范围里
+        apply_gain_at(&mut p, ids.a1, secs(2), -200.0).unwrap();
+        assert!((clip(&p, ids.a1).gain_db_at(secs(2)) + 60.0).abs() < 1e-6);
+        assert_eq!(
+            apply_gain_at(&mut p, ids.a1, secs(2), f32::NAN),
+            Err(EditError::InvalidValue)
+        );
+        // 音频片段不能打调色关键帧；字幕不能打音量关键帧
+        assert_eq!(
+            add_keyframe_props(&mut p, ids.a1, secs(0), &[crate::Prop::Brightness]),
+            Err(EditError::WrongTrackKind)
+        );
+        assert_eq!(
+            add_keyframe_props(&mut p, ids.s1, secs(0), &[crate::Prop::Volume]),
+            Err(EditError::WrongTrackKind)
+        );
+        // 分割：两半各自接得上
+        let right = split_at(&mut p, ids.a1, secs(1)).unwrap();
+        assert!(
+            (clip(&p, right).gain_db_at(Time::ZERO) - clip(&p, ids.a1).gain_db_at(secs(1))).abs()
+                < 1e-4
+        );
+        assert_valid(&p);
+    }
+
+    #[test]
+    fn speed_curve_keeps_the_source_and_maps_time_by_the_curve() {
+        let (mut p, ids) = sample_project();
+        p.settings.main_magnet = false;
+        let before = clip(&p, ids.v2);
+        let span = before.source_span();
+        let curve = crate::CurvePreset::FlashIn.curve();
+        let mean = curve.mean();
+        set_speed_curve(&mut p, ids.v2, Some(curve)).unwrap();
+        let c = clip(&p, ids.v2);
+        assert!((c.speed - mean).abs() < 1e-6);
+        assert!(
+            (c.source_span() - span).0.abs() <= Time::from_millis(40).0,
+            "用掉的素材不变"
+        );
+        // 闪进：前面快，素材进度跑在时间前面
+        let quarter = Time(c.duration.0 / 4);
+        let progress = (c.source_at(quarter) - c.source_in()).as_secs_f64() / span.as_secs_f64();
+        assert!(progress > 0.4, "{progress}");
+        assert!(c.speed_at(Time::ZERO) > c.speed_at(c.duration));
+        // 声音按 16 段切，各段接得上、合起来正好是用掉的素材
+        let s = crate::compose::audio_span(&p, ids.v2).unwrap();
+        let pieces = crate::compose::audio_pieces(&c, &s);
+        assert_eq!(pieces.len(), 16);
+        for w in pieces.windows(2) {
+            assert_eq!(w[0].start + w[0].len, w[1].start);
+        }
+        assert!(pieces[0].speed > pieces[15].speed);
+        // 分割：两半接得上
+        let at = c.start + Time(c.duration.0 / 2);
+        let mid = c.source_at(at - c.start);
+        let right = split_at(&mut p, ids.v2, at).unwrap();
+        assert!((clip(&p, right).source_in() - mid).0.abs() <= 1);
+        let l = clip(&p, ids.v2);
+        assert!((l.source_at(l.duration) - mid).0.abs() <= Time::from_millis(2).0);
+        assert_valid(&p);
+        // 常规变速去掉曲线
+        set_speed(&mut p, right, 1.0).unwrap();
+        assert!(clip(&p, right).curve.is_none());
+    }
+
+    #[test]
+    fn recordings_go_on_a_free_audio_track() {
+        let (mut p, ids) = sample_project();
+        let audio_tracks = |q: &Project| {
+            q.timeline
+                .tracks
+                .iter()
+                .filter(|t| t.kind == TrackKind::Audio)
+                .count()
+        };
+        let before = audio_tracks(&p);
+        // 音频轨在 0 秒已经有 bgm：放在 0 秒要新建一条
+        let rec = p.add_asset(Asset {
+            id: AssetId(0),
+            name: "录音".into(),
+            path: "rec.wav".into(),
+            duration: secs(2),
+            video: None,
+            audio: p.assets[&ids.audio_asset].audio,
+        });
+        let c = place_audio(&mut p, rec, Time::ZERO).unwrap();
+        assert_eq!(audio_tracks(&p), before + 1);
+        assert_eq!(clip(&p, c).start, Time::ZERO);
+        // 新的那条在 30 秒还空着：不用再建
+        let c2 = place_audio(&mut p, rec, secs(30)).unwrap();
+        assert_eq!(audio_tracks(&p), before + 1);
+        assert_eq!(clip(&p, c2).start, secs(30));
+        assert_valid(&p);
+    }
+
+    #[test]
+    fn reversing_swaps_the_source_and_back() {
+        let (mut p, ids) = sample_project();
+        let before = clip(&p, ids.v2);
+        let span = before.source_span();
+        let rev = p.add_asset(Asset {
+            id: AssetId(0),
+            name: "倒放 · clip.mp4".into(),
+            path: "rev.mp4".into(),
+            duration: span,
+            video: p.assets[&ids.video_asset].video,
+            audio: p.assets[&ids.video_asset].audio,
+        });
+        reverse_clip(&mut p, ids.v2, rev).unwrap();
+        let r = clip(&p, ids.v2);
+        assert_eq!((r.asset(), r.source_in()), (Some(rev), Time::ZERO));
+        assert_eq!((r.start, r.duration), (before.start, before.duration));
+        assert_eq!(r.reversed, Some((ids.video_asset, before.source_in())));
+        assert_eq!(
+            reverse_clip(&mut p, ids.v2, rev),
+            Err(EditError::InvalidValue),
+            "不能倒两次"
+        );
+        unreverse_clip(&mut p, ids.v2).unwrap();
+        assert_eq!(clip(&p, ids.v2), before);
+        assert_eq!(unreverse_clip(&mut p, ids.v2), Err(EditError::InvalidValue));
+        assert_eq!(
+            reverse_clip(&mut p, ids.s1, rev),
+            Err(EditError::WrongTrackKind)
+        );
+        assert_valid(&p);
+    }
+
+    #[test]
+    fn colour_labels_are_checked_and_stored() {
+        let (mut p, ids) = sample_project();
+        set_label(&mut p, &[ids.v1, ids.a1], Some(3)).unwrap();
+        assert_eq!(clip(&p, ids.v1).label, Some(3));
+        assert_eq!(clip(&p, ids.a1).label, Some(3));
+        assert_eq!(
+            set_label(&mut p, &[ids.v1], Some(8)),
+            Err(EditError::InvalidValue)
+        );
+        set_label(&mut p, &[ids.v1], None).unwrap();
+        assert_eq!(clip(&p, ids.v1).label, None);
+        // 分割后两半颜色一样
+        set_label(&mut p, &[ids.v2], Some(1)).unwrap();
+        let right = split_at(&mut p, ids.v2, secs(6)).unwrap();
+        assert_eq!(clip(&p, right).label, Some(1));
+        assert_valid(&p);
+    }
+
+    #[test]
+    fn replacing_keeps_position_length_and_attributes() {
+        let (mut p, ids) = sample_project();
+        let other = p.add_asset(Asset {
+            id: AssetId(0),
+            name: "b.mp4".into(),
+            path: "b.mp4".into(),
+            duration: secs(20),
+            video: p.assets[&ids.video_asset].video,
+            audio: p.assets[&ids.video_asset].audio,
+        });
+        set_adjust(&mut p, ids.v2, crate::FILTERS[3].adjust).unwrap();
+        let before = clip(&p, ids.v2);
+        replace_asset(&mut p, ids.v2, other).unwrap();
+        let after = clip(&p, ids.v2);
+        assert_eq!(after.asset(), Some(other));
+        assert_eq!(
+            (after.start, after.duration),
+            (before.start, before.duration)
+        );
+        assert_eq!(
+            after.source_in(),
+            before.source_in(),
+            "放得下就保留素材内起点"
+        );
+        assert_eq!(after.adjust, before.adjust);
+        // 太短的素材换不上；放不下原起点时从头取
+        let short = p.add_asset(Asset {
+            id: AssetId(0),
+            name: "c.mp4".into(),
+            path: "c.mp4".into(),
+            duration: Time::from_millis(500),
+            video: p.assets[&ids.video_asset].video,
+            audio: None,
+        });
+        assert_eq!(
+            replace_asset(&mut p, ids.v2, short),
+            Err(EditError::SourceTooShort)
+        );
+        let tight = p.add_asset(Asset {
+            id: AssetId(0),
+            name: "d.mp4".into(),
+            path: "d.mp4".into(),
+            duration: clip(&p, ids.v2).source_span(),
+            video: p.assets[&ids.video_asset].video,
+            audio: None,
+        });
+        replace_asset(&mut p, ids.v2, tight).unwrap();
+        assert_eq!(clip(&p, ids.v2).source_in(), Time::ZERO);
+        // 没声音的素材放不到音频轨；字幕不能替换
+        assert_eq!(
+            replace_asset(&mut p, ids.a1, tight),
+            Err(EditError::WrongTrackKind)
+        );
+        assert_eq!(
+            replace_asset(&mut p, ids.s1, other),
+            Err(EditError::WrongTrackKind)
+        );
+        assert_valid(&p);
+    }
+
+    #[test]
+    fn in_out_points_make_a_range() {
+        let (mut p, ids) = sample_project();
+        let end = p.timeline.duration();
+        set_in_point(&mut p, secs(2)).unwrap();
+        assert_eq!(
+            p.timeline.range,
+            Some((secs(2), end)),
+            "只有入点时出点在末尾"
+        );
+        set_out_point(&mut p, secs(4)).unwrap();
+        assert_eq!(p.timeline.range, Some((secs(2), secs(4))));
+        // 入点放到出点后面：出点退回末尾
+        set_in_point(&mut p, secs(5)).unwrap();
+        assert_eq!(p.timeline.range, Some((secs(5), end)));
+        // 出点放到入点前面：入点退回开头
+        set_out_point(&mut p, secs(1)).unwrap();
+        assert_eq!(p.timeline.range, Some((Time::ZERO, secs(1))));
+        assert_eq!(
+            set_out_point(&mut p, Time::ZERO),
+            Err(EditError::ZeroLength)
+        );
+        assert_eq!(set_in_point(&mut p, end), Err(EditError::ZeroLength));
+        range_from_clips(&mut p, &[ids.v2, ids.a1]).unwrap();
+        let (v2, a1) = (clip(&p, ids.v2), clip(&p, ids.a1));
+        assert_eq!(
+            p.timeline.range,
+            Some((v2.start.min(a1.start), v2.end().max(a1.end())))
+        );
+    }
+
+    #[test]
+    fn extracting_a_range_cuts_and_shifts_everything() {
+        let (mut p, _) = sample_project();
+        p.timeline.toggle_marker(secs(3));
+        p.timeline.toggle_marker(secs(9));
+        let (from, to) = (secs(2), secs(6));
+        let part = extract_range(&p, from, to).unwrap();
+        assert_eq!(part.timeline.duration(), to - from);
+        assert_eq!(part.timeline.markers, [secs(1)]);
+        assert_eq!(part.timeline.range, None);
+        assert!(part.timeline.check_invariants(&part.assets).is_ok());
+        // 里面每一刻和原来那一刻放的是同一处素材
+        for t in [2.0, 3.5, 4.99, 5.5] {
+            let at = Time::from_secs_f64(t);
+            let src = |q: &Project, when: Time| {
+                q.timeline
+                    .tracks
+                    .iter()
+                    .filter_map(|tr| tr.clip_at(when).filter(|c| c.asset().is_some()))
+                    .map(|c| (c.asset(), c.source_at(when - c.start)))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(src(&part, at - from), src(&p, at), "{t}");
+        }
+        assert_eq!(
+            extract_range(&p, to, from).map(|_| ()),
+            Err(EditError::ZeroLength)
+        );
     }
 
     #[test]

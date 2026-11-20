@@ -142,6 +142,28 @@ impl Workspace {
                     this.set_bound_text_motion(TextMotion { outro: v, ..motion }, window, cx);
                 }))
             }));
+        let looping =
+            h_flex()
+                .flex_wrap()
+                .gap_1()
+                .children(ve_core::TextLoop::ALL.iter().enumerate().map(|(i, &v)| {
+                    chrome::chip(
+                        SharedString::from(format!("text-loop-{i}")),
+                        v.label(),
+                        motion.looping == v,
+                        cx,
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_bound_text_motion(
+                            TextMotion {
+                                looping: v,
+                                ..motion
+                            },
+                            window,
+                            cx,
+                        );
+                    }))
+                }));
         v_flex()
             .id("insp-text-motion")
             .gap_3()
@@ -149,6 +171,8 @@ impl Workspace {
             .child(intro)
             .child(div().text_sm().text_color(muted).child("出场"))
             .child(outro)
+            .child(div().text_sm().text_color(muted).child("循环"))
+            .child(looping)
             .child(
                 Button::new("text-motion-all")
                     .compact()

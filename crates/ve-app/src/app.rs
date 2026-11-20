@@ -28,6 +28,7 @@ pub fn init(cx: &mut App) {
     gpui_kit::init(cx);
     theme::apply(cx);
     actions::bind_keys(cx);
+    crate::keymap::install(cx, None);
 }
 
 /// 命令行参数。
@@ -76,6 +77,8 @@ pub fn run() {
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx: &mut App| {
             init(cx);
+            // 改过的快捷键
+            crate::keymap::use_file(cx, crate::keymap::default_path());
             let engine = match Engine::new(EngineConfig::default()) {
                 Ok(e) => e,
                 Err(e) => {

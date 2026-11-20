@@ -146,6 +146,18 @@ pub mod palette {
     pub fn locked_veil() -> Hsla {
         rgba(0x1414_1470).into()
     }
+    /// 录音中的红点。
+    #[must_use]
+    pub fn recording() -> Hsla {
+        rgb(0xE5_484D).into()
+    }
+
+    /// 预览轴：橙色细线（和白色的播放头区分开）。
+    #[must_use]
+    pub fn preview_axis() -> Hsla {
+        rgb(0xF7_9009).into()
+    }
+
     /// 播放头（剪映是白色）。
     #[must_use]
     pub fn playhead() -> Hsla {

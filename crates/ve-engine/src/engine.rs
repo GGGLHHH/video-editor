@@ -103,6 +103,8 @@ pub(crate) struct Control {
     pub(crate) revision: u64,
     /// 播放倍数（J / K / L；负数倒放）。
     pub(crate) rate: f32,
+    /// 预览画面尺寸上限（剪映的「原画质 / 清晰画质」切换会改它）。
+    pub(crate) preview_max: ScaleTarget,
 }
 
 pub(crate) struct Queued {
@@ -232,6 +234,7 @@ impl Engine {
                 start: Time::ZERO,
                 revision: 0,
                 rate: 1.0,
+                preview_max: config.preview_max,
             }),
             wake: Condvar::new(),
             clock,
@@ -288,6 +291,30 @@ impl Engine {
             threads,
             _stream: stream,
         })
+    }
+
+    /// 改预览画面尺寸上限（画质切换）：解码器按新尺寸重开，当前画面重新渲染。
+    pub fn set_preview_max(&self, max: ScaleTarget) {
+        let mut c = self.shared.control();
+        if c.preview_max == max {
+            return;
+        }
+        c.preview_max = max;
+        c.revision += 1;
+        if c.playing {
+            self.shared.wake.notify_all();
+        } else {
+            let pos = self.shared.clock.position();
+            c.seek = Some(pos);
+            self.shared.bump(&mut c, pos);
+        }
+        drop(c);
+    }
+
+    /// 现在的预览画面尺寸上限。
+    #[must_use]
+    pub fn preview_max(&self) -> ScaleTarget {
+        self.shared.control().preview_max
     }
 
     /// 换工程（编辑后调用）。播放中则从当前位置继续，暂停则重新渲染当前画面。
@@ -522,6 +549,24 @@ mod tests {
     }
 
     #[test]
+    fn preview_size_can_change_while_open() {
+        let e = engine();
+        e.set_project(Arc::new(project_with(&[Fixture::FrameIndexed30]).0));
+        e.seek(Time::ZERO);
+        let full = wait_frame_at(&e, Time::ZERO).frame.unwrap();
+        assert_eq!((full.width, full.height), (64, 36));
+        // 清晰画质：画面按一半大小解码、合成
+        e.set_preview_max(ScaleTarget {
+            max_width: 32,
+            max_height: 18,
+        });
+        let small = wait_frame_at(&e, Time::ZERO).frame.unwrap();
+        assert_eq!((small.width, small.height), (32, 18));
+        assert!((gray(&small) - expected_gray(0)).abs() <= 2.0);
+        assert_eq!(e.preview_max().max_width, 32);
+    }
+
+    #[test]
     fn seek_delivers_exact_frame() {
         let e = engine();
         e.set_project(Arc::new(project_with(&[Fixture::FrameIndexed30]).0));
@@ -538,7 +583,8 @@ mod tests {
         let e = engine();
         e.set_project(Arc::new(project_with(&[Fixture::FrameIndexed30]).0));
         let events = e.events();
-        e.seek(Time::from_millis(500));
+        // 从 1.5 秒倒回去：并行跑测试时软件显卡要排队，留够出帧的时间
+        e.seek(Time::from_millis(1500));
         e.play_at_rate(-1.0);
         assert!((e.rate() + 1.0).abs() < f32::EPSILON);
         let mut times = Vec::new();

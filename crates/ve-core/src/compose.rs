@@ -5,7 +5,7 @@
 use crate::{AssetId, Clip, ClipId, Project, Time, Track, TrackId, Transform};
 
 /// 时间点上的一个画面图层。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LayerSource {
     /// 所在轨道。
     pub track: TrackId,
@@ -23,6 +23,11 @@ pub struct LayerSource {
     pub color: crate::ColorMatrix,
     /// 同一条轨上相邻的片段交替用 0 / 1：转场时前后两段同时出现，各用各的解码器。
     pub lane: u8,
+    /// 外观：混合模式、圆角、描边、阴影、蒙版、色度抠图。
+    pub look: crate::Look,
+    /// 整条调色链（片段自己的，再接上压在它上面的调节片段）；只在用到进阶调色（HSL、曲线、
+    /// 色轮、LUT）时才有，没有时按 [`Self::color`] 的矩阵调色。
+    pub grades: crate::GradeChain,
 }
 
 /// 时间点 `t` 上要合成的东西：各层画面和底色的调色。
@@ -32,6 +37,8 @@ pub struct Composition {
     pub layers: Vec<LayerSource>,
     /// 黑底要做的调色（调节片段会把没有画面的地方也调了）。
     pub background: crate::ColorMatrix,
+    /// 黑底的调色链（调节片段用了进阶调色时才有）。
+    pub background_grades: crate::GradeChain,
 }
 
 /// 时间点 `t` 上所有视频轨的画面，从最下层到最上层（合成顺序）。
@@ -47,6 +54,7 @@ pub fn resolve_frame(project: &Project, t: Time) -> Composition {
     let frame = project.settings.frame_rate.frame_duration();
     let mut out: Vec<LayerSource> = Vec::new();
     let mut background = crate::ColorMatrix::IDENTITY;
+    let mut background_grades: crate::GradeChain = Vec::new();
     for tr in project
         .timeline
         .video_tracks_bottom_up()
@@ -64,12 +72,18 @@ pub fn resolve_frame(project: &Project, t: Time) -> Composition {
             continue;
         }
         if clip.is_adjustment() {
-            let m = clip.adjust.matrix();
-            if !m.is_identity() {
+            let m = clip.adjust_at(t - clip.start).matrix();
+            if !m.is_identity() || clip.grade.is_some() {
+                let step = crate::GradeStep {
+                    matrix: m,
+                    grade: clip.grade.clone(),
+                };
                 for l in &mut out {
                     l.color = l.color.then(&m);
+                    l.grades.push(step.clone());
                 }
                 background = background.then(&m);
+                background_grades.push(step);
             }
             continue;
         }
@@ -77,9 +91,20 @@ pub fn resolve_frame(project: &Project, t: Time) -> Composition {
             out.push(layer);
         }
     }
+    // 整条链都没用进阶调色：只留矩阵（着色器走快的那条路）
+    let plain = |chain: &crate::GradeChain| chain.iter().all(|s| s.grade.is_none());
+    for l in &mut out {
+        if plain(&l.grades) {
+            l.grades.clear();
+        }
+    }
+    if plain(&background_grades) {
+        background_grades.clear();
+    }
     Composition {
         layers: out,
         background,
+        background_grades,
     }
 }
 
@@ -101,8 +126,13 @@ fn layer_of(
             .animation
             .max_value(crate::Prop::Scale)
             .map_or(clip.transform.scale, |m| m.max(clip.transform.scale)),
-        color: clip.adjust.matrix(),
+        color: clip.adjust_at(offset).matrix(),
         lane: u8::from(index % 2 == 1),
+        look: clip.look,
+        grades: vec![crate::GradeStep {
+            matrix: clip.adjust_at(offset).matrix(),
+            grade: clip.grade.clone(),
+        }],
     })
 }
 
@@ -174,6 +204,63 @@ pub struct AudioSpan {
     pub fade_out: Time,
 }
 
+/// 一小段声音：时间轴上从 `start` 放 `len` 长，素材从 `source_start` 起、按 `speed` 倍速。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioPiece {
+    /// 时间轴上的起点。
+    pub start: Time,
+    /// 长度（时间轴时间）。
+    pub len: Time,
+    /// 素材里的起点。
+    pub source_start: Time,
+    /// 倍速（素材时间 / 时间轴时间）。
+    pub speed: f32,
+}
+
+/// 曲线变速的声音分成多少小段（每段按那一段的平均倍数放；预览和导出同一套切法）。
+pub const CURVE_AUDIO_PIECES: i64 = 16;
+
+/// 片段在 `span` 里要放的声音，切成若干段：普通片段一整段；曲线变速的片段按
+/// [`CURVE_AUDIO_PIECES`] 等分（越过片段边界的部分并进头尾两段）。
+#[must_use]
+pub fn audio_pieces(clip: &Clip, span: &AudioSpan) -> Vec<AudioPiece> {
+    let piece = |start: Time, end: Time| {
+        let len = end - start;
+        let a = clip.source_at(start - clip.start).max(Time::ZERO);
+        let b = clip.source_at(end - clip.start).max(a);
+        #[expect(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            reason = "倍数"
+        )]
+        let speed = ((b - a).0 as f64 / len.0.max(1) as f64) as f32;
+        AudioPiece {
+            start,
+            len,
+            source_start: a,
+            speed: speed.clamp(0.05, 20.0),
+        }
+    };
+    if clip.curve.is_none() {
+        return vec![AudioPiece {
+            start: span.start,
+            len: span.end - span.start,
+            source_start: clip.source_at(span.start - clip.start).max(Time::ZERO),
+            speed: clip.speed,
+        }];
+    }
+    let mut cuts: Vec<Time> = (1..CURVE_AUDIO_PIECES)
+        .map(|i| clip.start + Time(clip.duration.0 * i / CURVE_AUDIO_PIECES))
+        .filter(|t| *t > span.start && *t < span.end)
+        .collect();
+    cuts.insert(0, span.start);
+    cuts.push(span.end);
+    cuts.windows(2)
+        .filter(|w| w[1] > w[0])
+        .map(|w| piece(w[0], w[1]))
+        .collect()
+}
+
 /// 片段声音实际放的那一段（预览和导出共用）。转场的时长为 `span`、切点为 `cut` 时，
 /// 两段的声音都在 `[cut − span/2, cut + span/2]` 里交叉淡化：前一段越过切点接着放出点后面的
 /// 素材、后一段提前放入点前面的素材。哪一侧素材不够，就只越过够用的那部分（一点都没有时
@@ -237,12 +324,12 @@ mod tests {
         // v1（0–5 秒）：片段内 0 秒缩放 1，2 秒缩放 3
         add_keyframe(&mut p, ids.v1, Time::ZERO).unwrap();
         apply_transform_at(&mut p, ids.v1, Time::from_secs(2), at(3.0)).unwrap();
-        let layer = resolve_layers(&p, Time::from_secs(1))[0];
+        let layer = resolve_layers(&p, Time::from_secs(1)).swap_remove(0);
         assert_eq!(layer.clip, ids.v1);
         assert!((layer.transform.scale - 2.0).abs() < 1e-6, "{layer:?}");
         assert!((layer.max_scale - 3.0).abs() < 1e-6, "整个片段里最大的缩放");
         // 没有缩放动画：最大缩放就是固定值
-        let still = resolve_layers(&p, Time::from_secs(6))[0];
+        let still = resolve_layers(&p, Time::from_secs(6)).swap_remove(0);
         assert_eq!(still.clip, ids.v2);
         assert_eq!(still.max_scale, still.transform.scale);
     }
@@ -286,6 +373,53 @@ mod tests {
         assert_eq!(before[1].source_time, Time::from_secs(5), "v2 的素材起点");
         assert_eq!(resolve_layers(&p, Time::from_secs(6)).len(), 1, "转场之后");
         assert!(p.timeline.check_invariants(&p.assets).is_ok());
+    }
+
+    #[test]
+    fn advanced_grades_make_a_chain_only_when_used() {
+        use crate::edit::{ADJUSTMENT_LENGTH, add_adjustment, set_grade};
+        let (mut p, ids) = sample_project();
+        let f = resolve_frame(&p, Time::from_secs(1));
+        assert!(f.layers[0].grades.is_empty(), "没有进阶调色：只用矩阵");
+        let mut g = crate::Grade::default();
+        g.curves.luma = vec![(0.5, 0.8)];
+        let adj = add_adjustment(&mut p, Time::ZERO, ADJUSTMENT_LENGTH).unwrap();
+        set_grade(&mut p, adj, Some(g.clone())).unwrap();
+        let graded = resolve_frame(&p, Time::from_secs(1));
+        let chain = &graded.layers[0].grades;
+        assert_eq!(chain.len(), 2, "片段自己一步、调节片段一步");
+        assert!(chain[0].grade.is_none() && chain[1].grade.as_deref() == Some(&g));
+        assert_eq!(graded.background_grades.len(), 1, "黑底也过调节片段");
+        // 片段自己的进阶调色
+        set_grade(&mut p, ids.v1, Some(g)).unwrap();
+        assert!(
+            resolve_frame(&p, Time::from_secs(1)).layers[0].grades[0]
+                .grade
+                .is_some()
+        );
+        set_grade(&mut p, ids.v1, None).unwrap();
+        assert!(
+            resolve_frame(&p, Time::from_secs(1)).layers[0].grades[0]
+                .grade
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn colour_keyframes_reach_the_layer() {
+        let (mut p, ids) = sample_project();
+        crate::edit::add_keyframe_props(&mut p, ids.v1, Time::ZERO, &[crate::Prop::Saturation])
+            .unwrap();
+        let bw = crate::ColorAdjust {
+            saturation: -1.0,
+            ..crate::ColorAdjust::NONE
+        };
+        crate::edit::apply_adjust_at(&mut p, ids.v1, Time::from_secs(2), bw).unwrap();
+        assert!(resolve_frame(&p, Time::ZERO).layers[0].color.is_identity());
+        assert_eq!(
+            resolve_frame(&p, Time::from_secs(3)).layers[0].color,
+            bw.matrix()
+        );
     }
 
     #[test]

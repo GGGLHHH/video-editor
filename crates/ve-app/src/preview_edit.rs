@@ -162,6 +162,10 @@ impl Workspace {
     ) {
         let Some(m) = self.mapping() else { return };
         let p = m.to_canvas((f32::from(e.position.x), f32::from(e.position.y)));
+        // 抠像的取色器：这一下是取色，不是选中 / 拖动
+        if self.pick_key_color(p, m.canvas, window, cx) {
+            return;
+        }
         let Some(((clip, start, geom), mode)) = self.pick(m, p) else {
             return;
         };

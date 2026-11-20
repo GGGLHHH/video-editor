@@ -50,6 +50,11 @@ pub const fn media_clip(id: ClipId, asset: AssetId, start: Time, duration: Time)
         transition_in: None,
         speed: 1.0,
         keep_pitch: true,
+        label: None,
+        look: crate::Look::NONE,
+        reversed: None,
+        curve: None,
+        grade: None,
     }
 }
 
@@ -107,6 +112,7 @@ pub fn sample_project() -> (Project, SampleIds) {
         content: ClipContent::Subtitle {
             text: "你好".into(),
             motion: crate::TextMotion::default(),
+            style: None,
         },
         gain_db: 0.0,
         fade_in: Time::ZERO,
@@ -118,6 +124,11 @@ pub fn sample_project() -> (Project, SampleIds) {
         transition_in: None,
         speed: 1.0,
         keep_pitch: true,
+        label: None,
+        look: crate::Look::NONE,
+        reversed: None,
+        curve: None,
+        grade: None,
     };
     // Project::new() 的轨道顺序固定为 字幕、视频、音频
     let [subs, video, audio] = &mut p.timeline.tracks[..] else {
