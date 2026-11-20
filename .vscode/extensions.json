@@ -1,0 +1,11 @@
+{
+  // 打开项目时 VS Code 会提示装这些插件
+  "recommendations": [
+    // Rust 语言支持（settings.json 里按 check.ps1 的 clippy 设置）
+    "rust-lang.rust-analyzer",
+    // Cargo.toml 等 TOML 文件
+    "tamasfe.even-better-toml",
+    // justfile 语法高亮（常用命令见 justfile）
+    "nefrob.vscode-just-syntax"
+  ]
+}

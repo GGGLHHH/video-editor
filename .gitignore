@@ -11,9 +11,10 @@
 *.wav
 *.mp3
 
-# 只共享项目级 VS Code 设置，其他 .vscode/ 文件（launch.json 等）仍为个人配置
+# 只共享项目级 VS Code 设置和推荐插件，其他 .vscode/ 文件（launch.json 等）仍为个人配置
 .vscode/*
 !.vscode/settings.json
+!.vscode/extensions.json
 .idea/
 
 # 实验日志

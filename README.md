@@ -89,18 +89,27 @@
 - `ffmpeg.exe` 和 FFmpeg 的 DLL 要在 PATH 上。
 - 构建脚本需要 libclang，并设置好 `LIBCLANG_PATH`。
 
+常用命令都写在根目录的 `justfile` 里（要先装 [just](https://just.systems)：`cargo install just`）。`just` 列出全部：
+
 ```sh
-cargo run --release -p ve-app                         # 启动
-cargo run --release -p ve-app -- 工程.vep              # 打开工程
-cargo run --release -p ve-app -- a.mp4 bgm.m4a        # 导入素材并依次放进时间轴
+just run                    # 启动（发布版）
+just run 工程.vep            # 打开工程
+just run a.mp4 bgm.m4a      # 导入素材并依次放进时间轴
+just check                  # 全量检查（和 CI 一样）；just check-fast 不算覆盖率
+just test 关键字             # 跑测试；just ui 关键字 只跑界面测试
+just fmt / just lint        # 格式化 / clippy
+just package                # 本机打压缩包
+just release 0.3.0          # 发版（见下面「打包与发布」）
 ```
+
+不装 just 也行，命令都是普通的 cargo / pwsh，打开 `justfile` 照着敲。
 
 ## 打包与发布
 
 GitHub Actions 自动做（只打 Windows x64）：
 - 推到 main、提 PR：跑全量检查（`.github/workflows/ci.yml`）。
 - 推 `v*` 标签：先跑全量检查，再打压缩包，建 GitHub Release（`.github/workflows/release.yml`）。Release 说明取自 `CHANGELOG.md` 里这一版，没写会直接失败。
-- 发版步骤：把 `CHANGELOG.md` 的「未发布」整理成 `## [x.y.z] - 日期`、改 `Cargo.toml` 的版本号，合进 main 后打 `vx.y.z` 标签推上去。
+- 发版：先把这一版改了什么写进 `CHANGELOG.md` 的「## [未发布]」，然后在 main 上 `just release x.y.z`（`scripts/release.ps1`）。它会检查 main 干净且和远端一致、把「未发布」改成这一版、改版本号，问一句后开 PR、等 CI 通过后压缩合并、打 `vx.y.z` 标签推上去，再等 Release 工作流跑完。`just release x.y.z -DryRun` 只预览不动手。
 - 在 Actions 页面手动运行 Release：只生成压缩包，作为运行产物保留 14 天。
 
 压缩包解压即用：`video-editor.exe` + FFmpeg 的 DLL 和 `ffmpeg.exe` + `licenses/`。
