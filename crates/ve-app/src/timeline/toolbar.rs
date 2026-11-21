@@ -74,6 +74,7 @@ impl Workspace {
             .border_b_1()
             .border_color(palette::divider())
             .child(self.render_tool_button(cx))
+            .children(self.render_compound_breadcrumb(cx))
             .child(gap())
             .child(tool(
                 "tb-undo",

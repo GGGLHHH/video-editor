@@ -94,6 +94,9 @@ pub fn run() {
                     // 性能测试时不自动保存（别往草稿目录里写东西）
                     if args.bench_seconds.is_none() {
                         ws.enable_autosave(crate::autosave::default_dir(), window, cx);
+                        // 全局设置：草稿位置、缓存位置、图片默认时长、新草稿帧率
+                        let file = crate::settings::AppSettings::default_file();
+                        ws.use_settings(crate::settings::AppSettings::load(&file), Some(file), cx);
                         // 特效插件：第一次用时放两个示例
                         let dir = crate::plugins::default_dir();
                         if let Err(e) = crate::plugins::seed_examples(&dir) {

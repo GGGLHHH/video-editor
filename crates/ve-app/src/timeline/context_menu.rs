@@ -1,5 +1,7 @@
 //! 时间轴片段的右键菜单（剪映）：复制 / 剪切 / 粘贴、复制 / 粘贴属性、删除；选中同色片段、
 //! 8 个颜色标签色点 + 还原；分割、向左 / 右裁剪；停用片段、替换片段。右侧画快捷键键帽，用不了的项变灰。
+//!
+//! 右键空白处是另一个小菜单：粘贴、删除空隙、删除轨道上所有空隙。
 
 use super::Hit;
 use crate::actions as act;
@@ -13,6 +15,25 @@ use gpui_kit::{
     MouseDownEvent, ParentElement as _, StatefulInteractiveElement as _, Styled as _, Window,
     deferred, div, px,
 };
+
+/// 右键空白处的菜单：弹在哪（窗口坐标）、点在哪条轨道（轨道下面的空白没有）的哪个时刻。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlankMenu {
+    /// 窗口坐标。
+    pub at: (u32, u32),
+    /// 点在哪条轨道上。
+    pub track: Option<ve_core::TrackId>,
+    /// 点的时刻。
+    pub time: ve_core::Time,
+}
+
+/// 空白处菜单的一项。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlankAction {
+    Paste,
+    CloseGap,
+    CloseAllGaps,
+}
 
 /// 菜单里的一项：编号、文字、快捷键、动作、能不能用。
 struct Item {
@@ -35,15 +56,36 @@ impl Workspace {
         let o = self.timeline.bounds.origin;
         let (x, y) = (f32::from(e.position.x - o.x), f32::from(e.position.y - o.y));
         let geo = self.timeline.geometry;
-        self.timeline.context_menu = match geo.hit_test(x, y, &self.doc.project.timeline) {
+        let hit = geo.hit_test(x, y, &self.doc.project.timeline);
+        // 记窗口坐标：菜单画在整个窗口上，不被时间轴面板裁掉
+        let at = (f32::from(e.position.x), f32::from(e.position.y));
+        self.timeline.context_menu = match hit {
             // 锁定轨道上的片段：不弹菜单（选不中，菜单会作用到别的选择上）
             Hit::Clip { clip, .. } if self.doc.selectable(clip) => {
                 if !self.doc.is_selected(clip) {
                     self.doc.select(clip, false);
                 }
-                // 记窗口坐标：菜单画在整个窗口上，不被时间轴面板裁掉
-                Some((f32::from(e.position.x), f32::from(e.position.y)))
+                Some(at)
             }
+            _ => None,
+        };
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "窗口坐标，非负、不大"
+        )]
+        let window_at = (at.0.max(0.0) as u32, at.1.max(0.0) as u32);
+        self.timeline.blank_menu = match hit {
+            Hit::Track(track) => Some(BlankMenu {
+                at: window_at,
+                track: Some(track),
+                time: geo.x_to_time(x).max(ve_core::Time::ZERO),
+            }),
+            Hit::Empty if y >= geo.ruler_height => Some(BlankMenu {
+                at: window_at,
+                track: None,
+                time: geo.x_to_time(x).max(ve_core::Time::ZERO),
+            }),
             _ => None,
         };
         self.after_change(window, cx);
@@ -175,6 +217,132 @@ impl Workspace {
                 ),
             ],
         ]
+    }
+
+    /// 空白处菜单的几项：（编号，文字，快捷键，动作，能不能用）。
+    fn blank_items(
+        &self,
+        menu: BlankMenu,
+    ) -> [(&'static str, &'static str, &'static str, BlankAction, bool); 3] {
+        let tl = &self.doc.project.timeline;
+        let open = |t: ve_core::TrackId| tl.track(t).is_some_and(|t| !t.locked);
+        let gap = menu
+            .track
+            .filter(|&t| open(t))
+            .and_then(|t| ve_core::edit::gap_at(tl, t, menu.time))
+            .is_some();
+        let any_gap = menu.track.filter(|&t| open(t)).is_some_and(|t| {
+            let mut p = self.doc.project.clone();
+            ve_core::edit::close_all_gaps(&mut p, t).is_ok() && p.timeline != *tl
+        });
+        [
+            (
+                "bm-paste",
+                "粘贴",
+                "Ctrl+V",
+                BlankAction::Paste,
+                self.clipboard.clips.is_some(),
+            ),
+            ("bm-close-gap", "删除空隙", "", BlankAction::CloseGap, gap),
+            (
+                "bm-close-all-gaps",
+                "删除轨道上所有空隙",
+                "",
+                BlankAction::CloseAllGaps,
+                any_gap,
+            ),
+        ]
+    }
+
+    fn run_blank_action(
+        &mut self,
+        menu: BlankMenu,
+        action: BlankAction,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.timeline.blank_menu = None;
+        match (action, menu.track) {
+            (BlankAction::Paste, _) => window.dispatch_action(Box::new(act::Paste), cx),
+            (BlankAction::CloseGap, Some(track)) => {
+                self.apply(window, cx, |p| {
+                    ve_core::edit::close_gap(p, track, menu.time)
+                });
+            }
+            (BlankAction::CloseAllGaps, Some(track)) => {
+                self.apply(window, cx, |p| ve_core::edit::close_all_gaps(p, track));
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// 右键空白处的小菜单。
+    pub(crate) fn render_blank_menu(
+        &self,
+        window: &Window,
+        cx: &Context<'_, Self>,
+    ) -> Option<AnyElement> {
+        let menu = self.timeline.blank_menu?;
+        let muted = cx.theme().muted_foreground;
+        let viewport = window.viewport_size();
+        #[expect(clippy::cast_precision_loss, reason = "窗口坐标")]
+        let (x, y) = (menu.at.0 as f32, menu.at.1 as f32);
+        let y = y
+            .min(f32::from(viewport.height) - 3.0 * 26.0 - 10.0)
+            .max(0.0);
+        let x = x.min(f32::from(viewport.width) - 220.0).max(0.0);
+        let rows = self
+            .blank_items(menu)
+            .map(|(id, label, keys, action, enabled)| {
+                let row = h_flex()
+                    .id(id)
+                    .test_support()
+                    .h(px(26.))
+                    .px_2()
+                    .gap_4()
+                    .justify_between()
+                    .rounded(px(4.))
+                    .text_sm()
+                    .child(label)
+                    .child(chrome::keycaps(keys, cx));
+                if enabled {
+                    row.cursor_pointer()
+                        .hover(|s| s.bg(palette::menu_hover()))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.run_blank_action(menu, action, window, cx);
+                        }))
+                        .into_any_element()
+                } else {
+                    row.text_color(muted).into_any_element()
+                }
+            });
+        Some(
+            deferred(
+                v_flex()
+                    .id("blank-menu")
+                    .occlude()
+                    .test_support()
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y))
+                    .w(px(220.))
+                    .p_1()
+                    .bg(palette::menu_bg())
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded(px(chrome::CARD_RADIUS))
+                    .shadow_lg()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.timeline.blank_menu = None;
+                        cx.notify();
+                    }))
+                    .children(rows),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
     }
 
     /// 颜色标签一行：8 个色点 + ⟲ 还原（剪映）。

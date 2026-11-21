@@ -14,8 +14,10 @@ use gpui_kit::{
     ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
     Window, div, prelude::FluentBuilder as _, px, rgb,
 };
-use ve_core::edit::set_look;
-use ve_core::{BlendMode, ChromaKey, ClipId, Look, Mask, MaskShape, Shadow, Stroke};
+use ve_core::edit::{apply_look_at, reset_look_at};
+use ve_core::{
+    BlendMode, ChromaKey, ClipId, KeyGroup, Look, Mask, MaskShape, Prop, Shadow, Stroke, Time,
+};
 
 /// 「画面」标签的二级分段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -127,70 +129,35 @@ impl LookField {
         }
     }
 
+    /// 对应的可打关键帧属性。
+    const fn prop(self) -> Prop {
+        match self {
+            Self::Radius => Prop::Radius,
+            Self::StrokeWidth => Prop::StrokeWidth,
+            Self::ShadowOpacity => Prop::ShadowOpacity,
+            Self::ShadowBlur => Prop::ShadowBlur,
+            Self::ShadowDistance => Prop::ShadowDistance,
+            Self::ShadowAngle => Prop::ShadowAngle,
+            Self::KeyIntensity => Prop::KeyIntensity,
+            Self::KeyShadow => Prop::KeyShadow,
+            Self::MaskX => Prop::MaskX,
+            Self::MaskY => Prop::MaskY,
+            Self::MaskWidth => Prop::MaskWidth,
+            Self::MaskHeight => Prop::MaskHeight,
+            Self::MaskRotation => Prop::MaskRotation,
+            Self::MaskFeather => Prop::MaskFeather,
+            Self::MaskRound => Prop::MaskRound,
+        }
+    }
+
     /// 存的值（这一项没开时 `None`）。
     fn get(self, l: &Look) -> Option<f32> {
-        let m = l.mask;
-        Some(match self {
-            Self::Radius => l.radius,
-            Self::StrokeWidth => l.stroke?.width,
-            Self::ShadowOpacity => l.shadow?.opacity,
-            Self::ShadowBlur => l.shadow?.blur,
-            Self::ShadowDistance => l.shadow?.distance,
-            Self::ShadowAngle => l.shadow?.angle,
-            Self::KeyIntensity => l.chroma?.intensity,
-            Self::KeyShadow => l.chroma?.shadow,
-            Self::MaskX => m?.x,
-            Self::MaskY => m?.y,
-            Self::MaskWidth => m?.width,
-            Self::MaskHeight => m?.height,
-            Self::MaskRotation => m?.rotation,
-            Self::MaskFeather => m?.feather,
-            Self::MaskRound => m?.round,
-        })
+        self.prop().look_get(l)
     }
 
     /// 写存的值（这一项没开时什么都不做）。
     fn set(self, l: &mut Look, v: f32) {
-        match self {
-            Self::Radius => l.radius = v,
-            Self::StrokeWidth => {
-                if let Some(s) = &mut l.stroke {
-                    s.width = v;
-                }
-            }
-            Self::ShadowOpacity | Self::ShadowBlur | Self::ShadowDistance | Self::ShadowAngle => {
-                if let Some(s) = &mut l.shadow {
-                    match self {
-                        Self::ShadowOpacity => s.opacity = v,
-                        Self::ShadowBlur => s.blur = v,
-                        Self::ShadowDistance => s.distance = v,
-                        _ => s.angle = v,
-                    }
-                }
-            }
-            Self::KeyIntensity | Self::KeyShadow => {
-                if let Some(k) = &mut l.chroma {
-                    if self == Self::KeyIntensity {
-                        k.intensity = v;
-                    } else {
-                        k.shadow = v;
-                    }
-                }
-            }
-            _ => {
-                if let Some(m) = &mut l.mask {
-                    match self {
-                        Self::MaskX => m.x = v,
-                        Self::MaskY => m.y = v,
-                        Self::MaskWidth => m.width = v,
-                        Self::MaskHeight => m.height = v,
-                        Self::MaskRotation => m.rotation = v,
-                        Self::MaskFeather => m.feather = v,
-                        _ => m.round = v,
-                    }
-                }
-            }
-        }
+        self.prop().look_set(l, v);
     }
 
     /// 界面值 → 存的值。
@@ -265,11 +232,17 @@ impl LookFields {
 }
 
 impl Workspace {
-    /// 选中的视频轨媒体片段和它的外观。
-    fn bound_look(&self) -> Option<(ClipId, Look)> {
+    /// 选中的视频轨媒体片段、它在播放头这一刻的外观（有关键帧的项按时间求值）、播放头相对片段起点的时间。
+    fn bound_look_at(&self) -> Option<(ClipId, Look, Time)> {
         let (clip, ..) = self.bound_video_clip()?;
         let (_, c) = self.doc.project.timeline.find_clip(clip)?;
-        Some((clip, c.look))
+        let offset = self.key_offset(c);
+        Some((clip, c.look_at(offset), offset))
+    }
+
+    /// 选中的视频轨媒体片段和它在播放头这一刻的外观。
+    fn bound_look(&self) -> Option<(ClipId, Look)> {
+        self.bound_look_at().map(|(clip, look, _)| (clip, look))
     }
 
     /// 改外观（一步撤销）。
@@ -279,11 +252,26 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some((clip, mut look)) = self.bound_look() else {
+        let Some((clip, mut look, at)) = self.bound_look_at() else {
             return;
         };
         f(&mut look);
-        self.apply(window, cx, |p| set_look(p, clip, look));
+        self.apply(window, cx, |p| apply_look_at(p, clip, at, look));
+    }
+
+    /// 一组的「↻ 重置」：这一组的关键帧一起清掉，再改成默认值（一步撤销）。
+    fn reset_look(
+        &mut self,
+        f: impl FnOnce(&mut Look),
+        props: &'static [Prop],
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((clip, mut look, at)) = self.bound_look_at() else {
+            return;
+        };
+        f(&mut look);
+        self.apply(window, cx, |p| reset_look_at(p, clip, at, look, props));
     }
 
     fn on_look_slider(
@@ -293,7 +281,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some((clip, mut look)) = self.bound_look() else {
+        let Some((clip, mut look, at)) = self.bound_look_at() else {
             return;
         };
         match e {
@@ -303,7 +291,7 @@ impl Workspace {
                     self.inspector.look.gesture = true;
                 }
                 field.set(&mut look, field.ui_to_value(v.start()));
-                let _ = self.doc.edit(|p| set_look(p, clip, look));
+                let _ = self.doc.edit(|p| apply_look_at(p, clip, at, look));
                 self.after_change(window, cx);
             }
             SliderEvent::Release(_) => {
@@ -376,7 +364,7 @@ impl Workspace {
             geom.uv.h.mul_add(fy, geom.uv.y),
         );
         let at = if asset.is_still() {
-            ve_core::Time::ZERO
+            Time::ZERO
         } else {
             c.source_at(offset)
         };
@@ -429,6 +417,7 @@ impl Workspace {
                         .text_sm()
                         .child(SharedString::from(format!("{v}"))),
                 )
+                .child(self.render_group_keys(KeyGroup::Look(f.prop()), cx))
                 .into_any_element(),
         )
     }
@@ -593,8 +582,9 @@ impl Workspace {
                     this.edit_look(|l| l.stroke = on.then(Stroke::default), window, cx);
                 })),
                 reset: Some(|this, window, cx| {
-                    this.edit_look(
+                    this.reset_look(
                         |l| l.stroke = l.stroke.map(|_| Stroke::default()),
+                        &Prop::STROKE,
                         window,
                         cx,
                     );
@@ -639,8 +629,9 @@ impl Workspace {
                     this.edit_look(|l| l.shadow = on.then(Shadow::default), window, cx);
                 })),
                 reset: Some(|this, window, cx| {
-                    this.edit_look(
+                    this.reset_look(
                         |l| l.shadow = l.shadow.map(|_| Shadow::default()),
+                        &Prop::SHADOW,
                         window,
                         cx,
                     );
@@ -729,8 +720,9 @@ impl Workspace {
                     this.edit_look(|l| l.chroma = on.then(ChromaKey::default), window, cx);
                 })),
                 reset: Some(|this, window, cx| {
-                    this.edit_look(
+                    this.reset_look(
                         |l| l.chroma = l.chroma.map(|_| ChromaKey::default()),
+                        &Prop::KEY,
                         window,
                         cx,
                     );
@@ -795,8 +787,9 @@ impl Workspace {
                             .label("↻")
                             .tooltip("重置蒙版")
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.edit_look(
+                                this.reset_look(
                                     |l| l.mask = l.mask.map(|m| Mask::new(m.shape)),
+                                    &Prop::MASK,
                                     window,
                                     cx,
                                 );
@@ -834,7 +827,7 @@ impl Workspace {
 
 /// 原片 `path` 在 `at` 那一帧、纹理坐标 `uv` 处的颜色 0xRRGGBB。
 #[expect(clippy::many_single_char_names, reason = "坐标和颜色分量")]
-fn sample_source(path: &std::path::Path, at: ve_core::Time, uv: (f32, f32)) -> Option<u32> {
+fn sample_source(path: &std::path::Path, at: Time, uv: (f32, f32)) -> Option<u32> {
     let target = ve_media::ScaleTarget {
         max_width: 640,
         max_height: 640,

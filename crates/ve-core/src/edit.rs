@@ -159,6 +159,7 @@ fn new_media_clip(
         frame_blend: false,
         stabilized: None,
         input_space: None,
+        parent: None,
     })
 }
 
@@ -627,19 +628,18 @@ pub fn set_fades(
     })
 }
 
-/// 加一条轨道：视频轨放在所有视频轨最上面，音频轨放在最后一条音频轨下面。
+/// 加一条轨道：视频轨、文字轨放在同类轨道最上面，音频轨放在最后一条音频轨下面。
 ///
 /// # Errors
-/// 字幕轨（这一版只有一条）。
+/// 不会出错（保留 `Result` 给以后的限制）。
 pub fn add_track(project: &mut Project, kind: TrackKind) -> Result<TrackId, EditError> {
     let tracks = &project.timeline.tracks;
     let at = match kind {
-        TrackKind::Video => tracks.iter().position(|t| t.kind == TrackKind::Video),
+        TrackKind::Video | TrackKind::Subtitle => tracks.iter().position(|t| t.kind == kind),
         TrackKind::Audio => tracks
             .iter()
             .rposition(|t| t.kind == TrackKind::Audio)
             .map(|i| i + 1),
-        TrackKind::Subtitle => return Err(EditError::WrongTrackKind),
     };
     // 没有同类轨道时：视频轨放在字幕轨后面，音频轨放最后
     let at = at.unwrap_or_else(|| match kind {
@@ -647,7 +647,8 @@ pub fn add_track(project: &mut Project, kind: TrackKind) -> Result<TrackId, Edit
             .iter()
             .position(|t| t.kind != TrackKind::Subtitle)
             .unwrap_or(tracks.len()),
-        _ => tracks.len(),
+        TrackKind::Subtitle => 0,
+        TrackKind::Audio => tracks.len(),
     });
     let id = project.ids.track();
     project
@@ -658,18 +659,21 @@ pub fn add_track(project: &mut Project, kind: TrackKind) -> Result<TrackId, Edit
 }
 
 /// 某类轨道可以新插入的位置（轨道列表下标，含两端）：同类轨道要挨在一起。
-/// 字幕轨只有一条，返回 `None`；还没有这类轨道时也返回 `None`。
+/// 还没有这类轨道时返回 `None`。
 #[must_use]
 pub fn insert_slots(
     timeline: &Timeline,
     kind: TrackKind,
 ) -> Option<std::ops::RangeInclusive<usize>> {
-    if kind == TrackKind::Subtitle {
-        return None;
-    }
     let first = timeline.tracks.iter().position(|t| t.kind == kind)?;
     let last = timeline.tracks.iter().rposition(|t| t.kind == kind)?;
-    Some(first..=last + 1)
+    // 文字轨只能往上加：最下面那条是字幕轨（字幕列表、导入 SRT 都认它），下面不开新轨
+    let end = if kind == TrackKind::Subtitle {
+        last
+    } else {
+        last + 1
+    };
+    Some(first..=end)
 }
 
 /// 把片段拖进两条轨道之间的缝（剪映：拖到轨道之间自动新建轨道）：在 `slot` 处新建一条
@@ -693,16 +697,30 @@ pub fn move_clip_to_new_track(
         .track(track)
         .ok_or(EditError::TrackNotFound(track))?
         .kind;
+    let mut next = project.clone();
+    let id = insert_track_at(&mut next, kind, slot)?;
+    move_clip(&mut next, clip, id, start)?;
+    *project = next;
+    Ok(id)
+}
+
+/// 在轨道列表的 `slot` 处新建一条 `kind` 轨道（从素材面板拖到两条轨道之间的缝）。返回新轨道。
+///
+/// # Errors
+/// `slot` 不在这类轨道能插入的范围内（同类轨道要挨在一起；字幕轨只有一条）。
+pub fn insert_track_at(
+    project: &mut Project,
+    kind: TrackKind,
+    slot: usize,
+) -> Result<TrackId, EditError> {
     if !insert_slots(&project.timeline, kind).is_some_and(|r| r.contains(&slot)) {
         return Err(EditError::WrongTrackKind);
     }
-    let mut next = project.clone();
-    let id = next.ids.track();
-    next.timeline
+    let id = project.ids.track();
+    project
+        .timeline
         .tracks
         .insert(slot, crate::Track::new(id, kind));
-    move_clip(&mut next, clip, id, start)?;
-    *project = next;
     Ok(id)
 }
 
@@ -780,6 +798,109 @@ pub const fn set_frame_rate(
     }
     project.settings.frame_rate = rate;
     Ok(())
+}
+
+/// 轨道 `track` 上时刻 `at` 所在的空隙：（前一段的终点或 0，后一段的起点）。`at` 落在片段上、
+/// 或者后面已经没有片段（不算空隙，是结尾）时返回 `None`。
+#[must_use]
+pub fn gap_at(timeline: &Timeline, track: TrackId, at: Time) -> Option<(Time, Time)> {
+    let t = timeline.track(track)?;
+    let next = t.clips.iter().find(|c| c.start >= at)?;
+    let prev_end = t
+        .clips
+        .iter()
+        .take_while(|c| c.start < next.start)
+        .map(|c| c.end())
+        .max()
+        .unwrap_or(Time::ZERO);
+    (prev_end <= at && prev_end < next.start).then_some((prev_end, next.start))
+}
+
+/// 删除空隙（剪映右键空白处「删除空隙」）：轨道 `track` 上 `at` 所在空隙后面的片段整体往前挪，
+/// 接上前一段（或从 0 开始）。
+///
+/// # Errors
+/// 轨道不存在、锁着；`at` 不在空隙里。
+pub fn close_gap(project: &mut Project, track: TrackId, at: Time) -> Result<(), EditError> {
+    let (from, to) = gap_at(&project.timeline, track, at).ok_or(EditError::InvalidValue)?;
+    let ti = track_index(&project.timeline, track)?;
+    if project.timeline.tracks[ti].locked {
+        return Err(EditError::TrackLocked);
+    }
+    let shift = to - from;
+    for c in &mut project.timeline.tracks[ti].clips {
+        if c.start >= to {
+            Arc::make_mut(c).start -= shift;
+        }
+    }
+    Ok(())
+}
+
+/// 删除轨道上所有空隙（剪映「批量删除空隙」）：片段按原来的先后从 0 开始首尾相接。
+/// 本来就没有空隙时不改。
+///
+/// # Errors
+/// 轨道不存在、锁着。
+pub fn close_all_gaps(project: &mut Project, track: TrackId) -> Result<(), EditError> {
+    let ti = track_index(&project.timeline, track)?;
+    if project.timeline.tracks[ti].locked {
+        return Err(EditError::TrackLocked);
+    }
+    let mut at = Time::ZERO;
+    for c in &mut project.timeline.tracks[ti].clips {
+        if c.start != at {
+            Arc::make_mut(c).start = at;
+        }
+        at = c.end();
+    }
+    Ok(())
+}
+
+/// 编辑后变空的轨道收掉（剪映：轨道上最后一段拖走 / 删掉后，这条轨道自动消失）。
+/// 编辑前就是空的（手动加的）不收；主轨、每类最后一条也不收。收了返回 `true`。
+pub fn prune_emptied_tracks(before: &Timeline, project: &mut Project) -> bool {
+    let had: std::collections::HashSet<TrackId> = before
+        .tracks
+        .iter()
+        .filter(|t| !t.clips.is_empty())
+        .map(|t| t.id)
+        .collect();
+    let main = crate::magnet::main_track(&project.timeline);
+    let tracks = &project.timeline.tracks;
+    // 最下面那条文字轨是字幕轨，不收（收了上面的标题轨就成了字幕轨）
+    let captions = tracks
+        .iter()
+        .rfind(|t| t.kind == TrackKind::Subtitle)
+        .map(|t| t.id);
+    let doomed: Vec<TrackId> = tracks
+        .iter()
+        .filter(|t| {
+            t.clips.is_empty()
+                && had.contains(&t.id)
+                && Some(t.id) != main
+                && Some(t.id) != captions
+        })
+        .map(|t| t.id)
+        .collect();
+    let mut removed = false;
+    for id in doomed {
+        let Some(kind) = project.timeline.track(id).map(|t| t.kind) else {
+            continue;
+        };
+        // 每类至少留一条
+        if project
+            .timeline
+            .tracks
+            .iter()
+            .filter(|t| t.kind == kind)
+            .count()
+            > 1
+        {
+            project.timeline.tracks.retain(|t| t.id != id);
+            removed = true;
+        }
+    }
+    removed
 }
 
 /// 删除一条轨道和它上面的片段。
@@ -919,6 +1040,7 @@ pub fn apply_adjust_at(
     }
     ensure_video(project, clip)?;
     update_clip(project, clip, |c| {
+        let now = c.adjust_at(at);
         for prop in crate::Prop::ADJUST {
             let Some(item) = prop.adjust_item() else {
                 continue;
@@ -926,7 +1048,7 @@ pub fn apply_adjust_at(
             let value = item.get(&adjust);
             if c.animation.keys(prop).is_empty() {
                 item.set(&mut c.adjust, value);
-            } else {
+            } else if moved(item.get(&now), value) {
                 c.animation.upsert(prop, at, value);
             }
         }
@@ -957,6 +1079,22 @@ pub fn apply_gain_at(
         }
         Ok(())
     })
+}
+
+/// 片段该放在哪类轨道上（按内容看：文字、只有声音的素材放音频轨，其余放视频轨）。
+fn kind_for(project: &Project, clip: &Clip) -> TrackKind {
+    if clip.subtitle_text().is_some() {
+        return TrackKind::Subtitle;
+    }
+    let audio_only = clip
+        .asset()
+        .and_then(|a| project.assets.get(&a))
+        .is_some_and(|a| a.video.is_none());
+    if audio_only {
+        TrackKind::Audio
+    } else {
+        TrackKind::Video
+    }
 }
 
 /// 复制下来的片段：（原来的轨道，片段）；片段起点是相对最早那段的偏移。
@@ -1002,23 +1140,25 @@ pub fn paste_clips(
             return Err(EditError::AssetNotFound(asset));
         }
         let kind_of = |tl: &Timeline, id: TrackId| tl.track(id).map(|t| t.kind);
-        let wanted = project.timeline.track(*track).map(|t| t.kind).or_else(|| {
-            // 轨道删掉了：按内容猜类型
-            Some(if clip.subtitle_text().is_some() {
-                TrackKind::Subtitle
-            } else {
-                TrackKind::Video
-            })
-        });
         let target = if kind_of(&next.timeline, *track).is_some() {
             *track
         } else {
-            next.timeline
+            // 原来的轨道没了（删了，或剪切后被自动收掉）：按内容找一条这段时间空着的同类轨道，
+            // 都占着就新开一条
+            let kind = project
+                .timeline
+                .track(*track)
+                .map_or_else(|| kind_for(&next, clip), |t| t.kind);
+            let (from, to) = (at + clip.start, at + clip.start + clip.duration);
+            match next
+                .timeline
                 .tracks
                 .iter()
-                .find(|t| Some(t.kind) == wanted)
-                .map(|t| t.id)
-                .ok_or(EditError::WrongTrackKind)?
+                .find(|t| t.kind == kind && !t.locked && t.is_free(from, to, &[]))
+            {
+                Some(t) => t.id,
+                None => add_track(&mut next, kind)?,
+            }
         };
         let id = next.ids.clip();
         let mut c = clip.clone();
@@ -1104,11 +1244,21 @@ pub fn paste_attributes(
         }
         update_clip(&mut next, id, |c| {
             c.transform = attrs.transform;
-            c.animation = attrs.animation.clone();
             c.adjust = attrs.adjust;
             c.grade.clone_from(&attrs.grade);
-            if c.asset().is_some() {
+            let media = c.asset().is_some();
+            if media {
                 c.look = attrs.look;
+            }
+            // 关键帧只换粘过来的这几类（画面、调色，素材片段再加外观）；音量、特效强度这些
+            // 留目标自己的，用不上的不带过来
+            let pasted = crate::Prop::TRANSFORM
+                .iter()
+                .chain(&crate::Prop::ADJUST)
+                .chain(if media { &crate::Prop::LOOK[..] } else { &[] });
+            for &prop in pasted {
+                c.animation
+                    .set_keys(prop, attrs.animation.keys(prop).to_vec());
             }
             Ok(())
         })?;
@@ -1468,6 +1618,15 @@ pub fn add_keyframe_props(
         if props.contains(&crate::Prop::Volume) && c.asset().is_none() {
             return Err(EditError::WrongTrackKind);
         }
+        // 外观里没开的那一项（没有描边、没有蒙版……）没有值可记
+        let look = c.look_at(at);
+        if props
+            .iter()
+            .any(|p| p.is_look() && p.look_get(&look).is_none())
+            || (props.contains(&crate::Prop::EffectAmount) && c.effect().is_none())
+        {
+            return Err(EditError::InvalidValue);
+        }
         let now: Vec<f32> = props.iter().map(|p| c.value_at(*p, at)).collect();
         for (prop, value) in props.iter().zip(now) {
             c.animation.upsert(*prop, at, value);
@@ -1516,16 +1675,23 @@ pub fn apply_transform_at(
     }
     ensure_visual(project, clip)?;
     update_clip(project, clip, |c| {
+        let now = c.transform_at(at);
         for prop in crate::Prop::TRANSFORM {
             let value = prop.get(&t);
             if c.animation.keys(prop).is_empty() {
                 prop.set(&mut c.transform, value);
-            } else {
+            } else if moved(prop.get(&now), value) {
+                // 只给真的改了的属性打帧，没动的不在这里多出一帧（不然原来的运动会在这里停一下）
                 c.animation.upsert(prop, at, value);
             }
         }
         Ok(())
     })
+}
+
+/// 界面改值时这个属性算不算改了（插值出来的值和写回的值会有一点点浮点误差）。
+fn moved(now: f32, next: f32) -> bool {
+    (now - next).abs() > 1e-5
 }
 
 /// 删掉片段内 `at` 时刻画面属性的关键帧（调色、音量的不动）。某个属性删光了，
@@ -1618,6 +1784,115 @@ pub fn set_look(project: &mut Project, clip: ClipId, look: crate::Look) -> Resul
             return Err(EditError::WrongTrackKind);
         }
         c.look = look;
+        Ok(())
+    })
+}
+
+/// 界面改外观走这里：有关键帧的那几项（圆角、描边粗细、阴影、抠图强度、蒙版位置大小……）在
+/// `at`（相对片段起点）新建或更新关键帧，其余（颜色、开关、形状、没有关键帧的项）改固定值。
+/// 关掉了的那一项（比如去掉蒙版），它的关键帧一起删掉。
+///
+/// # Errors
+/// 同 [`set_look`]。
+pub fn apply_look_at(
+    project: &mut Project,
+    clip: ClipId,
+    at: Time,
+    look: crate::Look,
+) -> Result<(), EditError> {
+    if !look.is_valid() {
+        return Err(EditError::InvalidValue);
+    }
+    ensure_video(project, clip)?;
+    update_clip(project, clip, |c| {
+        if c.asset().is_none() {
+            return Err(EditError::WrongTrackKind);
+        }
+        // 换了蒙版形状 = 一个新蒙版：旧形状的关键帧（包括新形状用不上的宽高、圆角）不留
+        if before_shape(c) != look.mask.map(|m| m.shape) {
+            for prop in crate::Prop::MASK {
+                c.animation.remove_between(prop, Time::ZERO, Time(i64::MAX));
+            }
+        }
+        let before = c.look;
+        let now = c.look_at(at);
+        c.look = look;
+        for prop in crate::Prop::LOOK {
+            if c.animation.keys(prop).is_empty() {
+                continue;
+            }
+            if let Some(v) = prop.look_get(&look) {
+                if prop.look_get(&now).is_none_or(|n| moved(n, v)) {
+                    c.animation.upsert(prop, at, v);
+                }
+                // 有关键帧的项固定值不动（删光关键帧时才用得上）
+                if let Some(base) = prop.look_get(&before) {
+                    prop.look_set(&mut c.look, base);
+                }
+            } else {
+                c.animation.remove_between(prop, Time::ZERO, Time(i64::MAX));
+            }
+        }
+        Ok(())
+    })
+}
+
+/// 片段现在的蒙版形状（没有蒙版时 `None`）。
+fn before_shape(c: &Clip) -> Option<crate::MaskShape> {
+    c.look.mask.map(|m| m.shape)
+}
+
+/// 外观里一组的「重置」：这一组（`props`，如 [`crate::Prop::MASK`]）的关键帧全清掉，再按
+/// [`apply_look_at`] 写成 `look`（重置后的默认值）。一步完成。
+///
+/// # Errors
+/// 同 [`apply_look_at`]。
+pub fn reset_look_at(
+    project: &mut Project,
+    clip: ClipId,
+    at: Time,
+    look: crate::Look,
+    props: &[crate::Prop],
+) -> Result<(), EditError> {
+    let mut next = project.clone();
+    update_clip(&mut next, clip, |c| {
+        for prop in props {
+            c.animation
+                .remove_between(*prop, Time::ZERO, Time(i64::MAX));
+        }
+        Ok(())
+    })?;
+    apply_look_at(&mut next, clip, at, look)?;
+    *project = next;
+    Ok(())
+}
+
+/// 界面改特效走这里：强度有关键帧时在 `at`（相对片段起点）新建或更新关键帧，其余改固定值。
+///
+/// # Errors
+/// 同 [`set_effect`]。
+pub fn apply_effect_at(
+    project: &mut Project,
+    clip: ClipId,
+    at: Time,
+    effect: crate::Effect,
+) -> Result<(), EditError> {
+    if !effect.is_valid() {
+        return Err(EditError::InvalidValue);
+    }
+    update_clip(project, clip, |c| {
+        let (Some(before), Some(now)) = (c.effect(), c.effect_at(at)) else {
+            return Err(EditError::WrongTrackKind);
+        };
+        let mut next = effect;
+        if !c.animation.keys(crate::Prop::EffectAmount).is_empty() {
+            if moved(now.amount, effect.amount) {
+                c.animation
+                    .upsert(crate::Prop::EffectAmount, at, effect.amount);
+            }
+            next.amount = before.amount;
+        }
+        c.content = ClipContent::Effect(next);
         Ok(())
     })
 }
@@ -1915,6 +2190,64 @@ pub fn set_effect(
     })
 }
 
+/// 把调节片段放到指定的视频轨 `track` 上（从素材面板拖到时间轴）。
+///
+/// # Errors
+/// 长度不为正；轨道不存在、不是视频轨、锁着、那里有别的片段。
+pub fn add_adjustment_on(
+    project: &mut Project,
+    track: TrackId,
+    at: Time,
+    duration: Time,
+) -> Result<ClipId, EditError> {
+    place_overlay_tool(project, track, at, duration, ClipContent::Adjustment)
+}
+
+/// 把特效片段放到指定的视频轨 `track` 上（从素材面板拖到时间轴）。
+///
+/// # Errors
+/// 长度不为正、强度不在 0–1；轨道不存在、不是视频轨、锁着、那里有别的片段。
+pub fn add_effect_on(
+    project: &mut Project,
+    track: TrackId,
+    at: Time,
+    duration: Time,
+    effect: crate::Effect,
+) -> Result<ClipId, EditError> {
+    if !effect.is_valid() {
+        return Err(EditError::InvalidValue);
+    }
+    place_overlay_tool(project, track, at, duration, ClipContent::Effect(effect))
+}
+
+fn place_overlay_tool(
+    project: &mut Project,
+    track: TrackId,
+    at: Time,
+    duration: Time,
+    content: ClipContent,
+) -> Result<ClipId, EditError> {
+    if duration <= Time::ZERO {
+        return Err(EditError::ZeroLength);
+    }
+    let ti = track_index(&project.timeline, track)?;
+    let t = &project.timeline.tracks[ti];
+    if t.kind != TrackKind::Video {
+        return Err(EditError::WrongTrackKind);
+    }
+    if t.locked {
+        return Err(EditError::TrackLocked);
+    }
+    let start = at.max(Time::ZERO);
+    if !t.is_free(start, start + duration, &[]) {
+        return Err(EditError::Overlap);
+    }
+    let id = project.ids.clip();
+    let clip = overlay_clip(id, start, duration, content);
+    project.timeline.tracks[ti].insert_sorted(Arc::new(clip));
+    Ok(id)
+}
+
 /// 调节、特效这类片段：放到最上面一条有空位的非主轨视频轨，没有就新建一条。
 fn add_overlay_tool(
     project: &mut Project,
@@ -1940,7 +2273,16 @@ fn add_overlay_tool(
         None => add_track(&mut next, TrackKind::Video)?,
     };
     let id = next.ids.clip();
-    let clip = Clip {
+    let clip = overlay_clip(id, start, duration, content);
+    let ti = track_index(&next.timeline, track)?;
+    next.timeline.tracks[ti].insert_sorted(Arc::new(clip));
+    *project = next;
+    Ok(id)
+}
+
+/// 一段调节 / 特效片段（默认属性）。
+fn overlay_clip(id: ClipId, start: Time, duration: Time, content: ClipContent) -> Clip {
+    Clip {
         id,
         start,
         duration,
@@ -1964,14 +2306,15 @@ fn add_overlay_tool(
         frame_blend: false,
         stabilized: None,
         input_space: None,
-    };
-    let ti = track_index(&next.timeline, track)?;
-    next.timeline.tracks[ti].insert_sorted(Arc::new(clip));
-    *project = next;
-    Ok(id)
+        parent: None,
+    }
 }
 
-/// 在字幕轨加一条字幕。
+/// 叠放在上层文字轨上的新文字往上挪多少（画布高度）：字幕贴着底边，挪 0.4 大约到画面中间。
+pub const TITLE_Y: f32 = -0.4;
+
+/// 加一条文字：放在最下面一条有空位的文字轨上（字幕）；这个时间段每条文字轨都占了，
+/// 就在最上面新开一条文字轨（剪映：文字可以叠放，标题和字幕同时出现），新开的这条默认在画面中间。
 ///
 /// # Errors
 /// 长度不为正、与已有字幕重叠、没有字幕轨。
@@ -1981,21 +2324,118 @@ pub fn add_subtitle(
     duration: Time,
     text: String,
 ) -> Result<ClipId, EditError> {
+    place_text(project, at, duration, text, true)
+}
+
+/// 加一句字幕（导入字幕文件用）：只放在最下面那条文字轨（字幕轨）上，不叠放。
+///
+/// # Errors
+/// 长度不为正、与那条轨上已有的字幕重叠、没有文字轨。
+pub fn add_caption(
+    project: &mut Project,
+    at: Time,
+    duration: Time,
+    text: String,
+) -> Result<ClipId, EditError> {
+    place_text(project, at, duration, text, false)
+}
+
+/// 把一条文字放到指定的文字轨 `track` 上（从素材面板拖到时间轴）。不是最下面那条（字幕轨）时
+/// 默认放到画面中间（标题）。
+///
+/// # Errors
+/// 长度不为正；轨道不存在、不是文字轨、锁着、那里有别的文字。
+pub fn add_subtitle_on(
+    project: &mut Project,
+    track: TrackId,
+    at: Time,
+    duration: Time,
+    text: String,
+) -> Result<ClipId, EditError> {
     if duration <= Time::ZERO {
         return Err(EditError::ZeroLength);
     }
-    let ti = project
-        .timeline
-        .tracks
-        .iter()
-        .position(|t| t.kind == TrackKind::Subtitle)
-        .ok_or(EditError::WrongTrackKind)?;
+    let ti = track_index(&project.timeline, track)?;
+    let lane = &project.timeline.tracks[ti];
+    if lane.kind != TrackKind::Subtitle {
+        return Err(EditError::WrongTrackKind);
+    }
+    if lane.locked {
+        return Err(EditError::TrackLocked);
+    }
     let start = at.max(Time::ZERO);
-    if !project.timeline.tracks[ti].is_free(start, start + duration, &[]) {
+    if !lane.is_free(start, start + duration, &[]) {
         return Err(EditError::Overlap);
     }
+    let on_top = Some(ti)
+        != project
+            .timeline
+            .tracks
+            .iter()
+            .rposition(|t| t.kind == TrackKind::Subtitle);
     let id = project.ids.clip();
-    let clip = Clip {
+    let clip = text_clip(id, start, duration, text, on_top);
+    project.timeline.tracks[ti].insert_sorted(Arc::new(clip));
+    Ok(id)
+}
+
+fn place_text(
+    project: &mut Project,
+    at: Time,
+    duration: Time,
+    text: String,
+    stack: bool,
+) -> Result<ClipId, EditError> {
+    if duration <= Time::ZERO {
+        return Err(EditError::ZeroLength);
+    }
+    let start = at.max(Time::ZERO);
+    let tracks = &project.timeline.tracks;
+    let bottom = tracks
+        .iter()
+        .rposition(|t| t.kind == TrackKind::Subtitle)
+        .ok_or(EditError::WrongTrackKind)?;
+    // 从最下面一条文字轨（字幕）往上找空着的；都占了就在最上面新开一条（剪映：文字叠放）
+    // 叠放时隐藏的文字轨不放（放进去看不见）；字幕轨锁着时直接说锁着
+    let fits = |i: usize| {
+        let t = &tracks[i];
+        t.kind == TrackKind::Subtitle
+            && !t.locked
+            && !(stack && t.hidden)
+            && t.is_free(start, start + duration, &[])
+    };
+    if !stack && tracks[bottom].locked {
+        return Err(EditError::TrackLocked);
+    }
+    let free = if stack {
+        (0..=bottom).rev().find(|&i| fits(i))
+    } else {
+        Some(bottom).filter(|&i| fits(i))
+    };
+    let ti = match free {
+        Some(i) => i,
+        None if !stack => return Err(EditError::Overlap),
+        None => {
+            let new = add_track(project, TrackKind::Subtitle)?;
+            track_index(&project.timeline, new)?
+        }
+    };
+    let on_top = ti
+        != project
+            .timeline
+            .tracks
+            .iter()
+            .rposition(|t| t.kind == TrackKind::Subtitle)
+            .unwrap_or(ti);
+    let id = project.ids.clip();
+    let clip = text_clip(id, start, duration, text, on_top);
+    project.timeline.tracks[ti].insert_sorted(Arc::new(clip));
+    Ok(id)
+}
+
+/// 一条新文字（默认属性）；`on_top`（叠在上层文字轨的标题）时默认放到画面中间。
+fn text_clip(id: ClipId, start: Time, duration: Time, text: String, on_top: bool) -> Clip {
+    Clip {
         id,
         start,
         duration,
@@ -2007,7 +2447,15 @@ pub fn add_subtitle(
         gain_db: 0.0,
         fade_in: Time::ZERO,
         fade_out: Time::ZERO,
-        transform: Transform::default(),
+        // 叠在上层文字轨的（标题）默认放到画面中间，不压着底下的字幕
+        transform: if on_top {
+            Transform {
+                y: TITLE_Y,
+                ..Transform::default()
+            }
+        } else {
+            Transform::default()
+        },
         animation: crate::Animation::default(),
         adjust: crate::ColorAdjust::NONE,
         disabled: false,
@@ -2023,9 +2471,8 @@ pub fn add_subtitle(
         frame_blend: false,
         stabilized: None,
         input_space: None,
-    };
-    project.timeline.tracks[ti].insert_sorted(Arc::new(clip));
-    Ok(id)
+        parent: None,
+    }
 }
 
 /// 设置字幕的入场 / 出场动画（剪映文字「动画」）。
@@ -2667,10 +3114,9 @@ mod tests {
         // 剪映：新视频轨在已有视频轨上面（主轨在最下），文字轨始终在最上
         assert_eq!(p.timeline.tracks[1].id, new);
         assert_eq!(p.timeline.tracks[2].id, ids.video_track);
-        assert_eq!(
-            add_track(&mut p, TrackKind::Subtitle),
-            Err(EditError::WrongTrackKind)
-        );
+        // 文字轨也能加：放在文字轨最上面
+        let text = add_track(&mut p, TrackKind::Subtitle).unwrap();
+        assert_eq!(p.timeline.tracks[0].id, text);
         assert_valid(&p);
     }
 
@@ -2958,7 +3404,23 @@ mod tests {
         let s = add_subtitle(&mut p, secs(4), secs(2), "第二句".into()).unwrap();
         assert_eq!(clip(&p, s).subtitle_text(), Some("第二句"));
         assert_eq!(
-            add_subtitle(&mut p, secs(2), secs(1), "x".into()),
+            p.timeline.find_clip(s).unwrap().0,
+            ids.subtitle_track,
+            "空着就放字幕轨"
+        );
+        // 2 秒处已经有字幕：在上面新开一条文字轨叠放，默认放到画面中间（标题）
+        let title = add_subtitle(&mut p, secs(2), secs(1), "标题".into()).unwrap();
+        let (on, c) = p.timeline.find_clip(title).unwrap();
+        assert_ne!(on, ids.subtitle_track);
+        assert_eq!(p.timeline.tracks[0].id, on, "新文字轨在最上面");
+        assert!((c.transform.y - TITLE_Y).abs() < f32::EPSILON);
+        assert!(
+            clip(&p, ids.s1).transform.y.abs() < f32::EPSILON,
+            "字幕还在底下"
+        );
+        // 导入字幕文件用的：只放字幕轨，重叠就报错
+        assert_eq!(
+            add_caption(&mut p, secs(2), secs(1), "x".into()),
             Err(EditError::Overlap)
         );
         assert_eq!(
@@ -3122,7 +3584,8 @@ mod tests {
         // [S, V, V, A]：视频轨能插在 1、2、3（视频块的上沿、中间、下沿），音频轨能插在 3、4
         assert_eq!(insert_slots(&p.timeline, TrackKind::Video), Some(1..=3));
         assert_eq!(insert_slots(&p.timeline, TrackKind::Audio), Some(3..=4));
-        assert_eq!(insert_slots(&p.timeline, TrackKind::Subtitle), None);
+        // 文字轨只往上加：字幕轨下面不是文字轨的缝
+        assert_eq!(insert_slots(&p.timeline, TrackKind::Subtitle), Some(0..=0));
     }
 
     #[test]
@@ -3145,12 +3608,10 @@ mod tests {
             move_clip_to_new_track(&mut p, ids.v1, 0, secs(0)),
             Err(EditError::WrongTrackKind)
         );
-        assert_eq!(
-            move_clip_to_new_track(&mut p, ids.s1, 0, secs(0)),
-            Err(EditError::WrongTrackKind),
-            "字幕轨只有一条"
-        );
         assert_eq!(p, before);
+        // 文字也能拖进新文字轨（剪映：文字叠放）
+        let text = move_clip_to_new_track(&mut p, ids.s1, 0, secs(0)).unwrap();
+        assert_eq!(p.timeline.tracks[0].id, text);
     }
 
     #[test]
@@ -3769,6 +4230,407 @@ mod tests {
         assert_eq!(
             set_keep_pitch(&mut p, ids.s1, false),
             Err(EditError::WrongTrackKind)
+        );
+    }
+
+    #[test]
+    fn closing_gaps_pulls_later_clips_left() {
+        let (mut p, ids) = sample_project();
+        // V1：0–5、5–8；把 v2 挪到 7 秒，空出 5–7
+        move_clip(&mut p, ids.v2, ids.video_track, Time::from_secs(7)).unwrap();
+        let tl = &p.timeline;
+        assert_eq!(
+            gap_at(tl, ids.video_track, Time::from_secs(6)),
+            Some((Time::from_secs(5), Time::from_secs(7)))
+        );
+        assert_eq!(
+            gap_at(tl, ids.video_track, Time::from_secs(1)),
+            None,
+            "片段上"
+        );
+        assert_eq!(
+            gap_at(tl, ids.video_track, Time::from_secs(20)),
+            None,
+            "结尾不算空隙"
+        );
+        close_gap(&mut p, ids.video_track, Time::from_secs(6)).unwrap();
+        assert_eq!(
+            p.timeline.find_clip(ids.v2).unwrap().1.start,
+            Time::from_secs(5)
+        );
+        assert_eq!(
+            close_gap(&mut p, ids.video_track, Time::from_secs(6)),
+            Err(EditError::InvalidValue)
+        );
+        // 开头也有空隙：批量删除后从 0 开始首尾相接
+        move_clip(&mut p, ids.v2, ids.video_track, Time::from_secs(12)).unwrap();
+        move_clip(&mut p, ids.v1, ids.video_track, Time::from_secs(1)).unwrap();
+        close_all_gaps(&mut p, ids.video_track).unwrap();
+        let starts: Vec<Time> = p
+            .timeline
+            .track(ids.video_track)
+            .unwrap()
+            .clips
+            .iter()
+            .map(|c| c.start)
+            .collect();
+        assert_eq!(starts, [Time::ZERO, Time::from_secs(5)]);
+        p.timeline.check_invariants(&p.assets).unwrap();
+        set_track_flag(&mut p, ids.video_track, TrackFlag::Locked, true).unwrap();
+        assert_eq!(
+            close_all_gaps(&mut p, ids.video_track),
+            Err(EditError::TrackLocked)
+        );
+    }
+
+    #[test]
+    fn a_track_emptied_by_an_edit_goes_away_but_a_new_empty_one_stays() {
+        let (mut p, ids) = sample_project();
+        let fresh = add_track(&mut p, TrackKind::Audio).unwrap();
+        let before = p.timeline.clone();
+        // A1 的唯一一段删掉：A1 收掉；刚加的空轨不动
+        delete_clips(&mut p, &[ids.a1]).unwrap();
+        assert!(prune_emptied_tracks(&before, &mut p));
+        assert!(p.timeline.track(ids.audio_track).is_none());
+        assert!(p.timeline.track(fresh).is_some());
+        // 主轨空了不收
+        let main_before = p.timeline.clone();
+        delete_clips(&mut p, &[ids.v1, ids.v2]).unwrap();
+        assert!(!prune_emptied_tracks(&main_before, &mut p));
+        assert!(p.timeline.track(ids.video_track).is_some());
+    }
+
+    #[test]
+    fn tools_and_tracks_can_be_placed_exactly_where_dropped() {
+        let (mut p, ids) = sample_project();
+        let slot = p
+            .timeline
+            .tracks
+            .iter()
+            .position(|t| t.id == ids.video_track)
+            .unwrap();
+        let top = insert_track_at(&mut p, TrackKind::Video, slot).unwrap();
+        assert_eq!(p.timeline.tracks[slot].id, top);
+        assert_eq!(
+            insert_track_at(&mut p, TrackKind::Audio, 0),
+            Err(EditError::WrongTrackKind)
+        );
+        let blur = crate::Effect::new(crate::EffectKind::Blur);
+        let fx = add_effect_on(&mut p, top, Time::from_secs(1), Time::from_secs(2), blur).unwrap();
+        assert_eq!(p.timeline.find_clip(fx).unwrap().0, top);
+        assert_eq!(
+            add_adjustment_on(&mut p, top, Time::from_secs(2), Time::from_secs(1)),
+            Err(EditError::Overlap)
+        );
+        assert_eq!(
+            add_adjustment_on(&mut p, ids.audio_track, Time::ZERO, Time::from_secs(1)),
+            Err(EditError::WrongTrackKind)
+        );
+        p.timeline.check_invariants(&p.assets).unwrap();
+    }
+
+    #[test]
+    fn look_sliders_and_effect_strength_take_keyframes() {
+        let (mut p, ids) = sample_project();
+        let mut look = crate::Look::NONE;
+        look.mask = Some(crate::Mask::new(crate::MaskShape::Circle));
+        set_look(&mut p, ids.v1, look).unwrap();
+        // 没开描边时不能给描边打关键帧
+        assert_eq!(
+            add_keyframe_props(&mut p, ids.v1, secs(1), &[crate::Prop::StrokeWidth]),
+            Err(EditError::InvalidValue)
+        );
+        add_keyframe_props(&mut p, ids.v1, secs(1), &[crate::Prop::MaskWidth]).unwrap();
+        let mut wide = look;
+        wide.mask.as_mut().unwrap().width = 1.5;
+        apply_look_at(&mut p, ids.v1, secs(3), wide).unwrap();
+        let masked = Arc::clone(p.timeline.find_clip(ids.v1).unwrap().1);
+        let w = |at| masked.look_at(at).mask.unwrap().width;
+        let base = look.mask.unwrap().width;
+        assert!((w(secs(1)) - base).abs() < 1e-6);
+        assert!((w(secs(3)) - 1.5).abs() < 1e-6);
+        assert!(w(secs(2)) > base && w(secs(2)) < 1.5, "中间按时间插值");
+        assert!(
+            (masked.look.mask.unwrap().width - base).abs() < 1e-6,
+            "固定值不动"
+        );
+        // 合成用的是这一刻的外观
+        let layers = crate::compose::resolve_layers(&p, secs(3));
+        assert!((layers[0].look.mask.unwrap().width - 1.5).abs() < 1e-6);
+        // 去掉蒙版：它的关键帧一起删
+        apply_look_at(&mut p, ids.v1, secs(3), crate::Look::NONE).unwrap();
+        let cleared = Arc::clone(p.timeline.find_clip(ids.v1).unwrap().1);
+        assert_eq!(cleared.animation.keys(crate::Prop::MaskWidth), []);
+
+        let fx = add_effect(
+            &mut p,
+            secs(0),
+            secs(4),
+            crate::Effect::new(crate::EffectKind::Blur),
+        )
+        .unwrap();
+        add_keyframe_props(&mut p, fx, secs(0), &[crate::Prop::EffectAmount]).unwrap();
+        let mut strong = crate::Effect::new(crate::EffectKind::Blur);
+        strong.amount = 1.0;
+        apply_effect_at(&mut p, fx, secs(2), strong).unwrap();
+        let faded = Arc::clone(p.timeline.find_clip(fx).unwrap().1);
+        assert!((faded.effect_at(secs(0)).unwrap().amount - 0.5).abs() < 1e-6);
+        assert!((faded.effect_at(secs(2)).unwrap().amount - 1.0).abs() < 1e-6);
+        assert!((faded.effect().unwrap().amount - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_caption_track_stays_the_bottom_text_track() {
+        let (mut p, ids) = sample_project();
+        add_subtitle(&mut p, secs(1), secs(1), "标题".into()).unwrap();
+        let subs = |proj: &Project| {
+            proj.timeline
+                .tracks
+                .iter()
+                .filter(|t| t.kind == TrackKind::Subtitle)
+                .map(|t| t.id)
+                .collect::<Vec<_>>()
+        };
+        let before = subs(&p);
+        assert_eq!(before.len(), 2);
+        // 拖到文字轨下面（字幕轨和视频轨之间）不能新开文字轨：那里不是文字轨的缝
+        let slots = insert_slots(&p.timeline, TrackKind::Subtitle).unwrap();
+        let bottom = p
+            .timeline
+            .tracks
+            .iter()
+            .rposition(|t| t.kind == TrackKind::Subtitle)
+            .unwrap();
+        assert!(!slots.contains(&(bottom + 1)), "{slots:?}");
+        // 字幕删光了：字幕轨不收（不然上面的标题轨就成了字幕轨）
+        let snapshot = p.timeline.clone();
+        delete_clips(&mut p, &[ids.s1]).unwrap();
+        prune_emptied_tracks(&snapshot, &mut p);
+        assert_eq!(subs(&p), before);
+    }
+
+    #[test]
+    fn editing_one_property_does_not_add_keys_to_untouched_ones() {
+        let (mut p, ids) = sample_project();
+        let mut look = crate::Look::NONE;
+        look.mask = Some(crate::Mask::new(crate::MaskShape::Circle));
+        set_look(&mut p, ids.v1, look).unwrap();
+        // 蒙版 X 在 0 秒、4 秒各一帧
+        add_keyframe_props(&mut p, ids.v1, secs(0), &[crate::Prop::MaskX]).unwrap();
+        let mut moved = look;
+        moved.mask.as_mut().unwrap().x = 0.3;
+        apply_look_at(&mut p, ids.v1, secs(4), moved).unwrap();
+        let keys = |proj: &Project, prop| {
+            proj.timeline
+                .find_clip(ids.v1)
+                .unwrap()
+                .1
+                .animation
+                .keys(prop)
+                .len()
+        };
+        assert_eq!(keys(&p, crate::Prop::MaskX), 2);
+        // 2 秒处只点「反转」：X 没动，不能在 2 秒多出一帧
+        let c = Arc::clone(p.timeline.find_clip(ids.v1).unwrap().1);
+        let mut flipped = c.look_at(secs(2));
+        flipped.mask.as_mut().unwrap().invert = true;
+        apply_look_at(&mut p, ids.v1, secs(2), flipped).unwrap();
+        assert_eq!(keys(&p, crate::Prop::MaskX), 2);
+        assert!(
+            p.timeline
+                .find_clip(ids.v1)
+                .unwrap()
+                .1
+                .look
+                .mask
+                .unwrap()
+                .invert
+        );
+
+        // 画面属性一样：X 有关键帧，在别处只改缩放，X 不多帧
+        add_keyframe_props(&mut p, ids.v1, secs(0), &[crate::Prop::X]).unwrap();
+        let later = Arc::clone(p.timeline.find_clip(ids.v1).unwrap().1);
+        let mut t = later.transform_at(secs(3));
+        t.scale = 0.5;
+        apply_transform_at(&mut p, ids.v1, secs(3), t).unwrap();
+        assert_eq!(keys(&p, crate::Prop::X), 1);
+
+        // 特效：强度有关键帧，换种类不多帧
+        let fx = add_effect(
+            &mut p,
+            secs(0),
+            secs(4),
+            crate::Effect::new(crate::EffectKind::Blur),
+        )
+        .unwrap();
+        add_keyframe_props(&mut p, fx, secs(0), &[crate::Prop::EffectAmount]).unwrap();
+        let mut other = crate::Effect::new(crate::EffectKind::Sharpen);
+        other.amount = crate::Effect::DEFAULT_AMOUNT;
+        apply_effect_at(&mut p, fx, secs(2), other).unwrap();
+        let fx_clip = Arc::clone(p.timeline.find_clip(fx).unwrap().1);
+        assert_eq!(fx_clip.animation.keys(crate::Prop::EffectAmount).len(), 1);
+        assert_eq!(fx_clip.effect().unwrap().kind, crate::EffectKind::Sharpen);
+    }
+
+    #[test]
+    fn changing_the_mask_shape_or_resetting_drops_its_keys() {
+        let (mut p, ids) = sample_project();
+        let mut look = crate::Look::NONE;
+        look.mask = Some(crate::Mask::new(crate::MaskShape::Circle));
+        set_look(&mut p, ids.v1, look).unwrap();
+        let key = |proj: &mut Project| {
+            add_keyframe_props(
+                proj,
+                ids.v1,
+                secs(0),
+                &[crate::Prop::MaskX, crate::Prop::MaskWidth],
+            )
+            .unwrap();
+            let mut moved = look;
+            moved.mask.as_mut().unwrap().x = 0.3;
+            apply_look_at(proj, ids.v1, secs(4), moved).unwrap();
+        };
+        let clip = |proj: &Project| Arc::clone(proj.timeline.find_clip(ids.v1).unwrap().1);
+        key(&mut p);
+        // 圆形换成线性：新形状是一个新蒙版，旧的关键帧（包括线性用不上的宽）都不留
+        let line = crate::Look {
+            mask: Some(crate::Mask::new(crate::MaskShape::Linear)),
+            ..look
+        };
+        apply_look_at(&mut p, ids.v1, secs(2), line).unwrap();
+        let c = clip(&p);
+        assert_eq!(c.animation.keys(crate::Prop::MaskX), []);
+        assert_eq!(c.animation.keys(crate::Prop::MaskWidth), []);
+        assert_eq!(c.look_at(secs(4)).mask, line.mask);
+        // 重置：这一组的关键帧清掉，回到默认值
+        apply_look_at(&mut p, ids.v1, secs(0), look).unwrap();
+        key(&mut p);
+        reset_look_at(&mut p, ids.v1, secs(2), look, &crate::Prop::MASK).unwrap();
+        let reset = clip(&p);
+        assert_eq!(reset.animation.keys(crate::Prop::MaskX), []);
+        assert_eq!(reset.look_at(secs(4)).mask, look.mask);
+    }
+
+    #[test]
+    fn cut_then_paste_works_after_the_emptied_track_was_tidied_away() {
+        let (mut p, ids) = sample_project();
+        // A1 上 0–8 秒有 a1：这段音频放到新开的 A2
+        let extra = place_audio(&mut p, ids.audio_asset, secs(0)).unwrap();
+        let audio_tracks = |proj: &Project| {
+            proj.timeline
+                .tracks
+                .iter()
+                .filter(|t| t.kind == TrackKind::Audio)
+                .count()
+        };
+        assert_eq!(audio_tracks(&p), 2);
+        // 剪切：复制 + 删除，A2 空了被收掉
+        let copied = copy_clips(&p, &[extra]).unwrap();
+        let snapshot = p.timeline.clone();
+        delete_clips(&mut p, &[extra]).unwrap();
+        prune_emptied_tracks(&snapshot, &mut p);
+        assert_eq!(audio_tracks(&p), 1);
+        // 粘回 0 秒：还是音频，A1 那段时间占着，就新开一条音频轨
+        let pasted = paste_clips(&mut p, &copied, secs(0)).unwrap();
+        let (track, _) = p.timeline.find_clip(pasted[0]).unwrap();
+        assert_eq!(p.timeline.track(track).unwrap().kind, TrackKind::Audio);
+        assert_eq!(audio_tracks(&p), 2);
+    }
+
+    #[test]
+    fn pasted_attributes_bring_only_the_keys_that_belong_to_them() {
+        let (mut p, ids) = sample_project();
+        // 源片段 v1：位置、音量、蒙版 X 都有关键帧
+        let mut look = crate::Look::NONE;
+        look.mask = Some(crate::Mask::new(crate::MaskShape::Circle));
+        set_look(&mut p, ids.v1, look).unwrap();
+        for prop in [crate::Prop::X, crate::Prop::Volume, crate::Prop::MaskX] {
+            add_keyframe_props(&mut p, ids.v1, secs(1), &[prop]).unwrap();
+        }
+        set_keyframe_easing(
+            &mut p,
+            ids.v1,
+            secs(1),
+            &[crate::Prop::X],
+            crate::Easing::Linear,
+        )
+        .unwrap();
+        // 目标：特效片段（强度有自己的关键帧）、另一段视频（音量有自己的关键帧）
+        let fx = add_effect(
+            &mut p,
+            secs(0),
+            secs(4),
+            crate::Effect::new(crate::EffectKind::Blur),
+        )
+        .unwrap();
+        add_keyframe_props(&mut p, fx, secs(2), &[crate::Prop::EffectAmount]).unwrap();
+        add_keyframe_props(&mut p, ids.v2, secs(2), &[crate::Prop::Volume]).unwrap();
+        let attrs = copy_attributes(&p, ids.v1).unwrap();
+        paste_attributes(&mut p, &[fx, ids.v2], &attrs).unwrap();
+        let get = |proj: &Project, id| Arc::clone(proj.timeline.find_clip(id).unwrap().1);
+        let effect = get(&p, fx);
+        assert_eq!(
+            effect.animation.keys(crate::Prop::EffectAmount).len(),
+            1,
+            "特效自己的强度帧还在"
+        );
+        assert_eq!(
+            effect.animation.keys(crate::Prop::Volume),
+            [],
+            "音量帧不跟过来"
+        );
+        assert_eq!(
+            effect.animation.keys(crate::Prop::MaskX),
+            [],
+            "特效片段没有外观，蒙版帧不跟过来"
+        );
+        let video = get(&p, ids.v2);
+        assert_eq!(video.animation.keys(crate::Prop::X).len(), 1);
+        assert_eq!(
+            video.animation.keys(crate::Prop::X)[0].easing,
+            crate::Easing::Linear,
+            "缓动一起带过来"
+        );
+        assert_eq!(video.animation.keys(crate::Prop::MaskX).len(), 1);
+        let volume = video.animation.keys(crate::Prop::Volume);
+        assert_eq!(
+            (volume.len(), volume[0].at),
+            (1, secs(2)),
+            "目标自己的音量帧不变"
+        );
+    }
+
+    #[test]
+    fn text_goes_around_hidden_tracks_and_a_locked_caption_track_says_so() {
+        let (mut p, _) = sample_project();
+        let captions = p
+            .timeline
+            .tracks
+            .iter()
+            .rfind(|t| t.kind == TrackKind::Subtitle)
+            .unwrap()
+            .id;
+        // 字幕轨隐藏着：新加的文字不放进去（放进去看不见）
+        p.timeline.track_mut(captions).unwrap().hidden = true;
+        let shown = add_subtitle(&mut p, secs(5), secs(1), "看得见".into()).unwrap();
+        let (track, _) = p.timeline.find_clip(shown).unwrap();
+        assert_ne!(track, captions);
+        assert!(!p.timeline.track(track).unwrap().hidden);
+        // 字幕轨锁着：加字幕、导入 SRT 报「锁着」，不是「重叠」
+        p.timeline.track_mut(captions).unwrap().hidden = false;
+        p.timeline.track_mut(captions).unwrap().locked = true;
+        assert_eq!(
+            add_caption(&mut p, secs(6), secs(1), "字幕".into()),
+            Err(EditError::TrackLocked)
+        );
+        let cues = [crate::srt::Cue {
+            start: secs(6),
+            end: secs(7),
+            text: "字幕".into(),
+        }];
+        assert_eq!(
+            crate::srt::import_srt(&mut p, &cues).map(|r| r.added.len()),
+            Err(EditError::TrackLocked)
         );
     }
 }

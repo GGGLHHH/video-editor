@@ -85,6 +85,22 @@ impl Workspace {
         self.proxies.min_short = min_short;
     }
 
+    /// 换代理文件的文件夹（全局设置「缓存位置」）；换了就当作还没有副本，重新找 / 重新做。
+    pub(crate) fn use_proxy_cache(&mut self, dir: PathBuf) {
+        if self.proxies.dir != dir {
+            self.proxies.dir = dir;
+            self.forget_proxies();
+        }
+    }
+
+    /// 忘掉已经做好 / 做失败的副本（清理缓存、换了缓存位置后）；正在做的照做完。
+    pub(crate) fn forget_proxies(&mut self) {
+        self.proxies.ready.clear();
+        self.proxies.failed.clear();
+        self.engine_revision = None;
+        self.sync_engine();
+    }
+
     /// 代理模式开着没有。
     #[must_use]
     pub const fn proxy_mode(&self) -> bool {

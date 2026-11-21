@@ -101,10 +101,14 @@ impl Workspace {
         })
     }
 
-    /// 播放头处各图层（从下往上）的片段、画面属性和几何。
+    /// 播放头处各图层（从下往上）的片段、画面属性和几何。视频轨上的复合片段算一个画布大小的图层
+    /// （整组一起点选、拖动、缩放、旋转）。
     fn layers_here(&self, canvas: (u32, u32)) -> Vec<(ClipId, Transform, LayerGeometry)> {
         let project = &self.doc.project;
-        resolve_layers(project, self.playhead)
+        let tracks = &project.timeline.tracks;
+        // 轨道在列表里从上到下：越靠后越在下面
+        let depth = |t: ve_core::TrackId| tracks.iter().position(|x| x.id == t).unwrap_or(0);
+        let mut layers: Vec<(usize, Layer)> = resolve_layers(project, self.playhead)
             .into_iter()
             .filter_map(|l| {
                 let info = project.assets.get(&l.asset)?.video?;
@@ -113,9 +117,51 @@ impl Workspace {
                     return None;
                 }
                 let geom = layer_geometry(canvas, (info.width, info.height), &l.transform);
-                Some((l.clip, l.transform, geom))
+                Some((depth(l.track), (l.clip, l.transform, geom)))
             })
-            .collect()
+            .collect();
+        // 复合片段：这一刻里面有画面时才算一个图层（空档、里面只有声音时不挡下面的图层）
+        let showing = self.compounds_showing();
+        for tr in tracks
+            .iter()
+            .filter(|t| t.kind == ve_core::TrackKind::Video && !t.hidden)
+        {
+            let here = tr.clips.iter().find(|c| {
+                showing.contains(&c.id) && c.start <= self.playhead && self.playhead < c.end()
+            });
+            if let Some(c) = here {
+                let t = c.transform_at(self.playhead - c.start);
+                // 整组的裁剪合成时不生效，框也不按裁剪画
+                let shown = Transform {
+                    crop: ve_core::Crop::default(),
+                    ..t
+                };
+                layers.push((
+                    depth(tr.id),
+                    (c.id, t, layer_geometry(canvas, canvas, &shown)),
+                ));
+            }
+        }
+        // 从下往上；同一条轨道上保持原来的先后
+        layers.sort_by_key(|(d, _)| std::cmp::Reverse(*d));
+        layers.into_iter().map(|(_, l)| l).collect()
+    }
+
+    /// 播放头这一刻有画面的复合片段（摊开后的图层往外找它们属于哪段复合片段，套几层都算）。
+    fn compounds_showing(&self) -> std::collections::HashSet<ClipId> {
+        let flat = &self.engine_project;
+        let mut out = std::collections::HashSet::new();
+        for l in resolve_layers(flat, self.playhead) {
+            let Some((_, c)) = flat.timeline.find_clip(l.clip) else {
+                continue;
+            };
+            let mut next = c.parent.as_deref();
+            while let Some(p) = next {
+                out.insert(p.id);
+                next = p.parent.as_deref();
+            }
+        }
+        out
     }
 
     /// 吸附开关（Alt 临时取反）下，这次操作是否吸附。
@@ -124,7 +170,10 @@ impl Workspace {
     }
 
     /// 选中的片段（单选）在播放头处可见时，它的画面属性和几何。
-    fn selected_layer(&self, canvas: (u32, u32)) -> Option<(ClipId, Transform, LayerGeometry)> {
+    pub(crate) fn selected_layer(
+        &self,
+        canvas: (u32, u32),
+    ) -> Option<(ClipId, Transform, LayerGeometry)> {
         let [selected] = self.doc.selection() else {
             return None;
         };
@@ -164,6 +213,11 @@ impl Workspace {
         let p = m.to_canvas((f32::from(e.position.x), f32::from(e.position.y)));
         // 抠像的取色器：这一下是取色，不是选中 / 拖动
         if self.pick_key_color(p, m.canvas, window, cx) {
+            return;
+        }
+        // 属性面板在「蒙版」：按在蒙版上是拖蒙版
+        if self.mask_mouse_down(p, m.canvas, 1.0 / m.scale) {
+            cx.notify();
             return;
         }
         let Some(((clip, start, geom), mode)) = self.pick(m, p) else {
@@ -216,6 +270,23 @@ impl Workspace {
         let Some(m) = self.mapping() else { return };
         let snapping = self.snapping_for(e.modifiers.alt);
         let p = m.to_canvas((f32::from(e.position.x), f32::from(e.position.y)));
+        if self.mask_mouse_move(
+            p,
+            (e.pressed_button.is_some(), e.modifiers.shift),
+            window,
+            cx,
+        ) {
+            return;
+        }
+        if self.preview.drag.is_none()
+            && let Some(cursor) = self.mask_hover_cursor(p, m.canvas, 1.0 / m.scale)
+        {
+            if cursor != self.preview.cursor {
+                self.preview.cursor = cursor;
+                cx.notify();
+            }
+            return;
+        }
         let Some(drag) = self.preview.drag.as_mut() else {
             // 没在拖：鼠标样式提示按下去会做什么
             let picked = self.pick(m, p);
@@ -275,6 +346,10 @@ impl Workspace {
     }
 
     pub(crate) fn preview_mouse_up(&mut self, cx: &mut Context<'_, Self>) {
+        if self.mask_mouse_up() {
+            cx.notify();
+            return;
+        }
         if let Some(drag) = self.preview.drag.take() {
             self.doc.end_gesture();
             // 可能在预览外面松开（之后收不到预览的悬停事件）：先交还光标，下次移动再按位置定
@@ -312,6 +387,23 @@ impl Workspace {
         let Some(m) = self.mapping() else {
             return Vec::new();
         };
+        #[expect(clippy::cast_precision_loss, reason = "画布尺寸远小于 2^23")]
+        let video = (
+            m.x,
+            m.y,
+            m.canvas.0 as f32 * m.scale,
+            m.canvas.1 as f32 * m.scale,
+        );
+        // 属性面板在「蒙版」：画蒙版的轮廓和手柄，不画选中框
+        if let Some(mask) = self.render_mask_overlay(
+            |p| m.to_screen(p),
+            m.canvas,
+            1.0 / m.scale,
+            video,
+            cx.theme().background,
+        ) {
+            return vec![mask];
+        }
         let Some((.., geom)) = self.selected_layer(m.canvas) else {
             return Vec::new();
         };

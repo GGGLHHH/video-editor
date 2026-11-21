@@ -39,23 +39,29 @@ impl Workspace {
         cx: &mut Context<'_, Self>,
     ) {
         if let Some(clip) = self.apply(window, cx, |p| {
-            ve_core::edit::add_subtitle(p, end, NEW_SUBTITLE, "新字幕".into())
+            ve_core::edit::add_caption(p, end, NEW_SUBTITLE, "新字幕".into())
         }) {
             self.pick_subtitle(clip, end, window, cx);
         }
+    }
+
+    /// 字幕列表列的片段：字幕轨（最下面那条文字轨）上的，上面叠放的标题不算。
+    fn caption_clips(&self) -> Vec<std::sync::Arc<ve_core::Clip>> {
+        self.doc
+            .project
+            .timeline
+            .tracks
+            .iter()
+            .rfind(|t| t.kind == TrackKind::Subtitle)
+            .map(|t| t.clips.clone())
+            .unwrap_or_default()
     }
 
     pub(crate) fn render_subtitle_list(&self, cx: &Context<'_, Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         let current = self.inspector.bound;
         let playhead = self.playhead;
-        let clips: Vec<_> = self
-            .doc
-            .project
-            .timeline
-            .track_of_kind(TrackKind::Subtitle)
-            .map(|t| t.clips.clone())
-            .unwrap_or_default();
+        let clips = self.caption_clips();
         let rows = clips.iter().enumerate().map(|(i, c)| {
             let (id, start, end) = (c.id, c.start, c.end());
             let text = c.subtitle_text().unwrap_or_default().replace('\n', " ");

@@ -62,7 +62,21 @@ type FrameLayers = (
     Vec<LayerFrame>,
     (ve_core::ColorMatrix, ve_core::GradeChain),
     Vec<ve_core::EffectPass>,
+    Vec<ve_core::compose::GroupPass>,
 );
+
+/// 各层画不画：素材有画面的才画。
+fn drawn_layers(project: &Project, layers: &[ve_core::compose::LayerSource]) -> Vec<bool> {
+    layers
+        .iter()
+        .map(|l| {
+            project
+                .assets
+                .get(&l.asset)
+                .is_some_and(|a| a.video.is_some())
+        })
+        .collect()
+}
 
 /// 按顺序读一个片段的画面：第一次定位，之后一直往后读。
 struct Stepper {
@@ -183,17 +197,10 @@ fn layer_frames(
         background,
         background_grades,
         effects,
+        groups,
     } = resolve_frame(project, t);
-    // 素材没有画面的层不画：特效压在哪几层上要按画出来的算
-    let kept: Vec<bool> = layers
-        .iter()
-        .map(|l| {
-            project
-                .assets
-                .get(&l.asset)
-                .is_some_and(|a| a.video.is_some())
-        })
-        .collect();
+    // 素材没有画面的层不画：特效、分组压在哪几层上要按画出来的算
+    let kept = drawn_layers(project, &layers);
     let effects = ve_core::EffectPass::remap(&effects, &kept);
     steppers.retain(|key, _| layers.iter().any(|l| (l.track, l.clip) == *key));
     let mut jobs = Vec::with_capacity(layers.len());
@@ -277,7 +284,8 @@ fn layer_frames(
         steppers.insert(key, stepper);
         frames.push(r?);
     }
-    Ok((frames, (background, background_grades), effects))
+    let groups = ve_core::compose::GroupPass::remap(&groups, &kept);
+    Ok((frames, (background, background_grades), effects, groups))
 }
 
 fn render_error(name: &str, e: &MediaError) -> ExportError {
@@ -346,7 +354,7 @@ pub fn render_video(
                 });
                 break;
             };
-            let (layers, background, effects) = match layers {
+            let (layers, background, effects, groups) = match layers {
                 Ok(l) => l,
                 Err(e) => {
                     outcome = Err(e);
@@ -373,6 +381,7 @@ pub fn render_video(
                 .collect();
             compositor.set_background_chain(&background.0, &background.1);
             compositor.set_effects(&effects);
+            compositor.set_groups(&groups);
             if let Err(e) = compositor.submit_nv12(size, &gpu) {
                 outcome = Err(ExportError::Render(e.to_string()));
                 break;

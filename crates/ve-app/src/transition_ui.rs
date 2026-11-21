@@ -96,9 +96,14 @@ impl Workspace {
                 cx.listener(|this, _, window, cx| this.apply_transition(None, window, cx)),
             ))
             .children(TransitionKind::ALL.map(|kind| {
-                tile(format!("tr-{}", slug(kind)).into(), kind.label()).on_click(cx.listener(
-                    move |this, _, window, cx| this.apply_transition(Some(kind), window, cx),
-                ))
+                crate::timeline::drop::draggable(
+                    tile(format!("tr-{}", slug(kind)).into(), kind.label()),
+                    crate::timeline::drop::BinItem::Transition(kind),
+                    kind.label(),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.apply_transition(Some(kind), window, cx);
+                }))
             }));
         v_flex()
             .id("bin-transitions")

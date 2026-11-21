@@ -320,6 +320,7 @@ impl Worker<'_> {
             background,
             background_grades,
             effects,
+            groups,
         } = ve_core::compose::resolve_frame(project, t);
         let frames = self.layer_frames(project, &layers);
         if frames.iter().all(Option::is_none)
@@ -385,6 +386,7 @@ impl Worker<'_> {
             .collect();
         compositor.set_background_chain(&background, &background_grades);
         compositor.set_effects(&ve_core::EffectPass::remap(&effects, &kept));
+        compositor.set_groups(&ve_core::compose::GroupPass::remap(&groups, &kept));
         let mut data = Vec::new();
         match compositor.compose_bgra(canvas, &gpu_layers, &mut data) {
             Ok(()) => Some(Arc::new(VideoFrame {

@@ -93,6 +93,7 @@ fn compound_clip(id: ClipId, start: Time, inner: Arc<Compound>) -> Clip {
         frame_blend: false,
         stabilized: None,
         input_space: None,
+        parent: None,
     }
 }
 
@@ -271,7 +272,7 @@ fn window(
 /// 返回放回去的片段。
 ///
 /// # Errors
-/// 不是复合片段；轨道锁着；字幕放不下（字幕轨只有一条）。
+/// 不是复合片段；轨道锁着。
 pub fn break_compound(project: &mut Project, clip: ClipId) -> Result<Vec<ClipId>, EditError> {
     let (track_id, c) = project
         .timeline
@@ -325,14 +326,12 @@ pub fn break_compound(project: &mut Project, clip: ClipId) -> Result<Vec<ClipId>
             .and_then(|(_, id)| tracks.iter().position(|t| t.id == *id));
         let ti = if let Some(floor) = floor {
             // 在下面那条的上方找最近的；没有就紧贴着它上面新建一条
-            match (0..floor).rev().find(|&i| fits(&tracks[i])) {
-                Some(i) => i,
-                None if it.kind == TrackKind::Subtitle => return Err(EditError::WrongTrackKind),
-                None => {
-                    let id = next.ids.track();
-                    next.timeline.tracks.insert(floor, Track::new(id, it.kind));
-                    floor
-                }
+            if let Some(i) = (0..floor).rev().find(|&i| fits(&tracks[i])) {
+                i
+            } else {
+                let id = next.ids.track();
+                next.timeline.tracks.insert(floor, Track::new(id, it.kind));
+                floor
             }
         } else {
             // 最下面一条：原来那条（复合片段所在的）优先，再往上找最近的，再找别的
@@ -357,6 +356,48 @@ pub fn break_compound(project: &mut Project, clip: ClipId) -> Result<Vec<ClipId>
     Ok(placed)
 }
 
+/// 进入复合片段编辑完回来（剪映「返回上一层」）：里面换成 `tracks`（空轨道丢掉），名字不变；
+/// 里面变短了，复合片段跟着截短；里面什么都不剩了，这段复合片段删掉。
+///
+/// # Errors
+/// 片段不存在、不是复合片段；轨道锁着。
+pub fn set_inner(project: &mut Project, clip: ClipId, tracks: Vec<Track>) -> Result<(), EditError> {
+    let (track, c) = project
+        .timeline
+        .find_clip(clip)
+        .ok_or(EditError::ClipNotFound(clip))?;
+    let Some((inner, source_in)) = c.compound() else {
+        return Err(EditError::WrongTrackKind);
+    };
+    if project.timeline.track(track).is_some_and(|t| t.locked) {
+        return Err(EditError::TrackLocked);
+    }
+    let name = inner.name.clone();
+    let tracks: Vec<Track> = tracks.into_iter().filter(|t| !t.clips.is_empty()).collect();
+    let next = Arc::new(Compound { name, tracks });
+    let room = next.duration() - source_in;
+    if room <= Time::ZERO {
+        return crate::edit::delete_clips(project, &[clip]);
+    }
+    let ti = project
+        .timeline
+        .tracks
+        .iter()
+        .position(|t| t.id == track)
+        .ok_or(EditError::TrackNotFound(track))?;
+    let tr = &mut project.timeline.tracks[ti];
+    let i = tr.index_of(clip).ok_or(EditError::ClipNotFound(clip))?;
+    let slot = Arc::make_mut(&mut tr.clips[i]);
+    slot.content = ClipContent::Compound {
+        inner: next,
+        source_in,
+    };
+    slot.duration = slot.duration.min(room);
+    slot.fade_in = slot.fade_in.min(slot.duration);
+    slot.fade_out = slot.fade_out.min(slot.duration - slot.fade_in);
+    Ok(())
+}
+
 /// 合成两个编号：摊开的片段 / 轨道要有稳定又不和真实编号撞的 id（解码器按片段 id 缓存）。
 const fn synth(outer: u64, inner: u64) -> u64 {
     0x4000_0000_0000_0000
@@ -373,6 +414,32 @@ pub fn has_compound(project: &Project) -> bool {
         .any(|t| t.clips.iter().any(|c| c.compound().is_some()))
 }
 
+/// 把复合片段的音量 `db` 叠到里面一段上：固定值和每个音量关键帧都加上，夹在音量范围里。
+fn stack_gain(piece: &mut Clip, db: f32) {
+    let (lo, hi) = crate::keyframe::VOLUME_RANGE_DB;
+    piece.gain_db = (piece.gain_db + db).clamp(lo, hi);
+    let keys: Vec<crate::Key> = piece.animation.keys(crate::Prop::Volume).to_vec();
+    for k in keys {
+        piece
+            .animation
+            .upsert(crate::Prop::Volume, k.at, (k.value + db).clamp(lo, hi));
+    }
+}
+
+/// 摊开的片段记下外面那段复合片段 `parent`（合成时套上它的画面属性）；里面本来就有外层
+/// （复合片段套复合片段）时，接到最外面，原来那几层的起点跟着片段一起挪 `shift`。
+fn adopt(piece: &mut Clip, parent: &Arc<Clip>, shift: Time) {
+    piece.parent = Some(piece.parent.take().map_or_else(
+        || Arc::clone(parent),
+        |inner| {
+            let mut inner = (*inner).clone();
+            inner.start += shift;
+            adopt(&mut inner, parent, shift);
+            Arc::new(inner)
+        },
+    ));
+}
+
 /// 摊开一组轨道（从上到下）：复合片段换成里面的轨道。
 fn flatten_tracks(tracks: &[Track]) -> Vec<Track> {
     let mut subtitles = Vec::new();
@@ -387,15 +454,26 @@ fn flatten_tracks(tracks: &[Track]) -> Vec<Track> {
                 continue;
             };
             let outer = c.id.0;
+            let shift = c.start - source_in;
+            let parent = Arc::clone(c);
             for it in flatten_tracks(&inner.tracks) {
-                let pieces = window(
+                let mut pieces = window(
                     &it,
                     source_in,
                     source_in + c.duration,
-                    c.start - source_in,
+                    shift,
                     // 一段原片段在范围里只留一块：按原 id 合成，裁剪时 id 不变
                     &mut |id, _| ClipId(synth(outer, id.0)),
                 );
+                for piece in &mut pieces {
+                    let piece = Arc::make_mut(piece);
+                    adopt(piece, &parent, shift);
+                    // 复合片段的音量叠到里面的声音上（音频轨和视频的原声都算；有音量关键帧的，
+                    // 每个关键帧也一起挪）
+                    if it.kind != TrackKind::Subtitle && parent.gain_db != 0.0 {
+                        stack_gain(piece, parent.gain_db);
+                    }
+                }
                 let mut track = it.clone();
                 track.id = TrackId(synth(outer, it.id.0));
                 track.clips = pieces;
@@ -633,5 +711,160 @@ mod tests {
         assert_eq!(layers_right[0].source_time, secs(4));
         assert_ne!(layers_left[0].clip, layers_right[0].clip);
         p.timeline.check_invariants(&p.assets).unwrap();
+    }
+
+    #[test]
+    fn the_compounds_own_picture_and_volume_reach_whats_inside() {
+        let (mut p, ids) = sample_project();
+        let cc = make_compound(&mut p, &[ids.v1, ids.v2, ids.a1]).unwrap();
+        let group = crate::Transform {
+            x: 0.1,
+            scale: 0.5,
+            opacity: 0.5,
+            ..crate::Transform::default()
+        };
+        crate::edit::set_transform(&mut p, cc, group).unwrap();
+        crate::edit::set_gain(&mut p, cc, -6.0).unwrap();
+        let flat = flatten(&p).unwrap();
+        let frame = crate::compose::resolve_frame(&flat, secs(1));
+        assert_eq!(frame.layers.len(), 1);
+        let shown = frame.layers[0].transform;
+        assert!((shown.scale - 0.5).abs() < 1e-6 && (shown.x - 0.1).abs() < 1e-6);
+        // 不透明度按整组算
+        assert!((shown.opacity - 1.0).abs() < 1e-6);
+        assert_eq!(frame.groups.len(), 1);
+        assert!((frame.groups[0].opacity - 0.5).abs() < 1e-6);
+        let gain = flat
+            .timeline
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Audio)
+            .flat_map(|t| t.clips.iter())
+            .map(|c| c.gain_db)
+            .next()
+            .unwrap();
+        assert!((gain + 6.0).abs() < 1e-6, "复合片段的音量叠到里面");
+    }
+
+    #[test]
+    fn nested_compounds_stack_their_pictures_at_the_right_time() {
+        let (mut p, ids) = sample_project();
+        let inner = make_compound(&mut p, &[ids.v1, ids.v2]).unwrap();
+        let half = crate::Transform {
+            scale: 0.5,
+            ..crate::Transform::default()
+        };
+        crate::edit::set_transform(&mut p, inner, half).unwrap();
+        let outer = make_compound(&mut p, &[inner]).unwrap();
+        crate::edit::set_transform(&mut p, outer, half).unwrap();
+        // 外面那段挪到 3 秒：里面那层的起点也要跟着挪，6 秒处是 v1 的第 3 秒
+        crate::edit::move_clip(&mut p, outer, ids.video_track, secs(3)).unwrap();
+        let flat = flatten(&p).unwrap();
+        let layers = crate::compose::resolve_layers(&flat, secs(6));
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].source_time, secs(3));
+        assert!(
+            (layers[0].transform.scale - 0.25).abs() < 1e-6,
+            "两层各缩一半"
+        );
+        assert_eq!(crate::compose::resolve_layers(&flat, secs(2)), []);
+    }
+
+    #[test]
+    fn the_compound_volume_also_reaches_video_sound_and_volume_keys() {
+        let (mut p, ids) = sample_project();
+        // a1 有音量关键帧：0 秒 -10 dB、4 秒 0 dB
+        crate::edit::add_keyframe_props(&mut p, ids.a1, secs(0), &[crate::Prop::Volume]).unwrap();
+        crate::edit::apply_gain_at(&mut p, ids.a1, secs(0), -10.0).unwrap();
+        crate::edit::apply_gain_at(&mut p, ids.a1, secs(4), 0.0).unwrap();
+        let cc = make_compound(&mut p, &[ids.v1, ids.a1]).unwrap();
+        crate::edit::set_gain(&mut p, cc, -6.0).unwrap();
+        let flat = flatten(&p).unwrap();
+        let all: Vec<(TrackKind, Arc<Clip>)> = flat
+            .timeline
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter().map(move |c| (t.kind, Arc::clone(c))))
+            .collect();
+        let video = &all.iter().find(|(k, _)| *k == TrackKind::Video).unwrap().1;
+        assert!(
+            (video.gain_db + 6.0).abs() < 1e-6,
+            "视频的原声也跟着小 6 dB"
+        );
+        let audio = &all.iter().find(|(k, _)| *k == TrackKind::Audio).unwrap().1;
+        assert!(
+            (audio.gain_db_at(secs(0)) + 16.0).abs() < 1e-4,
+            "{}",
+            audio.gain_db_at(secs(0))
+        );
+        assert!((audio.gain_db_at(secs(4)) + 6.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_translucent_compound_fades_as_one_group() {
+        let (mut p, ids) = sample_project();
+        // v2 挪到上面一条视频轨的 0 秒：和 v1 叠在一起
+        let upper = crate::edit::add_track(&mut p, TrackKind::Video).unwrap();
+        crate::edit::move_clip(&mut p, ids.v2, upper, secs(0)).unwrap();
+        let cc = make_compound(&mut p, &[ids.v1, ids.v2]).unwrap();
+        let half = crate::Transform {
+            opacity: 0.5,
+            ..crate::Transform::default()
+        };
+        crate::edit::set_transform(&mut p, cc, half).unwrap();
+        let flat = flatten(&p).unwrap();
+        let frame = crate::compose::resolve_frame(&flat, secs(1));
+        // 里面两层各自不透明，整组一起半透明（不是每层各乘一半，那样重叠处会透出下面那层）
+        assert_eq!(frame.layers.len(), 2);
+        assert!(
+            frame
+                .layers
+                .iter()
+                .all(|l| (l.transform.opacity - 1.0).abs() < 1e-6)
+        );
+        assert_eq!(
+            frame.groups,
+            [crate::compose::GroupPass {
+                start: 0,
+                end: 2,
+                effects_end: 0,
+                opacity: 0.5,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_compounds_own_grade_comes_after_the_adjustments_inside_it() {
+        let (mut p, ids) = sample_project();
+        // 里面：v1 上面压一层调节片段（提亮）
+        let upper = crate::edit::add_track(&mut p, TrackKind::Video).unwrap();
+        let adj = crate::edit::add_adjustment_on(&mut p, upper, secs(0), secs(5)).unwrap();
+        let bright = crate::ColorAdjust {
+            brightness: 0.3,
+            ..crate::ColorAdjust::default()
+        };
+        crate::edit::set_adjust(&mut p, adj, bright).unwrap();
+        let cc = make_compound(&mut p, &[ids.v1, adj]).unwrap();
+        // 复合片段自己：加对比度
+        let contrast = crate::ColorAdjust {
+            contrast: 0.5,
+            ..crate::ColorAdjust::default()
+        };
+        crate::edit::set_adjust(&mut p, cc, contrast).unwrap();
+        let flat = flatten(&p).unwrap();
+        let layers = crate::compose::resolve_layers(&flat, secs(1));
+        assert_eq!(layers.len(), 1);
+        // 先里面的提亮，再整组的对比度（反过来结果不一样）
+        let want = bright
+            .matrix()
+            .then(&contrast.matrix())
+            .apply([0.2, 0.2, 0.2]);
+        let wrong = contrast
+            .matrix()
+            .then(&bright.matrix())
+            .apply([0.2, 0.2, 0.2]);
+        assert!((want[0] - wrong[0]).abs() > 1e-3, "两个顺序要能分出来");
+        let got = layers[0].color.apply([0.2, 0.2, 0.2]);
+        assert!((got[0] - want[0]).abs() < 1e-4, "{got:?} vs {want:?}");
     }
 }

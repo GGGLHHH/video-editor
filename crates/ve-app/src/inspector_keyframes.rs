@@ -51,7 +51,10 @@ impl Workspace {
             offset,
             on_clip: offset >= Time::ZERO && offset < c.duration,
             times: c.animation.times_of(&Prop::TRANSFORM),
-            easing_here: c.animation.easing_of(&Prop::TRANSFORM, offset),
+            // 缓动管这一刻所有属性的关键帧（画面、调色、外观、音量……）
+            easing_here: c
+                .animation
+                .easing_of(&c.animation.props().collect::<Vec<_>>(), offset),
         })
     }
 
@@ -86,8 +89,54 @@ impl Workspace {
     fn set_easing_here(&mut self, easing: Easing, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some(k) = self.key_state() else { return };
         self.apply(window, cx, |p| {
-            set_keyframe_easing(p, k.clip, k.offset, &Prop::TRANSFORM, easing)
+            let all: Vec<Prop> = p
+                .timeline
+                .find_clip(k.clip)
+                .map(|(_, c)| c.animation.props().collect())
+                .unwrap_or_default();
+            set_keyframe_easing(p, k.clip, k.offset, &all, easing)
         });
+    }
+
+    /// 播放头正好在 `props` 的关键帧上时，一排缓动按钮（编号 `{prefix}-ease-…`），只改这几个属性
+    /// 在这一刻的关键帧；不在关键帧上时 `None`。画面以外的属性（比如特效强度）用。
+    pub(crate) fn render_easing_row(
+        &self,
+        props: &'static [Prop],
+        prefix: &'static str,
+        cx: &Context<'_, Self>,
+    ) -> Option<impl IntoElement> {
+        let (clip, _, offset, _) = self.bound_offset()?;
+        let (_, c) = self.doc.project.timeline.find_clip(clip)?;
+        let current = c.animation.easing_of(props, offset)?;
+        Some(
+            EASINGS
+                .into_iter()
+                .fold(h_flex().gap_1(), move |row, (id, label, e)| {
+                    let id = id.replacen("tf", prefix, 1);
+                    row.child(
+                        Button::new(gpui_kit::SharedString::from(id))
+                            .ghost()
+                            .compact()
+                            .label(label)
+                            .when(current == e, ButtonVariants::primary)
+                            .tooltip("从这个关键帧到下一个的快慢")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.apply(window, cx, |p| {
+                                    set_keyframe_easing(p, clip, offset, props, e)
+                                });
+                            })),
+                    )
+                }),
+        )
+    }
+
+    /// 播放头落在片段 `c` 里的位置（读值、打关键帧用，见 [`ve_core::Clip::key_offset`]）。
+    pub(crate) fn key_offset(&self, c: &ve_core::Clip) -> Time {
+        c.key_offset(
+            self.playhead,
+            self.doc.project.settings.frame_rate.frame_duration(),
+        )
     }
 
     /// 选中的那一个片段（任何轨道）和播放头的关系：（片段，起点，播放头相对起点，播放头在片段上）。
@@ -189,6 +238,8 @@ impl Workspace {
             KeyGroup::Adjust(ve_core::AdjustItem::Temperature) => "temperature",
             KeyGroup::Adjust(ve_core::AdjustItem::Tint) => "tint",
             KeyGroup::Volume => "volume",
+            KeyGroup::Effect => "effect",
+            KeyGroup::Look(p) => look_key_name(p),
         };
         let id = |suffix: &str| -> gpui_kit::SharedString {
             if suffix.is_empty() {
@@ -307,5 +358,27 @@ impl Workspace {
                 })
         });
         Some(v_flex().gap_1().child(keys).children(easing))
+    }
+}
+
+/// 外观属性那一行关键帧按钮的编号后缀（`tf-key-<后缀>`）。
+const fn look_key_name(p: Prop) -> &'static str {
+    match p {
+        Prop::Radius => "radius",
+        Prop::StrokeWidth => "stroke-width",
+        Prop::ShadowOpacity => "shadow-opacity",
+        Prop::ShadowBlur => "shadow-blur",
+        Prop::ShadowDistance => "shadow-distance",
+        Prop::ShadowAngle => "shadow-angle",
+        Prop::KeyIntensity => "key-intensity",
+        Prop::KeyShadow => "key-shadow",
+        Prop::MaskX => "mask-x",
+        Prop::MaskY => "mask-y",
+        Prop::MaskWidth => "mask-w",
+        Prop::MaskHeight => "mask-h",
+        Prop::MaskRotation => "mask-rot",
+        Prop::MaskFeather => "mask-feather",
+        Prop::MaskRound => "mask-round",
+        _ => "other",
     }
 }

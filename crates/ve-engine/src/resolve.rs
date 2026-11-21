@@ -158,10 +158,12 @@ pub struct SubtitleShow<'a> {
 /// 时刻 `t` 要显示的字幕（和导出的 ASS 按同一套公式）。
 #[must_use]
 pub fn resolve_subtitle_shows(project: &Project, t: Time) -> Vec<SubtitleShow<'_>> {
+    // 轨道列表从上到下；画的时候从下往上，上面那条文字轨盖在下面的上面（剪映的层级）
     project
         .timeline
         .tracks
         .iter()
+        .rev()
         .filter(|tr| tr.kind == TrackKind::Subtitle && tr.shows())
         .filter_map(|tr| {
             let c = tr.clip_at(t).filter(|c| c.enabled())?;
@@ -440,5 +442,22 @@ mod tests {
         // 上层还没开始：只有下层
         assert_eq!(resolve_layers(&p, Time::from_millis(500)).len(), 1);
         assert_eq!(resolve_layers(&p, secs(30)), []);
+    }
+
+    #[test]
+    fn stacked_text_is_listed_bottom_track_first_so_upper_tracks_draw_on_top() {
+        let (mut p, _) = sample_project();
+        // s1 在 1–3 秒；同一时刻再加一条：叠到上面新开的文字轨
+        ve_core::edit::add_subtitle(
+            &mut p,
+            Time::from_secs(1),
+            Time::from_secs(2),
+            "标题".into(),
+        )
+        .unwrap();
+        let shows = resolve_subtitle_shows(&p, Time::from_millis(1500));
+        assert_eq!(shows.len(), 2);
+        assert_eq!(shows[0].text, "你好", "下面的先画");
+        assert_eq!(shows[1].text, "标题", "上面的后画、盖在上面");
     }
 }

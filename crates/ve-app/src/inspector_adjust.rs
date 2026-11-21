@@ -68,7 +68,7 @@ impl Workspace {
         let clip = self.inspector.bound?;
         let (track, c) = self.doc.project.timeline.find_clip(clip)?;
         let video = self.doc.project.timeline.track(track)?.kind == ve_core::TrackKind::Video;
-        let offset = (self.playhead - c.start).clamp(Time::ZERO, c.duration);
+        let offset = self.key_offset(c);
         video.then(|| (clip, c.adjust_at(offset), offset))
     }
 
@@ -87,7 +87,7 @@ impl Workspace {
             return;
         };
         let c = std::sync::Arc::clone(c);
-        let offset = (self.playhead - c.start).clamp(Time::ZERO, c.duration);
+        let offset = self.key_offset(&c);
         let colour_keys = Prop::ADJUST
             .iter()
             .any(|p| !c.animation.keys(*p).is_empty());

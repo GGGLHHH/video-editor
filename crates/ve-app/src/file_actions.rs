@@ -25,6 +25,7 @@ impl Workspace {
         cx: &mut Context<'_, Self>,
         then: impl FnOnce(&mut Self, &mut Window, &mut Context<'_, Self>) + 'static,
     ) {
+        self.leave_all_compounds(window, cx);
         if !self.doc.is_dirty() {
             then(self, window, cx);
             return;
@@ -79,6 +80,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> bool {
+        // 在复合片段里面：先回到最外层再存（存的是整个工程）
+        self.leave_all_compounds(window, cx);
         match project_io::save(&mut self.doc, path) {
             Ok(saved) => {
                 self.remember_recent(saved);
@@ -242,7 +245,7 @@ impl Workspace {
         self.tasks.push(cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(path))) = rx.await {
                 let _ignored = this.update_in(cx, |this, window, cx| {
-                    let text = write_srt(&export_srt(&this.doc.project));
+                    let text = write_srt(&export_srt(&this.whole_project()));
                     match std::fs::write(&path, text) {
                         Ok(()) => crate::workspace::notify(
                             Notification::success("字幕已导出"),

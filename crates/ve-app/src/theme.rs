@@ -131,6 +131,11 @@ pub mod palette {
     pub fn ghost() -> Hsla {
         rgba(0xffff_ff1f).into()
     }
+    /// 从素材面板拖进时间轴时，新片段会落在哪的框（主题青、半透明）。
+    #[must_use]
+    pub fn drop_preview() -> Hsla {
+        rgba(0x2ad1_d433).into()
+    }
     /// 框选矩形的填充。
     #[must_use]
     pub fn marquee() -> Hsla {

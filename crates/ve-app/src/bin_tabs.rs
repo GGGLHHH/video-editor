@@ -216,37 +216,40 @@ impl Workspace {
         let muted = cx.theme().muted_foreground;
         let tiles = FILTERS.iter().enumerate().map(|(i, &f)| {
             let on = self.all_selected_use(&f.adjust);
-            v_flex()
+            let card = v_flex()
                 .id(SharedString::from(format!("filter-{i}")))
-                .test_support()
-                .group("filter-tile")
-                .w(px(88.))
-                .gap_1()
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, window, cx| this.apply_filter(f, window, cx)))
-                .child(
-                    h_flex()
-                        .w(px(88.))
-                        .h(px(50.))
-                        .rounded(px(4.))
-                        .overflow_hidden()
-                        .border_2()
-                        .border_color(if on {
-                            palette::accent()
-                        } else {
-                            gpui_kit::transparent_black()
-                        })
-                        .group_hover("filter-tile", |s| s.border_color(palette::accent()))
-                        .children(
-                            SWATCH.map(|c| div().flex_1().h_full().bg(color(f.adjust.apply(c)))),
-                        ),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(if on { palette::accent() } else { muted })
-                        .child(f.name),
-                )
+                .test_support();
+            crate::timeline::drop::draggable(
+                card,
+                crate::timeline::drop::BinItem::Filter(i),
+                f.name,
+            )
+            .group("filter-tile")
+            .w(px(88.))
+            .gap_1()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| this.apply_filter(f, window, cx)))
+            .child(
+                h_flex()
+                    .w(px(88.))
+                    .h(px(50.))
+                    .rounded(px(4.))
+                    .overflow_hidden()
+                    .border_2()
+                    .border_color(if on {
+                        palette::accent()
+                    } else {
+                        gpui_kit::transparent_black()
+                    })
+                    .group_hover("filter-tile", |s| s.border_color(palette::accent()))
+                    .children(SWATCH.map(|c| div().flex_1().h_full().bg(color(f.adjust.apply(c))))),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(if on { palette::accent() } else { muted })
+                    .child(f.name),
+            )
         });
         v_flex()
             .id("bin-filters")
@@ -283,8 +286,11 @@ impl Workspace {
                 "在播放头处加一段调节：给它下面所有轨道的画面一起调色（调节层），在属性面板「调整」里改；也能套滤镜",
             ))
             .child(
-                div()
-                    .id("bin-adjust-custom")
+                crate::timeline::drop::draggable(
+                    div().id("bin-adjust-custom"),
+                    crate::timeline::drop::BinItem::Adjustment,
+                    "自定义调节",
+                )
                     .test_support()
                     .w(px(88.))
                     .h(px(88.))

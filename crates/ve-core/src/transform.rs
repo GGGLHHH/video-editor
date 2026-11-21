@@ -39,6 +39,45 @@ pub struct Transform {
     pub mirror: bool,
 }
 
+impl Transform {
+    /// 把 `child`（一组里的一层）放进整组的变换 `self` 里，画布 `w` × `h`：位置跟着整组镜像、缩放、
+    /// 旋转（绕画布中心）、平移；大小相乘、角度相加、不透明度相乘、镜像叠加。裁剪只用这一层自己的。
+    #[must_use]
+    pub fn compose(&self, child: &Self, w: u32, h: u32) -> Self {
+        let (w, h) = (f64::from(w.max(1)), f64::from(h.max(1)));
+        let mut cx = f64::from(child.x) * w;
+        let cy = f64::from(child.y) * h;
+        let mut rotation = child.rotation;
+        if self.mirror {
+            cx = -cx;
+            rotation = -rotation;
+        }
+        let s = f64::from(self.scale);
+        let (sin, cos) = f64::from(self.rotation).to_radians().sin_cos();
+        let (px, py) = (cx * s, cy * s);
+        let (rx, ry) = (px.mul_add(cos, -py * sin), px.mul_add(sin, py * cos));
+        #[expect(clippy::cast_possible_truncation, reason = "画布单位里的小数")]
+        Self {
+            x: (rx / w) as f32 + self.x,
+            y: (ry / h) as f32 + self.y,
+            scale: self.scale * child.scale,
+            rotation: rotation + self.rotation,
+            opacity: self.opacity * child.opacity,
+            mirror: self.mirror != child.mirror,
+            // 镜像只把画面左右翻：裁掉的左边翻过去成了右边
+            crop: if self.mirror {
+                Crop {
+                    left: child.crop.right,
+                    right: child.crop.left,
+                    ..child.crop
+                }
+            } else {
+                child.crop
+            },
+        }
+    }
+}
+
 impl Default for Transform {
     fn default() -> Self {
         Self::DEFAULT
@@ -491,5 +530,66 @@ mod tests {
             let fills = (fw - cwf).abs() < 1e-2 || (fh - chf).abs() < 1e-2;
             prop_assert!(fills && fw <= cwf + 1e-2 && fh <= chf + 1e-2);
         }
+    }
+
+    #[test]
+    fn a_group_transform_moves_scales_turns_and_fades_its_layers() {
+        let child = Transform {
+            x: 0.25,
+            y: 0.0,
+            scale: 0.5,
+            opacity: 0.8,
+            rotation: 10.0,
+            ..Transform::default()
+        };
+        let same = Transform::default().compose(&child, 1920, 1080);
+        assert!((same.x - 0.25).abs() < 1e-6 && (same.scale - 0.5).abs() < 1e-6);
+        // 整组缩一半、往右挪 0.1：位置跟着缩
+        let half = Transform {
+            x: 0.1,
+            scale: 0.5,
+            opacity: 0.5,
+            ..Transform::default()
+        };
+        let c = half.compose(&child, 1920, 1080);
+        assert!((c.x - (0.125 + 0.1)).abs() < 1e-6);
+        assert!((c.scale - 0.25).abs() < 1e-6);
+        assert!((c.opacity - 0.4).abs() < 1e-6);
+        // 整组顺时针转 90°：右边 480 像素的图层转到下面 480 像素（画布 1920×1080）
+        let turned = Transform {
+            rotation: 90.0,
+            ..Transform::default()
+        };
+        let t = turned.compose(&child, 1920, 1080);
+        assert!(t.x.abs() < 1e-5, "{}", t.x);
+        assert!((t.y - 480.0 / 1080.0).abs() < 1e-5, "{}", t.y);
+        assert!((t.rotation - 100.0).abs() < 1e-5);
+        // 整组镜像：位置左右翻、角度反过来、镜像叠加
+        let flipped = Transform {
+            mirror: true,
+            ..Transform::default()
+        };
+        let m = flipped.compose(&child, 1920, 1080);
+        assert!((m.x + 0.25).abs() < 1e-6 && (m.rotation + 10.0).abs() < 1e-6 && m.mirror);
+    }
+
+    #[test]
+    fn a_mirrored_group_swaps_its_layers_left_and_right_crop() {
+        let child = Transform {
+            crop: Crop {
+                left: 0.5,
+                top: 0.1,
+                right: 0.0,
+                bottom: 0.2,
+            },
+            ..Transform::default()
+        };
+        let flipped = Transform {
+            mirror: true,
+            ..Transform::default()
+        };
+        let c = flipped.compose(&child, 1920, 1080).crop;
+        assert!((c.right - 0.5).abs() < 1e-6 && c.left.abs() < 1e-6, "{c:?}");
+        assert!((c.top - 0.1).abs() < 1e-6 && (c.bottom - 0.2).abs() < 1e-6);
     }
 }

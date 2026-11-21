@@ -5,13 +5,14 @@
 use crate::actions as act;
 use crate::chrome;
 use crate::workspace::Workspace;
+use gpui_kit::StyledImage as _;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window,
@@ -347,10 +348,78 @@ type DialogInput = (
     Option<ve_core::Cover>,
 );
 
+/// 打开导出框时带进去的：默认导出到哪、标题、封面小图。
+pub(crate) struct ExportTarget {
+    dir: PathBuf,
+    title: String,
+    cover: Option<Arc<gpui_kit::RenderImage>>,
+}
+
+/// 标题里放不进文件名的字符换成「_」。
+fn file_title(title: &str) -> String {
+    let safe = title
+        .chars()
+        .map(|c| {
+            if r#"\/:*?"<>|"#.contains(c) || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect::<String>()
+        .trim_end_matches(['.', ' '])
+        .to_owned();
+    // Windows 的设备名（CON、NUL、COM1……，带扩展名也算）写进去的是设备，不是文件：后面加「_」
+    let stem = safe.split('.').next().unwrap_or("");
+    let upper = stem.to_ascii_uppercase();
+    let device = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.len() == 4
+            && upper.as_bytes()[3].is_ascii_digit()
+            && upper.as_bytes()[3] != b'0');
+    if device {
+        format!("{stem}_{}", &safe[stem.len()..])
+    } else {
+        safe
+    }
+}
+
+/// `dir` 里还没用过的名字：`标题.ext`，用过了就 `标题(1).ext`、`标题(2).ext`……
+/// 一次导出会写同名的视频、音频（别的扩展名）和 `名字_封面.png`，所以同名的任何文件、
+/// 同名的封面都算用过，免得只导音频、封面时把上次的覆盖掉。
+fn free_path(dir: &std::path::Path, title: &str, ext: &str) -> PathBuf {
+    let used: std::collections::HashSet<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| {
+                    let path = e.path();
+                    // Windows 文件名不分大小写
+                    let stem = path.file_stem()?.to_str()?.to_lowercase();
+                    Some(
+                        stem.strip_suffix("_封面")
+                            .map_or_else(|| stem.clone(), str::to_owned),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let name = std::iter::once(title.to_owned())
+        .chain((1..10_000).map(|n| format!("{title}({n})")))
+        .find(|n| !used.contains(&n.to_lowercase()))
+        .unwrap_or_else(|| title.to_owned());
+    dir.join(format!("{name}.{ext}"))
+}
+
 /// 导出选项表单。
 #[derive(Debug)]
 pub struct ExportForm {
-    path: PathBuf,
+    /// 导出到哪个文件夹。
+    dir: PathBuf,
+    /// 标题（文件名，不带扩展名）。
+    title: Entity<InputState>,
+    /// 封面小图（打开对话框时播放器上的画面）。
+    cover_image: Option<Arc<gpui_kit::RenderImage>>,
     project: ProjectSettings,
     duration: Time,
     /// 时间轴的入出点区域。
@@ -365,15 +434,18 @@ pub struct ExportForm {
 
 impl ExportForm {
     fn new(
-        path: PathBuf,
+        target: ExportTarget,
         timeline: DialogInput,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let (project, duration, range, playhead, draft_cover) = timeline;
         let custom = cx.new(|cx| InputState::new(window, cx).default_value("12000"));
+        let title = cx.new(|cx| InputState::new(window, cx).default_value(target.title));
         Self {
-            path,
+            dir: target.dir,
+            title,
+            cover_image: target.cover,
             project,
             duration,
             range,
@@ -399,13 +471,26 @@ impl ExportForm {
         c
     }
 
+    /// 要导出的文件：文件夹 + 标题.mp4（标题里不能放进文件名的字符换成「_」；
+    /// 已经有同名文件时加「(1)」「(2)」……，不覆盖）。
+    fn path(&self, cx: &gpui_kit::App) -> Result<PathBuf, &'static str> {
+        let raw = self.title.read(cx).value();
+        let title = file_title(raw.trim());
+        if title.is_empty() {
+            return Err("标题不能为空");
+        }
+        Ok(free_path(&self.dir, &title, "mp4"))
+    }
+
     fn settings(&self, cx: &gpui_kit::App) -> ExportSettings {
-        self.choices(cx).settings(self.path.clone(), &self.project)
+        let path = self.path(cx).unwrap_or_else(|_| self.dir.join("导出.mp4"));
+        self.choices(cx).settings(path, &self.project)
     }
 
     fn plan(&self, cx: &gpui_kit::App) -> Result<ExportPlan, &'static str> {
+        let path = self.path(cx)?;
         self.choices(cx).plan_with_cover(
-            &self.path,
+            &path,
             &self.project,
             self.range,
             self.playhead,
@@ -419,6 +504,92 @@ impl ExportForm {
             Some((a, b)) => b - a,
             None => self.duration,
         }
+    }
+
+    /// 对话框最上面：左边封面小图，右边标题和「导出至」（文件夹 + 选文件夹按钮）。
+    fn render_target(&self, cx: &Context<'_, Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let cover = div()
+            .w(px(160.))
+            .h(px(90.))
+            .flex_none()
+            .rounded(px(4.))
+            .overflow_hidden()
+            .bg(gpui_kit::black())
+            .children(self.cover_image.clone().map(|image| {
+                gpui_kit::img(image)
+                    .size_full()
+                    .object_fit(gpui_kit::ObjectFit::Contain)
+            }));
+        let label = |text: &'static str| {
+            div()
+                .w(px(56.))
+                .flex_none()
+                .text_sm()
+                .text_color(muted)
+                .child(text)
+        };
+        h_flex().gap_3().items_start().child(cover).child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_2()
+                .child(
+                    h_flex().gap_2().child(label("标题")).child(
+                        div()
+                            .id("export-title")
+                            .test_support()
+                            .flex_1()
+                            .child(Input::new(&self.title)),
+                    ),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(label("导出至"))
+                        .child(
+                            div()
+                                .id("export-dir")
+                                .test_support()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .truncate()
+                                .child(SharedString::from(self.dir.display().to_string())),
+                        )
+                        .child(
+                            Button::new("export-pick-dir")
+                                .ghost()
+                                .small()
+                                .icon(gpui_kit::assets::IconName::FolderOpen)
+                                .tooltip("选择文件夹")
+                                .on_click(cx.listener(|_, _, window, cx| {
+                                    Self::pick_dir(window, cx);
+                                })),
+                        ),
+                ),
+        )
+    }
+
+    /// 「📁」：选一个文件夹导出到那里。
+    fn pick_dir(window: &Window, cx: &Context<'_, Self>) {
+        let rx = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("导出到".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await
+                && let Some(dir) = paths.into_iter().next()
+            {
+                let _ignored = this.update(cx, |this, cx| {
+                    this.dir = dir;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     /// 一个选项小块：点了就改 `choices`。
@@ -686,25 +857,9 @@ impl Render for ExportForm {
         let preview = self.settings(cx);
         let (res_items, fps_items, br_items, codec_items, enc_items) = self.option_items(cx);
         let muted = cx.theme().muted_foreground;
-        let file_name = self
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
         v_flex()
             .gap_3()
-            .child(
-                v_flex()
-                    .gap_0p5()
-                    .child(div().text_sm().child(SharedString::from(file_name)))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .truncate()
-                            .child(SharedString::from(self.path.display().to_string())),
-                    ),
-            )
+            .child(self.render_target(cx))
             .child(row(
                 "预设",
                 Preset::ALL
@@ -824,45 +979,63 @@ impl Workspace {
         if self.export.is_some() {
             return;
         }
+        // 导出的是整个工程：在复合片段里面就先回到最外层
+        self.leave_all_compounds(window, cx);
         if self.doc.project.timeline.duration() <= Time::ZERO {
             crate::workspace::notify(Notification::warning("时间轴是空的"), window, cx);
             return;
         }
-        let dir = self
-            .doc
-            .path()
-            .and_then(|p| p.parent().map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("."));
-        let rx = cx.prompt_for_new_path(&dir, Some("导出.mp4"));
-        self.tasks.push(cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(path))) = rx.await {
-                let _ignored = this.update_in(cx, |this, window, cx| {
-                    let timeline = (
-                        this.doc.project.settings,
-                        this.doc.project.timeline.duration(),
-                        this.doc.project.timeline.range,
-                        this.playhead,
-                        this.doc.project.timeline.cover.clone(),
-                    );
-                    Self::open_export_dialog(path, timeline, window, cx);
-                });
-            }
-        }));
+        // 剪映：直接弹导出框，标题、导出到哪在框里改（不先弹系统的另存为）
+        let target = ExportTarget {
+            dir: self.export_dir(),
+            title: self.export_title.clone().unwrap_or_else(|| self.doc.name()),
+            cover: self.preview.image.clone(),
+        };
+        let timeline = (
+            self.doc.project.settings,
+            self.doc.project.timeline.duration(),
+            self.doc.project.timeline.range,
+            self.playhead,
+            self.doc.project.timeline.cover.clone(),
+        );
+        let heading = SharedString::from(format!("导出-{}", self.doc.name()));
+        Self::open_export_dialog(target, timeline, heading, window, cx);
+    }
+
+    /// 导出框默认导出到哪：上次导出的文件夹、工程所在文件夹、「视频」文件夹，依次往下找。
+    fn export_dir(&self) -> PathBuf {
+        self.export_dir
+            .clone()
+            .or_else(|| {
+                self.last_export
+                    .as_ref()
+                    .and_then(|p| p.parent().map(PathBuf::from))
+            })
+            .or_else(|| self.doc.path().and_then(|p| p.parent().map(PathBuf::from)))
+            .or_else(|| std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join("Videos")))
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// 导出框默认的文件夹和标题（测试用；`None` 按草稿名）。
+    pub fn use_export_defaults(&mut self, dir: PathBuf, title: Option<String>) {
+        self.export_dir = Some(dir);
+        self.export_title = title;
     }
 
     fn open_export_dialog(
-        path: PathBuf,
+        target: ExportTarget,
         timeline: DialogInput,
+        heading: SharedString,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let form = cx.new(|cx| ExportForm::new(path, timeline, window, cx));
+        let form = cx.new(|cx| ExportForm::new(target, timeline, window, cx));
         let ws = cx.entity();
         window.open_dialog(cx, move |dialog, _, _| {
             let form = form.clone();
             let ws = ws.clone();
             dialog
-                .title("导出")
+                .title(heading.clone())
                 .width(px(560.))
                 .child(form.clone())
                 // 普通 Dialog 不会自己画按钮：on_ok 只登记回调，按钮要放进 footer
@@ -1049,6 +1222,41 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn titles_become_safe_file_names_that_never_overwrite() {
+        assert_eq!(file_title("片头: 第1集?"), "片头_ 第1集_");
+        assert_eq!(file_title(r"a/b\c"), "a_b_c");
+        assert_eq!(file_title("结尾. "), "结尾");
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            free_path(dir.path(), "片", "mp4"),
+            dir.path().join("片.mp4")
+        );
+        std::fs::write(dir.path().join("片.mp4"), "").unwrap();
+        std::fs::write(dir.path().join("片(1).mp4"), "").unwrap();
+        assert_eq!(
+            free_path(dir.path(), "片", "mp4"),
+            dir.path().join("片(2).mp4")
+        );
+        // 上次只导了音频（片(2).mp3）或封面：这个名字也算占了，不然会被覆盖
+        std::fs::write(dir.path().join("片(2).mp3"), "").unwrap();
+        std::fs::write(dir.path().join("片(3)_封面.png"), "").unwrap();
+        assert_eq!(
+            free_path(dir.path(), "片", "mp4"),
+            dir.path().join("片(4).mp4")
+        );
+        // Windows 的设备名不能当文件名
+        assert_eq!(file_title("nul"), "nul_");
+        assert_eq!(file_title("COM1"), "COM1_");
+        assert_eq!(file_title("aux.片头"), "aux_.片头");
+        assert_eq!(file_title("console"), "console");
+        std::fs::write(dir.path().join("Title.mp4"), "").unwrap();
+        assert_eq!(
+            free_path(dir.path(), "title", "mp4"),
+            dir.path().join("title(1).mp4")
+        );
+    }
+
     use super::*;
 
     #[test]

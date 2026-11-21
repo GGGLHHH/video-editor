@@ -49,11 +49,17 @@ impl EffectFields {
 }
 
 impl Workspace {
-    /// 选中的特效片段和它的特效。
+    /// 选中的特效片段和它在播放头这一刻的特效（强度有关键帧时按时间求值）。
     fn bound_effect(&self) -> Option<(ClipId, Effect)> {
+        self.bound_effect_at().map(|(id, e, _)| (id, e))
+    }
+
+    /// 同 [`Self::bound_effect`]，再加播放头相对片段起点的时间。
+    fn bound_effect_at(&self) -> Option<(ClipId, Effect, ve_core::Time)> {
         let id = self.inspector.bound?;
         let (_, c) = self.doc.project.timeline.find_clip(id)?;
-        Some((id, c.effect()?))
+        let offset = self.key_offset(c);
+        Some((id, c.effect_at(offset)?, offset))
     }
 
     fn set_bound_effect(
@@ -62,15 +68,19 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some((clip, mut e)) = self.bound_effect() else {
+        let Some((clip, mut e, at)) = self.bound_effect_at() else {
             return;
         };
         f(&mut e);
         if self.inspector.effect.gesture {
-            let _ = self.doc.edit(|p| ve_core::edit::set_effect(p, clip, e));
+            let _ = self
+                .doc
+                .edit(|p| ve_core::edit::apply_effect_at(p, clip, at, e));
             self.after_change(window, cx);
         } else {
-            self.apply(window, cx, |p| ve_core::edit::set_effect(p, clip, e));
+            self.apply(window, cx, |p| {
+                ve_core::edit::apply_effect_at(p, clip, at, e)
+            });
         }
     }
 
@@ -150,7 +160,9 @@ impl Workspace {
                             .text_xs()
                             .text_color(muted)
                             .child(SharedString::from(format!("{:.0}", amount * 100.0))),
-                    ),
+                    )
+                    .child(self.render_group_keys(ve_core::KeyGroup::Effect, cx)),
             )
+            .children(self.render_easing_row(ve_core::KeyGroup::Effect.props(), "fx", cx))
     }
 }

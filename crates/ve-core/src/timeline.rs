@@ -123,6 +123,10 @@ pub struct Clip {
     /// 素材的色彩空间（HDR / Log）；`None` 是 Rec.709。没有时不写进文件。第 8 版加的。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_space: Option<crate::color_space::InputSpace>,
+    /// 摊开的复合片段里的片段：外面那段复合片段（[`crate::compound::flatten`] 填，不存进文件）。
+    /// 合成时它的画面属性、调色套在这一段上面（[`crate::compose`]）。
+    #[serde(skip)]
+    pub parent: Option<Arc<Self>>,
 }
 
 /// 颜色标签的个数。
@@ -169,6 +173,31 @@ impl Clip {
         self.animation.apply_adjust(&self.adjust, offset)
     }
 
+    /// 时间轴时刻 `t` 落在片段里哪个位置（相对起点），用来在这里读值、打关键帧：夹在片段里，
+    /// 最多到最后一帧（`frame` 一帧的长度）的开头——片段终点那一刻已经不在片段上，打在那里的
+    /// 关键帧在属性行上删不掉。
+    #[must_use]
+    pub fn key_offset(&self, t: Time, frame: Time) -> Time {
+        let last = (self.duration - frame).max(Time::ZERO);
+        (t - self.start).clamp(Time::ZERO, last)
+    }
+
+    /// 片段内 `offset` 时刻的外观（圆角、描边、阴影、抠图、蒙版有关键帧时按动画求值）。
+    #[must_use]
+    pub fn look_at(&self, offset: Time) -> crate::Look {
+        self.animation.apply_look(&self.look, offset)
+    }
+
+    /// 片段内 `offset` 时刻的画面特效（强度有关键帧时按动画求值）；不是特效片段时 `None`。
+    #[must_use]
+    pub fn effect_at(&self, offset: Time) -> Option<crate::Effect> {
+        let mut e = self.effect()?;
+        if let Some(v) = self.animation.value_at(crate::Prop::EffectAmount, offset) {
+            e.amount = v;
+        }
+        Some(e)
+    }
+
     /// 片段内 `offset` 时刻的音量（dB）：有音量关键帧时按动画求值。
     #[must_use]
     pub fn gain_db_at(&self, offset: Time) -> f32 {
@@ -184,17 +213,27 @@ impl Clip {
             prop.get(&self.transform_at(offset))
         } else if let Some(item) = prop.adjust_item() {
             item.get(&self.adjust_at(offset))
+        } else if prop.is_look() {
+            prop.look_get(&self.look_at(offset)).unwrap_or_default()
+        } else if prop == crate::Prop::EffectAmount {
+            self.effect_at(offset).map_or(0.0, |e| e.amount)
         } else {
             self.gain_db_at(offset)
         }
     }
 
     /// 改某个属性的固定值（没有关键帧时用的值）。
-    pub const fn set_base(&mut self, prop: crate::Prop, value: f32) {
+    pub fn set_base(&mut self, prop: crate::Prop, value: f32) {
         if prop.is_transform() {
             prop.set(&mut self.transform, value);
         } else if let Some(item) = prop.adjust_item() {
             item.set(&mut self.adjust, value);
+        } else if prop.is_look() {
+            prop.look_set(&mut self.look, value);
+        } else if prop == crate::Prop::EffectAmount {
+            if let ClipContent::Effect(e) = &mut self.content {
+                e.amount = value;
+            }
         } else {
             self.gain_db = value;
         }

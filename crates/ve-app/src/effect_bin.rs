@@ -38,33 +38,38 @@ impl Workspace {
     pub(crate) fn render_effect_bin_tab(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let tiles = EffectKind::ALL.iter().enumerate().map(|(i, &k)| {
-            v_flex()
+            let card = v_flex()
                 .id(SharedString::from(format!("bin-effect-{i}")))
-                .test_support()
-                .group("effect-tile")
-                .w(px(88.))
-                .gap_1()
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.add_effect_at_playhead(k, window, cx);
-                }))
-                .child(
-                    h_flex()
-                        .w(px(88.))
-                        .h(px(50.))
-                        .justify_center()
-                        .rounded(px(4.))
-                        .bg(cx.theme().muted)
-                        .border_2()
-                        .border_color(gpui_kit::transparent_black())
-                        .group_hover("effect-tile", |s| s.border_color(palette::accent()))
-                        .child(
-                            Icon::new(Lucide::Sparkles)
-                                .size(px(20.))
-                                .text_color(palette::effect_clip()),
-                        ),
-                )
-                .child(div().text_xs().text_color(muted).child(k.label()))
+                .test_support();
+            crate::timeline::drop::draggable(
+                card,
+                crate::timeline::drop::BinItem::Effect(Effect::new(k)),
+                k.label(),
+            )
+            .group("effect-tile")
+            .w(px(88.))
+            .gap_1()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.add_effect_at_playhead(k, window, cx);
+            }))
+            .child(
+                h_flex()
+                    .w(px(88.))
+                    .h(px(50.))
+                    .justify_center()
+                    .rounded(px(4.))
+                    .bg(cx.theme().muted)
+                    .border_2()
+                    .border_color(gpui_kit::transparent_black())
+                    .group_hover("effect-tile", |s| s.border_color(palette::accent()))
+                    .child(
+                        Icon::new(Lucide::Sparkles)
+                            .size(px(20.))
+                            .text_color(palette::effect_clip()),
+                    ),
+            )
+            .child(div().text_xs().text_color(muted).child(k.label()))
         });
         v_flex()
             .id("bin-effects")
@@ -84,10 +89,18 @@ impl Workspace {
         let tiles = self.plugins.iter().enumerate().map(|(i, name)| {
             let name = name.clone();
             let label = SharedString::from(name.clone());
-            v_flex()
+            let card = v_flex()
                 .id(SharedString::from(format!("bin-plugin-{i}")))
-                .test_support()
-                .group("plugin-tile")
+                .test_support();
+            let card = match Effect::plugin(&name) {
+                Some(effect) => crate::timeline::drop::draggable(
+                    card,
+                    crate::timeline::drop::BinItem::Effect(effect),
+                    label.clone(),
+                ),
+                None => card,
+            };
+            card.group("plugin-tile")
                 .w(px(88.))
                 .gap_1()
                 .cursor_pointer()

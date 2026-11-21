@@ -242,14 +242,14 @@ pub const fn cursor_for(hit: Hit, drag: Option<&Drag>, marquee: bool) -> gpui_ki
 }
 
 /// 吸附：先吸目标（播放头、片段边缘），没有就吸到帧。
-struct Snapper {
+pub(crate) struct Snapper {
     targets: Vec<Time>,
     tolerance: Time,
     rate: FrameRate,
 }
 
 impl Snapper {
-    fn new(
+    pub(crate) fn new(
         doc: &Document,
         geo: &TimelineGeometry,
         playhead: Time,
@@ -274,7 +274,7 @@ impl Snapper {
     }
 
     /// 区间：起点或终点谁离目标近吸谁，返回（起点，吸附线）。
-    fn place_range(&self, start: Time, len: Time) -> (Time, Option<Time>) {
+    pub(crate) fn place_range(&self, start: Time, len: Time) -> (Time, Option<Time>) {
         let end = start + len;
         let by_start =
             snap(start, &self.targets, self.tolerance).map(|hit| (hit, (hit - start).0.abs()));
