@@ -1,9 +1,9 @@
 //! 时间轴视图：画布绘制（标尺、轨道、片段缩略图条 / 波形 / 字幕、播放头、吸附线）与鼠标交互。
 
+use super::drop::{BinDrag, BinItem, DropPlan, DropTarget};
 use super::geometry::SCROLLBAR_HEIGHT;
 use super::{Drag, Hit, TimelineGeometry};
 use crate::import::PEAKS_PER_SECOND;
-use crate::media_bin::AssetDrag;
 use crate::theme::palette;
 use crate::workspace::{MediaThumbs, Workspace};
 use gpui_kit::base::TestSupportExt as _;
@@ -16,6 +16,9 @@ use gpui_kit::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use ve_core::{AssetId, ClipContent, ClipId, Project, Time, TrackKind};
+
+/// 按下后鼠标挪开这么远（像素）才算拖起来，开始贴边自动滚。
+const DRAG_START_PX: f32 = 4.0;
 
 /// 时间轴视图状态。
 #[derive(Debug, Default)]
@@ -44,6 +47,11 @@ pub struct TimelineUi {
     pub cursor: gpui_kit::CursorStyle,
     /// 鼠标最后的位置（时间轴本地坐标），松开后据此恢复悬停样式。
     pub pointer: (f32, f32),
+    /// 按下的位置（时间轴本地坐标）：按下后鼠标还没真的挪开（几像素以内）时不贴边自动滚，
+    /// 免得在边缘单击一下片段就被挪走；挪开过一次就清掉。
+    pub pressed_at: Option<(f32, f32)>,
+    /// 播放时跟着播放头翻页（用户自己滚走时不拉回）。
+    pub follow: super::geometry::PlayFollow,
     /// 正在拖横向滚动条：（按下时的横坐标，按下时的横向滚动）。
     pub thumb_drag: Option<(f32, f32)>,
     /// 鼠标模式（选择 / 分割）。
@@ -58,6 +66,12 @@ pub struct TimelineUi {
     pub axis_anchor: Option<Time>,
     /// 主轨「封面」菜单展开着。
     pub cover_menu: bool,
+    /// 拖动中最后一次鼠标移动时按着的修饰键（贴边自动滚时照样按 Alt 决定吸附）。
+    pub drag_modifiers: gpui_kit::Modifiers,
+    /// 正从素材面板往时间轴拖：拖的东西和现在会落在哪（`None` = 落不下）。
+    pub bin_drop: Option<(BinItem, Option<DropPlan>)>,
+    /// 右键空白处弹出的菜单。
+    pub blank_menu: Option<super::context_menu::BlankMenu>,
 }
 
 /// 框选。
@@ -90,6 +104,8 @@ struct Snapshot {
     hover_line: Option<(Time, Hsla)>,
     /// 找不到文件的素材（片段标红）。
     missing: std::collections::BTreeSet<AssetId>,
+    /// 从素材面板拖进来会落在哪。
+    drop: Option<DropTarget>,
 }
 
 impl Workspace {
@@ -236,6 +252,7 @@ impl Workspace {
         self.timeline.ghosts = drag.map_or_else(Vec::new, |d| self.ghosts_for(&d));
         self.timeline.drag = drag;
         self.timeline.pointer = (x, y);
+        self.timeline.pressed_at = Some((x, y));
         self.timeline.cursor = super::interaction::cursor_for(
             geo.hit_test(x, y, &self.doc.project.timeline),
             drag.as_ref(),
@@ -325,6 +342,13 @@ impl Workspace {
             }
             return;
         }
+        self.timeline.drag_modifiers = e.modifiers;
+        self.drag_to(x, y, window, cx);
+    }
+
+    /// 框选 / 拖动跟到时间轴本地坐标 `(x, y)`（鼠标移动、贴边自动滚以后都走这里）。
+    fn drag_to(&mut self, x: f32, y: f32, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let geo = self.timeline.geometry;
         if let Some(m) = self.timeline.marquee.as_mut() {
             m.current = (x, y);
             let corner = (geo.time_to_x(m.origin.0), m.origin.1 - geo.scroll_y);
@@ -339,7 +363,7 @@ impl Workspace {
         };
         let revision = self.doc.revision();
         // 吸附开关关着时只吸到帧；按住 Alt 临时取反，松开就恢复
-        let snapping = self.snapping_for(e.modifiers.alt);
+        let snapping = self.snapping_for(self.timeline.drag_modifiers.alt);
         let out = drag.update(&mut self.doc, &geo, x, y, self.playhead, snapping);
         self.timeline.drag = Some(drag);
         self.timeline.snap_line = out.snap;
@@ -353,8 +377,62 @@ impl Workspace {
         cx.notify();
     }
 
+    /// 每帧调一次：播放时时间轴跟着播放头翻页；拖动、修剪、框选时鼠标贴着左右边缘就自动滚，
+    /// 滚完按同一个鼠标位置把拖动重新算一遍（鼠标不动也接着滚）。
+    pub(crate) fn auto_scroll_timeline(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let width = f32::from(self.timeline.bounds.size.width);
+        if width <= 0.0 || self.timeline.thumb_drag.is_some() {
+            return;
+        }
+        let duration = self.doc.project.timeline.duration();
+        // 从素材面板拖的东西已经放下或者不拖了：收掉预览
+        if self.timeline.bin_drop.is_some() && !cx.has_active_drag() {
+            self.clear_bin_drop();
+        }
+        let from_bin = self.timeline.bin_drop.map(|(item, _)| item);
+        let dragging =
+            self.timeline.marquee.is_some() || self.timeline.drag.is_some() || from_bin.is_some();
+        if !dragging {
+            if !self.engine.is_playing() {
+                self.timeline.follow.stop();
+                return;
+            }
+            let (t, forward) = (self.engine.position(), self.engine.rate() >= 0.0);
+            let geo = &mut self.timeline.geometry;
+            if self.timeline.follow.step(geo, t, width, forward) {
+                geo.clamp_scroll_x(duration);
+            }
+            return;
+        }
+        let (x, y) = self.timeline.pointer;
+        // 按下后还没真的拖起来（单击）：不滚
+        if from_bin.is_none()
+            && let Some((px, py)) = self.timeline.pressed_at
+        {
+            if (x - px).hypot(y - py) < DRAG_START_PX {
+                return;
+            }
+            self.timeline.pressed_at = None;
+        }
+        let geo = &mut self.timeline.geometry;
+        let before = geo.scroll_x;
+        // 往右拖出结尾时片段跟着往后挪、时间线变长，能接着滚
+        geo.scroll_by(geo.edge_scroll(x, width));
+        geo.clamp_scroll_x(duration);
+        if (geo.scroll_x - before).abs() > f32::EPSILON {
+            if let Some(item) = from_bin {
+                self.timeline.bin_drop = Some((item, self.plan_bin_drop(item)));
+                self.timeline.snap_line = self.timeline.bin_drop.and_then(|(_, p)| p?.snap);
+            } else {
+                self.drag_to(x, y, window, cx);
+            }
+            window.request_animation_frame();
+        }
+    }
+
     fn timeline_mouse_up(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.timeline.thumb_drag = None;
+        self.timeline.pressed_at = None;
         self.timeline.marquee = None;
         let insert = self.timeline.insert_line.take();
         if let Some(drag) = self.timeline.drag.take()
@@ -439,27 +517,57 @@ impl Workspace {
         cx.notify();
     }
 
-    fn timeline_drop(&mut self, drag: &AssetDrag, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let (x, y) = self.local(window.mouse_position());
-        let geo = self.timeline.geometry;
-        let at = self
-            .doc
-            .project
-            .settings
-            .frame_rate
-            .snap(geo.x_to_time(x).max(Time::ZERO));
-        let track = geo
-            .track_index_at(y, self.doc.project.timeline.tracks.len())
-            .and_then(|i| self.doc.project.timeline.tracks.get(i))
-            .map(|t| t.id);
-        let asset = drag.asset;
-        let placed = match track {
-            Some(track) => self.apply(window, cx, |p| {
-                ve_core::edit::insert_asset_at(p, asset, track, at)
-            }),
-            None => self.apply(window, cx, |p| ve_core::edit::append_asset(p, asset)),
+    /// 从素材面板拖着经过时间轴：算出会落在哪，画出来。
+    fn timeline_drag_move(
+        &mut self,
+        e: &gpui_kit::DragMoveEvent<BinDrag>,
+        _: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let item = e.drag(cx).item;
+        let inside = e.bounds.contains(&e.event.position);
+        self.timeline.pointer = self.local(e.event.position);
+        self.timeline.drag_modifiers = e.event.modifiers;
+        let before = self.timeline.bin_drop;
+        self.timeline.bin_drop = inside.then(|| (item, self.plan_bin_drop(item)));
+        if self.timeline.bin_drop != before {
+            self.timeline.snap_line = self.timeline.bin_drop.and_then(|(_, p)| p?.snap);
+            cx.notify();
+        }
+    }
+
+    /// 鼠标在 `self.timeline.pointer` 时 `item` 会落在哪。
+    fn plan_bin_drop(&self, item: BinItem) -> Option<DropPlan> {
+        super::drop::plan(
+            &self.doc,
+            &self.timeline.geometry,
+            item,
+            self.timeline.pointer,
+            self.playhead,
+            self.snapping_for(self.timeline.drag_modifiers.alt),
+        )
+    }
+
+    /// 拖完松手（或者拖到一半不拖了）：把拖动预览收掉。
+    pub(crate) const fn clear_bin_drop(&mut self) {
+        if self.timeline.bin_drop.take().is_some() {
+            self.timeline.snap_line = None;
+        }
+    }
+
+    fn timeline_drop(&mut self, drag: &BinDrag, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.timeline.pointer = self.local(window.mouse_position());
+        let plan = self.plan_bin_drop(drag.item);
+        self.clear_bin_drop();
+        let Some(plan) = plan else {
+            cx.notify();
+            return;
         };
-        if let Some(clip) = placed {
+        let transition = Time::from_secs_f64(self.transition_secs);
+        let item = drag.item;
+        if let Some(clip) = self.apply(window, cx, |p| {
+            super::drop::apply(p, item, plan.target, transition)
+        }) {
             self.doc.select(clip, false);
             self.after_change(window, cx);
         }
@@ -493,6 +601,10 @@ impl Workspace {
                 }
             }),
             missing: self.missing.clone(),
+            drop: self
+                .timeline
+                .bin_drop
+                .and_then(|(_, plan)| plan.map(|p| p.target)),
         };
         let this = cx.entity();
         div()
@@ -522,6 +634,7 @@ impl Workspace {
                 cx.listener(|this, _: &MouseUpEvent, w, cx| this.timeline_mouse_up(w, cx)),
             )
             .on_scroll(cx.listener(Self::timeline_scroll))
+            .on_drag_move(cx.listener(Self::timeline_drag_move))
             .on_drop(cx.listener(Self::timeline_drop))
             .child(
                 canvas(
@@ -723,6 +836,7 @@ fn paint(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut 
             line(window, t, 1.0, color);
         }
         paint_marquee(snap, ox, oy, window);
+        paint_drop(snap, ox, oy, w, window);
         // 拖到缝上：一条贯穿的白色横线，标出松手后新轨道的位置（剪映）
         if let Some(slot) = snap.insert {
             let y = oy + geo.track_top(slot);
@@ -890,6 +1004,63 @@ fn paint_ghosts(snap: &Snapshot, ox: f32, oy: f32, window: &mut Window) {
         );
         window.paint_quad(fill(r, palette::ghost()).corner_radii(px(3.0)));
         window.paint_quad(outline(r, palette::hover(), BorderStyle::Dashed).corner_radii(px(3.0)));
+    }
+}
+
+/// 从素材面板拖进来会落在哪：新片段的位置（半透明框）、新轨道的缝（白线）、主轨插队的剪辑点（竖条）、
+/// 要套滤镜 / 转场的片段（描边）。
+fn paint_drop(snap: &Snapshot, ox: f32, oy: f32, w: f32, window: &mut Window) {
+    let geo = snap.geo;
+    let ghost = |window: &mut Window, top: f32, start: Time, duration: Time| {
+        let (x0, x1) = (
+            ox + geo.time_to_x(start),
+            ox + geo.time_to_x(start + duration),
+        );
+        let r = rect(x0, oy + top + 2.0, x1 - x0, geo.track_height - 5.0);
+        window.paint_quad(fill(r, palette::drop_preview()).corner_radii(px(3.0)));
+        window
+            .paint_quad(outline(r, palette::selection(), BorderStyle::Solid).corner_radii(px(3.0)));
+    };
+    match snap.drop {
+        Some(DropTarget::Track {
+            track,
+            start,
+            duration,
+        }) => ghost(window, geo.track_top(track), start, duration),
+        Some(DropTarget::NewTrack {
+            slot,
+            start,
+            duration,
+        }) => {
+            let y = geo.track_top(slot);
+            window.paint_quad(fill(rect(ox, oy + y - 1.0, w, 2.0), palette::selection()));
+            ghost(window, y - geo.track_height / 2.0, start, duration);
+        }
+        Some(DropTarget::Main { track, at }) => {
+            let x = ox + geo.time_to_x(at);
+            let y = oy + geo.track_top(track);
+            window.paint_quad(fill(
+                rect(x - 2.0, y, 4.0, geo.track_height),
+                palette::selection(),
+            ));
+        }
+        Some(DropTarget::Clip(clip)) => {
+            for (i, t) in snap.project.timeline.tracks.iter().enumerate() {
+                if let Some(c) = t.clips.iter().find(|c| c.id == clip) {
+                    let (x0, x1) = (ox + geo.time_to_x(c.start), ox + geo.time_to_x(c.end()));
+                    let r = rect(
+                        x0,
+                        oy + geo.track_top(i) + 2.0,
+                        x1 - x0,
+                        geo.track_height - 5.0,
+                    );
+                    window.paint_quad(
+                        outline(r, palette::selection(), BorderStyle::Solid).corner_radii(px(3.0)),
+                    );
+                }
+            }
+        }
+        None => {}
     }
 }
 

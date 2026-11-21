@@ -37,6 +37,38 @@ fn escape(text: &str) -> String {
         .replace('\n', "\\N")
 }
 
+/// 一行 ASS 样式：`Default`（字有描边）或 `Box`（字底下一块背景框，ASS 的 `BorderStyle=3`：
+/// 框用描边色、框比字多出的边用描边宽度；这时字本身不描边）。
+fn style_line(name: &str, style: &SubtitleStyle, h: u32, boxed: bool) -> String {
+    let flag = |on: bool| if on { -1 } else { 0 };
+    let (edge, border, width) = if boxed {
+        (
+            SubtitleStyle::ass_color_alpha(style.background_color, style.background_opacity),
+            3,
+            style.padding_px(h),
+        )
+    } else {
+        (
+            SubtitleStyle::ass_color_alpha(style.outline_color, style.opacity),
+            1,
+            style.outline_px(h),
+        )
+    };
+    format!(
+        "Style: {name},{},{},{},&H000000FF,{edge},{},{},{},{},0,100,100,{:.1},0,{border},{width:.1},{:.1},2,20,20,{},1\n",
+        style.font,
+        style.font_px(h),
+        SubtitleStyle::ass_color_alpha(style.color, style.opacity),
+        SubtitleStyle::ass_color_alpha(style.shadow_color, style.shadow_opacity),
+        flag(style.bold),
+        flag(style.italic),
+        flag(style.underline),
+        style.spacing_px(h),
+        style.shadow_px(h),
+        style.margin_px(h),
+    )
+}
+
 /// 生成 ASS 字幕文件内容。
 #[must_use]
 pub fn write_ass(project: &Project) -> String {
@@ -48,28 +80,26 @@ pub fn write_ass(project: &Project) -> String {
         "[Script Info]\nScriptType: v4.00+\nPlayResX: {w}\nPlayResY: {h}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n\
          [V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, \
          Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, \
-         Alignment, MarginL, MarginR, MarginV, Encoding\n\
-         Style: Default,{},{},{},&H000000FF,{},&H64000000,{},0,0,0,100,100,0,0,1,{:.1},0,2,20,20,{},1\n\n\
+         Alignment, MarginL, MarginR, MarginV, Encoding\n{}{}\n\
          [Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
-        style.font,
-        style.font_px(h),
-        SubtitleStyle::ass_color(style.color),
-        SubtitleStyle::ass_color(style.outline_color),
-        if style.bold { -1 } else { 0 },
-        style.outline_px(h),
-        style.margin_px(h),
+        style_line("Default", style, h, false),
+        style_line("Box", style, h, true),
     );
-    let mut clips: Vec<&ve_core::Clip> = project
+    // 文字轨从下往上数的序号当 ASS 的 Layer：上面的文字轨盖在下面的上面（和预览一样）
+    let mut clips: Vec<(&ve_core::Clip, usize)> = project
         .timeline
         .tracks
         .iter()
-        .filter(|t| t.kind == TrackKind::Subtitle && t.shows())
-        .flat_map(|t| t.clips.iter().map(AsRef::as_ref))
-        .filter(|c| c.enabled() && c.subtitle_text().is_some())
+        .filter(|t| t.kind == TrackKind::Subtitle)
+        .rev()
+        .enumerate()
+        .filter(|(_, t)| t.shows())
+        .flat_map(|(layer, t)| t.clips.iter().map(move |c| (c.as_ref(), layer)))
+        .filter(|(c, _)| c.enabled() && c.subtitle_text().is_some())
         .collect();
-    clips.sort_by_key(|c| c.start);
-    for clip in clips {
-        write_clip(&mut out, project, clip);
+    clips.sort_by_key(|(c, _)| c.start);
+    for (clip, layer) in clips {
+        write_clip(&mut out, project, clip, layer);
     }
     out
 }
@@ -121,27 +151,52 @@ fn slice_points(clip: &ve_core::Clip) -> Vec<Time> {
     pts
 }
 
-/// ASS 的不透明度写法（00 不透明，FF 全透明）。
-fn ass_alpha(alpha: f32) -> String {
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "0–255"
-    )]
-    let a = ((1.0 - alpha.clamp(0.0, 1.0)) * 255.0).round() as u8;
-    format!("&H{a:02X}&")
-}
-
 /// 这一条自己的样式（和工程的不一样时）写成行内标签。
 fn style_tags(own: &SubtitleStyle, h: u32) -> String {
+    let (edge, edge_alpha, width) = if own.has_background() {
+        (
+            own.background_color,
+            own.background_opacity,
+            own.padding_px(h),
+        )
+    } else {
+        (own.outline_color, own.opacity, own.outline_px(h))
+    };
     format!(
-        "\\fn{}\\fs{}\\c{}\\3c{}\\bord{:.1}\\b{}",
+        "\\fn{}\\fs{}\\c{}\\3c{}\\4c{}\\1a{}\\3a{}\\4a{}\\bord{width:.1}\\shad{:.1}\\fsp{:.1}\\b{}\\i{}\\u{}",
         own.font,
         own.font_px(h),
         SubtitleStyle::ass_color(own.color),
-        SubtitleStyle::ass_color(own.outline_color),
-        own.outline_px(h),
-        u8::from(own.bold)
+        SubtitleStyle::ass_color(edge),
+        SubtitleStyle::ass_color(own.shadow_color),
+        alpha(own.opacity),
+        alpha(edge_alpha),
+        alpha(own.shadow_opacity),
+        own.shadow_px(h),
+        own.spacing_px(h),
+        u8::from(own.bold),
+        u8::from(own.italic),
+        u8::from(own.underline),
+    )
+}
+
+/// ASS 单独一个透明度值：`&HAA&`。
+fn alpha(opacity: f32) -> String {
+    format!("&H{:02X}&", SubtitleStyle::ass_alpha_byte(opacity))
+}
+
+/// 入场 / 出场动画在这一刻的不透明度 `a`：字、描边（或背景框）、阴影各自乘上去（ASS 的 `\1a` `\3a` `\4a`）。
+fn fade_tags(style: &SubtitleStyle, a: f32) -> String {
+    let edge = if style.has_background() {
+        style.background_opacity
+    } else {
+        style.opacity
+    };
+    format!(
+        "\\1a{}\\3a{}\\4a{}",
+        alpha(a * style.opacity),
+        alpha(a * edge),
+        alpha(a * style.shadow_opacity)
     )
 }
 
@@ -151,7 +206,8 @@ fn per_char_text(
     text: &str,
     line_start: Time,
     line_end: Time,
-    final_alpha: &str,
+    style: &SubtitleStyle,
+    line_alpha: f32,
     final_scale: f32,
 ) -> String {
     use ve_core::text_motion::{CHAR_FADE, ZOOM_FROM, char_len, char_step};
@@ -187,19 +243,18 @@ fn per_char_text(
         );
         let t0 = ms(begin.max(line_start) - line_start);
         let t1 = ms(done - line_start).max(t0 + 1);
-        let start_alpha = ass_alpha(a0);
+        // 字、描边（框）、阴影各自乘上自己的不透明度（\alpha 会把四个通道一起改掉，框和阴影就不对了）
+        let start_alpha = fade_tags(style, a0 * line_alpha);
+        let final_alpha = fade_tags(style, line_alpha);
         let _ = match motion.intro {
             ve_core::TextIn::CharZoom => {
                 let s = (s0.max(ZOOM_FROM) * final_scale * 100.0).round();
                 write!(
                     out,
-                    "{{\\alpha{start_alpha}\\fscx{s}\\fscy{s}\\t({t0},{t1},\\alpha{final_alpha}\\fscx{full}\\fscy{full})}}{esc}"
+                    "{{{start_alpha}\\fscx{s}\\fscy{s}\\t({t0},{t1},{final_alpha}\\fscx{full}\\fscy{full})}}{esc}"
                 )
             }
-            _ => write!(
-                out,
-                "{{\\alpha{start_alpha}\\t({t0},{t1},\\alpha{final_alpha})}}{esc}"
-            ),
+            _ => write!(out, "{{{start_alpha}\\t({t0},{t1},{final_alpha})}}{esc}"),
         };
     }
     out
@@ -207,7 +262,7 @@ fn per_char_text(
 
 /// 一条字幕：按 [`slice_points`] 切开，每段从这一段开头的样子线性过渡到结尾的样子
 /// （位置 `\move`、缩放 `\fscx`、不透明度 `\alpha`，和预览按同一个公式算的 [`ve_core::text_state`]）。
-fn write_clip(out: &mut String, project: &Project, clip: &ve_core::Clip) {
+fn write_clip(out: &mut String, project: &Project, clip: &ve_core::Clip, layer: usize) {
     let Some(text) = clip.subtitle_text() else {
         return;
     };
@@ -241,34 +296,40 @@ fn write_clip(out: &mut String, project: &Project, clip: &ve_core::Clip) {
             let _ = write!(tags, "\\move({x0},{y0},{x1},{y1})");
         }
         let (sc0, sc1) = ((s0.scale * 100.0).round(), (s1.scale * 100.0).round());
-        let (al0, al1) = (ass_alpha(s0.alpha), ass_alpha(s1.alpha));
         if (sc0 - 100.0).abs() > 0.1 || (sc1 - 100.0).abs() > 0.1 {
             let _ = write!(tags, "\\fscx{sc0}\\fscy{sc0}");
         }
-        if !per_char && al0 != "&H00&" {
-            let _ = write!(tags, "\\alpha{al0}");
+        let fading = |opacity: f32| (opacity - 1.0).abs() > 1e-4;
+        // 逐字入场只管每个字什么时候出来；整条的淡入淡出（出场、关键帧不透明度）照样写在行上
+        if fading(s0.alpha) || fading(s1.alpha) {
+            tags.push_str(&fade_tags(style, s0.alpha));
         }
         let mut change = String::new();
         if (sc0 - sc1).abs() > 0.1 {
             let _ = write!(change, "\\fscx{sc1}\\fscy{sc1}");
         }
-        if !per_char && al0 != al1 {
-            let _ = write!(change, "\\alpha{al1}");
+        if (s0.alpha - s1.alpha).abs() > 1e-4 {
+            change.push_str(&fade_tags(style, s1.alpha));
         }
         if !change.is_empty() {
             let _ = write!(tags, "\\t({change})");
         }
         tags.push('}');
         let body = if per_char {
-            per_char_text(clip, text, a, b, &al1, s1.scale)
+            per_char_text(clip, text, a, b, style, s1.alpha, s1.scale)
         } else {
             escape(text)
         };
-        out.push_str("Dialogue: 0,");
+        let _ = write!(out, "Dialogue: {layer},");
         ass_time(out, clip.start + a);
         out.push(',');
         ass_time(out, clip.start + b);
-        let _ = writeln!(out, ",Default,,0,0,0,,{tags}{body}");
+        let name = if style.has_background() {
+            "Box"
+        } else {
+            "Default"
+        };
+        let _ = writeln!(out, ",{name},,0,0,0,,{tags}{body}");
     }
 }
 
@@ -304,7 +365,7 @@ mod tests {
         let ass = write_ass(&p);
         assert!(
             ass.contains(
-                "Style: Default,SimHei,59,&H0000D7FF,&H000000FF,&H00000000,&H64000000,-1,"
+                "Style: Default,SimHei,59,&H0000D7FF,&H000000FF,&H00000000,&H66000000,-1,0,0,"
             ),
             "{ass}"
         );
@@ -326,6 +387,44 @@ mod tests {
         ve_core::edit::set_disabled(&mut p, &[ids.s1], true).unwrap();
         assert!(!has_subtitles(&p));
         assert!(!write_ass(&p).contains("你好"));
+    }
+
+    #[test]
+    fn new_text_styles_reach_the_ass_file() {
+        let (mut p, ids) = sample_project();
+        let s = &mut p.subtitle_style;
+        s.italic = true;
+        s.underline = true;
+        s.spacing = 10.0;
+        s.opacity = 0.5;
+        s.shadow = 4.0;
+        s.shadow_color = 0xFF_0000;
+        let ass = write_ass(&p);
+        // 半透明的白字（AA=80）、红阴影、斜体、下划线、字间距 10、阴影 4
+        assert!(
+            ass.contains("Style: Default,Microsoft YaHei,59,&H80FFFFFF,&H000000FF,&H80000000,&H660000FF,0,-1,-1,0,100,100,10.0,0,1,2.5,4.0,2,"),
+            "{ass}"
+        );
+        // 背景框：用 Box 样式（BorderStyle=3，框是描边色）
+        p.subtitle_style.background_opacity = 0.8;
+        p.subtitle_style.background_color = 0x33_3333;
+        let boxed = write_ass(&p);
+        assert!(boxed.contains("Style: Box,"), "{boxed}");
+        assert!(boxed.contains(",&H33333333,&H660000FF,"), "{boxed}");
+        assert!(dialogues(&boxed)[0].contains(",Box,,"), "{boxed}");
+        // 单独一条自己的样式：用覆盖标签写全
+        let own = SubtitleStyle {
+            italic: true,
+            shadow: 2.0,
+            ..SubtitleStyle::default()
+        };
+        ve_core::edit::set_own_subtitle_style(&mut p, &[ids.s1], Some(&own)).unwrap();
+        let with_own = write_ass(&p);
+        let line = dialogues(&with_own)[0];
+        assert!(
+            line.contains("\\i1") && line.contains("\\shad2.0") && line.contains(",Default,,"),
+            "{line}"
+        );
     }
 
     /// 所有 Dialogue 行（不含头部）。
@@ -353,7 +452,8 @@ mod tests {
         );
         assert!(
             lines[0].contains(&format!("\\move(960,{},960,{y})", y + 54.0))
-                && lines[0].contains("\\alpha&HFF&\\t(\\alpha&H00&)"),
+                // 字、描边、阴影分开淡入（阴影本身是六成不透明）
+                && lines[0].contains("\\1a&HFF&\\3a&HFF&\\4a&HFF&\\t(\\1a&H00&\\3a&H00&\\4a&H66&)"),
             "入场：从下面 54 像素升上来、从透明到不透明：{}",
             lines[0]
         );
@@ -430,7 +530,9 @@ mod tests {
             lines[0]
         );
         assert!(
-            lines[0].contains("{\\alpha&HFF&\\t(120,121,\\alpha&H00&)}好"),
+            lines[0].contains(
+                "{\\1a&HFF&\\3a&HFF&\\4a&HFF&\\t(120,121,\\1a&H00&\\3a&H00&\\4a&H66&)}好"
+            ),
             "{}",
             lines[0]
         );
@@ -469,5 +571,61 @@ mod tests {
         assert!(early < late);
         assert!(ass.contains("1:02:03.45,1:02:04.45"), "{ass}");
         assert!(has_subtitles(&p));
+    }
+
+    #[test]
+    fn per_char_intros_keep_box_and_shadow_alpha_and_still_fade_out() {
+        let (mut p, ids) = sample_project();
+        p.subtitle_style.background_opacity = 0.5;
+        p.subtitle_style.shadow = 4.0;
+        let m = ve_core::TextMotion {
+            intro: ve_core::TextIn::Typewriter,
+            outro: ve_core::TextOut::FadeOut,
+            ..ve_core::TextMotion::default()
+        };
+        ve_core::edit::set_text_motion(&mut p, &[ids.s1], m).unwrap();
+        let ass = write_ass(&p);
+        let lines = dialogues(&ass);
+        // 逐字的标签只动字、框、阴影各自的透明度，不能用一把改四个通道的 \alpha
+        assert!(lines.iter().all(|l| !l.contains("\\alpha")), "{ass}");
+        assert!(lines[0].contains("\\1a&HFF&"), "{}", lines[0]);
+        // 框（描边色）出来后是五成透明：&H7F / &H80，不是 &H00
+        assert!(
+            lines[0].contains("\\3a&H7F&") || lines[0].contains("\\3a&H80&"),
+            "{}",
+            lines[0]
+        );
+        // 出场淡出那一段照样淡出
+        let last = lines.last().unwrap();
+        assert!(
+            last.contains("\\t(") && last.contains("\\1a&HFF&"),
+            "{last}"
+        );
+    }
+
+    #[test]
+    fn upper_text_tracks_get_higher_ass_layers() {
+        let (mut p, _) = sample_project();
+        add_subtitle(
+            &mut p,
+            Time::from_secs(1),
+            Time::from_secs(2),
+            "标题".into(),
+        )
+        .unwrap();
+        let ass = write_ass(&p);
+        let lines = dialogues(&ass);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("Dialogue: 0,") && l.ends_with("你好")),
+            "{ass}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("Dialogue: 1,") && l.ends_with("标题")),
+            "{ass}"
+        );
     }
 }

@@ -106,6 +106,16 @@ pub struct Workspace {
     pub(crate) export: Option<crate::export_ui::ExportProgress>,
     /// 上一次成功导出的文件。
     pub(crate) last_export: Option<std::path::PathBuf>,
+    /// 导出框默认导出到的文件夹（不设时按上次导出 / 工程所在 / 「视频」文件夹）。
+    pub(crate) export_dir: Option<std::path::PathBuf>,
+    /// 导出框默认的标题（不设时用草稿名）。
+    pub(crate) export_title: Option<String>,
+    /// 进入复合片段编辑时，外面一层层的文档（[`Self::enter_compound`]）。
+    pub(crate) compound_stack: Vec<crate::compound_ui::OpenCompound>,
+    /// 全局设置（[`crate::settings`]）。
+    pub(crate) settings: crate::settings::AppSettings,
+    /// 全局设置存在哪个文件（测试、性能测试时没有：不落盘）。
+    pub(crate) settings_file: Option<std::path::PathBuf>,
     pub(crate) importing: usize,
     /// 最近打开的工程，及其存放文件。
     pub(crate) recent: crate::recent::RecentList,
@@ -258,6 +268,11 @@ impl Workspace {
             inspector,
             export: None,
             last_export: None,
+            export_dir: None,
+            export_title: None,
+            compound_stack: Vec::new(),
+            settings: crate::settings::AppSettings::default(),
+            settings_file: None,
             importing: 0,
             recent: crate::recent::RecentList::load(&crate::recent::default_file()),
             recent_file: crate::recent::default_file(),
@@ -338,6 +353,8 @@ impl Workspace {
     ) {
         self.engine.pause();
         self.doc = doc;
+        // 换了整个工程：之前进到哪个复合片段里都不算了
+        self.compound_stack.clear();
         self.doc_epoch += 1;
         self.engine_revision = None;
         for thumbs in std::mem::take(&mut self.media).into_values() {
@@ -351,6 +368,41 @@ impl Workspace {
         self.after_change(window, cx);
         let assets: Vec<_> = self.doc.project.assets.values().cloned().collect();
         self.analyze_assets(assets, window, cx);
+    }
+
+    /// 时间轴横向滚了多少像素。
+    #[must_use]
+    pub const fn timeline_scroll_x(&self) -> f32 {
+        self.timeline.geometry.scroll_x
+    }
+
+    /// 时刻 `t` 在时间轴视图里的横坐标（视图本地坐标）。
+    #[must_use]
+    pub fn timeline_x_of(&self, t: Time) -> f32 {
+        self.timeline.geometry.time_to_x(t)
+    }
+
+    /// 时间轴视图的宽度。
+    #[must_use]
+    pub fn timeline_width(&self) -> f32 {
+        f32::from(self.timeline.bounds.size.width)
+    }
+
+    /// 正从素材面板拖进时间轴时，会落在哪（没在拖、落不下时 `None`）。
+    #[must_use]
+    pub fn drop_preview(&self) -> Option<crate::timeline::drop::DropTarget> {
+        self.timeline
+            .bin_drop
+            .and_then(|(_, plan)| plan.map(|p| p.target))
+    }
+
+    /// 时间轴缩放：每秒多少像素（测试用）。
+    pub fn set_timeline_zoom(&mut self, px_per_second: f32) {
+        self.timeline.geometry.px_per_second = px_per_second.clamp(
+            crate::timeline::geometry::MIN_PX_PER_SECOND,
+            crate::timeline::geometry::MAX_PX_PER_SECOND,
+        );
+        self.clamp_timeline_scroll();
     }
 
     /// 片段 `clip` 现在用的素材（工程编号 + 内容 + 长度 + 变速 + 倒放 / 防抖记录）。后台按片段生成
@@ -592,7 +644,10 @@ impl Workspace {
             self.set_fullscreen(false, window, cx);
             return;
         }
-        let preview = self.preview.drag.take().is_some();
+        // 拖图层或拖蒙版到一半
+        let layer = self.preview.drag.take().is_some();
+        let mask = self.preview.mask_drag.take().is_some();
+        let preview = layer || mask;
         if preview {
             crate::platform_cursor::clear();
         }
@@ -603,6 +658,7 @@ impl Workspace {
             if let Some((_, t, _)) = self.bound_video_clip() {
                 self.fill_transform(&t, window, cx);
             }
+            self.refresh_look_sliders(window, cx);
         } else if !timeline_busy {
             self.doc.clear_selection();
         }
@@ -624,8 +680,12 @@ impl Workspace {
             return;
         }
         self.preview.fullscreen = on;
-        // 拖到一半进全屏：这次拖动作废
-        self.preview.drag = None;
+        // 拖到一半进全屏（全屏时预览收不到松开）：这次拖动作废、改动还原，不留半截撤销步骤
+        let layer = self.preview.drag.take().is_some();
+        let mask = self.preview.mask_drag.take().is_some();
+        if layer || mask {
+            self.doc.cancel_gesture();
+        }
         if window.is_fullscreen() != on {
             window.toggle_fullscreen();
         }
@@ -783,6 +843,7 @@ impl Workspace {
             .on_action(cx.listener(Self::save_as))
             .on_action(cx.listener(Self::import))
             .on_action(cx.listener(Self::export))
+            .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::import_srt))
             .on_action(cx.listener(Self::export_srt))
             .on_action(cx.listener(Self::cancel))
@@ -861,12 +922,14 @@ impl Render for Workspace {
             .axis_anchor
             .unwrap_or_else(|| self.engine.position());
         self.follow_playhead_in_inspector(window, cx);
+        self.auto_scroll_timeline(window, cx);
         self.refresh_animated_sliders(false, window, cx);
         self.refresh_look_sliders(window, cx);
         self.refresh_curve_sliders(window, cx);
         self.refresh_grade_sliders(window, cx);
         self.refresh_effect_slider(window, cx);
         self.refresh_audio_fx_sliders(window, cx);
+        self.refresh_text_style_controls(window, cx);
         self.sync_zoom_slider(window, cx);
         // 播放中、录音中一直刷新
         if self.engine.is_playing() || self.recording.is_some() {
@@ -896,6 +959,7 @@ impl Render for Workspace {
             })
             .when(!self.preview.fullscreen, |root| {
                 root.children(self.render_context_menu(window, cx))
+                    .children(self.render_blank_menu(window, cx))
                     .child(self.render_topbar(cx))
                     .child(
                         div()

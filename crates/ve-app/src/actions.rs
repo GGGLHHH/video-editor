@@ -56,6 +56,7 @@ mod generated {
             Mirror,
             Rotate90,
             ZoomToFit,
+            OpenSettings,
             Freeze,
             SetInPoint,
             SetOutPoint,

@@ -15,34 +15,12 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AppContext as _, ClickEvent, Context, InteractiveElement as _, IntoElement, ParentElement as _,
-    PathPromptOptions, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window,
-    div, img, px,
+    PathPromptOptions, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
+    img, px,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
 use ve_core::{Asset, AssetId, format_timecode};
-
-/// 从素材库拖到时间轴的内容。
-#[derive(Debug, Clone)]
-pub struct AssetDrag {
-    /// 素材。
-    pub asset: AssetId,
-    /// 显示名。
-    pub name: SharedString,
-}
-
-impl Render for AssetDrag {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        div()
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .bg(cx.theme().primary)
-            .text_color(cx.theme().primary_foreground)
-            .text_sm()
-            .child(self.name.clone())
-    }
-}
 
 fn thumbs_of(path: PathBuf, analysis: Analysis) -> MediaThumbs {
     MediaThumbs {
@@ -113,7 +91,11 @@ impl Workspace {
                 let mut added = Vec::new();
                 for r in results {
                     match r {
-                        Ok(asset) => {
+                        Ok(mut asset) => {
+                            // 图片多长按全局设置
+                            if asset.is_still() {
+                                asset.duration = this.still_length();
+                            }
                             let id = this.doc.add_asset(asset);
                             if append {
                                 let _ = this.doc.edit(|p| ve_core::edit::append_asset(p, id));
@@ -203,6 +185,26 @@ impl Workspace {
         }
     }
 
+    /// 卡片上的「+」：素材加到播放头处（见 [`crate::timeline::drop::at_playhead`]），选中它。
+    pub fn add_at_playhead(
+        &mut self,
+        asset: AssetId,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        use crate::timeline::drop;
+        let at = self.playhead_frame();
+        let Some(target) = drop::at_playhead(&self.doc.project, asset, at) else {
+            return;
+        };
+        if let Some(clip) = self.apply(window, cx, |p| {
+            drop::apply(p, drop::BinItem::Asset(asset), target, ve_core::Time::ZERO)
+        }) {
+            self.doc.select(clip, false);
+            self.after_change(window, cx);
+        }
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "卡片上的几种角标（已添加、时长、媒体丢失、+）都叠在缩略图上，拆开反而难对照"
@@ -221,8 +223,8 @@ impl Workspace {
             .and_then(|m| m.thumbnails.first().cloned());
         let audio_only = a.video.is_none();
         let missing = self.is_missing(id);
-        let drag = AssetDrag {
-            asset: id,
+        let drag = crate::timeline::drop::BinDrag {
+            item: crate::timeline::drop::BinItem::Asset(id),
             name: a.name.clone().into(),
         };
         let chip = |text: SharedString| {
@@ -307,7 +309,7 @@ impl Workspace {
                             .child(chip(format_timecode(a.duration, rate).into()))
                     }))
                     .child(
-                        // 悬停时右上角出现「+」：放到时间轴末尾
+                        // 悬停时右上角出现「+」：加到播放头处（剪映）
                         div()
                             .absolute()
                             .top(px(2.))
@@ -319,9 +321,9 @@ impl Workspace {
                                     .primary()
                                     .xsmall()
                                     .icon(IconName::Plus)
-                                    .tooltip("放到时间轴末尾")
+                                    .tooltip("加到播放头处")
                                     .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.append_to_timeline(id, window, cx);
+                                        this.add_at_playhead(id, window, cx);
                                     })),
                             ),
                     ),
@@ -451,9 +453,16 @@ impl Workspace {
             .p_2()
             .gap_3()
             .items_start()
-            .child(tile("bin-text-default", Lucide::Type, "默认文本").on_click(
-                cx.listener(|_, _, w, cx| w.dispatch_action(Box::new(act::AddSubtitle), cx)),
-            ))
+            .child(
+                crate::timeline::drop::draggable(
+                    tile("bin-text-default", Lucide::Type, "默认文本"),
+                    crate::timeline::drop::BinItem::Text,
+                    "默认文本",
+                )
+                .on_click(
+                    cx.listener(|_, _, w, cx| w.dispatch_action(Box::new(act::AddSubtitle), cx)),
+                ),
+            )
             .child(
                 tile("bin-text-srt", Lucide::Captions, "导入本地字幕").on_click(
                     cx.listener(|_, _, w, cx| w.dispatch_action(Box::new(act::ImportSrt), cx)),

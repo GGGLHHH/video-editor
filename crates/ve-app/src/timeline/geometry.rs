@@ -72,6 +72,13 @@ pub enum Hit {
 /// 轨道分界上下多少像素内算「缝」（拖进去新建轨道）。
 pub const INSERT_BAND: f32 = 6.0;
 
+/// 播放头离右边这么近（像素）就翻页。
+const FOLLOW_MARGIN: f32 = 16.0;
+/// 拖动时离片段区左右边缘这么近（像素）就开始自动滚。
+pub const EDGE_SCROLL_ZONE: f32 = 40.0;
+/// 自动滚最快每帧多少像素。
+const EDGE_SCROLL_MAX: f32 = 24.0;
+
 /// 横向滚动条的高度（贴在时间轴底边）。
 pub const SCROLLBAR_HEIGHT: f32 = 10.0;
 /// 滚动条滑块最短多少像素（内容很长时也抓得住）。
@@ -272,6 +279,43 @@ impl TimelineGeometry {
         (view_width - self.header_width).max(1.0)
     }
 
+    /// 播放头 `t` 在视图里看得见（片段区内、离右边留一点）。
+    #[must_use]
+    pub fn shows(&self, t: Time, view_width: f32) -> bool {
+        let x = self.time_to_x(t);
+        x >= self.header_width && x <= view_width - FOLLOW_MARGIN
+    }
+
+    /// 播放时让播放头 `t` 留在视图里（剪映的「翻页」）：出了视图就翻页，正放（`forward`）
+    /// 翻到片段区一成处、倒放翻到九成处（循环播放跳回起点也按正放落在左边）。滚动了返回 `true`。
+    pub fn follow(&mut self, t: Time, view_width: f32, forward: bool) -> bool {
+        if self.shows(t, view_width) {
+            return false;
+        }
+        let lane = self.lane_width(view_width);
+        let x = self.time_to_x(t);
+        let target = self.header_width + lane * if forward { 0.1 } else { 0.9 };
+        let before = self.scroll_x;
+        self.scroll_by(x - target);
+        (self.scroll_x - before).abs() > f32::EPSILON
+    }
+
+    /// 拖动时鼠标在横坐标 `x`：贴近片段区左右边缘（[`EDGE_SCROLL_ZONE`] 像素内或出了边）时，
+    /// 每帧该横向滚多少像素（越靠边越快，出了边按最快）；不在边上为 0。
+    #[must_use]
+    pub fn edge_scroll(&self, x: f32, view_width: f32) -> f32 {
+        let left = self.header_width + EDGE_SCROLL_ZONE;
+        let right = view_width - EDGE_SCROLL_ZONE;
+        let depth = if x > right {
+            x - right
+        } else if x < left {
+            x - left
+        } else {
+            return 0.0;
+        };
+        (depth / EDGE_SCROLL_ZONE).clamp(-1.0, 1.0) * EDGE_SCROLL_MAX
+    }
+
     /// 横向最多滚多远：时长为 `duration` 的内容最多滚到结尾贴着轨道头（后面留出一整屏，
     /// 方便往后接片段；内容短时也能滚，放大时播放头才能留在原处）；空时间轴不能滚。
     #[must_use]
@@ -325,6 +369,55 @@ impl TimelineGeometry {
             .map(|&ms| Time::from_millis(ms))
             .find(|t| t.as_secs_f64() * f64::from(self.px_per_second) >= 80.0)
             .unwrap_or(Time::from_secs(3600))
+    }
+}
+
+/// 播放时要不要跟着播放头翻页。用户在播放中自己滚动、缩放把播放头挪出视图时不拉回去
+/// （想往后看一眼），播放头自己走回视图后再接着跟；停下再播重新跟。
+#[derive(Debug, Clone, Copy)]
+pub struct PlayFollow {
+    /// 跟着翻页。
+    armed: bool,
+    /// 上一帧处理完时的（横向滚动，缩放）：对不上说明用户自己滚过或缩放过。
+    seen: Option<(f32, f32)>,
+}
+
+impl Default for PlayFollow {
+    fn default() -> Self {
+        Self {
+            armed: true,
+            seen: None,
+        }
+    }
+}
+
+impl PlayFollow {
+    /// 播放中的一帧：播放头在 `t`，`forward` 是正放。翻页了返回 `true`。
+    pub fn step(
+        &mut self,
+        geo: &mut TimelineGeometry,
+        t: Time,
+        view_width: f32,
+        forward: bool,
+    ) -> bool {
+        let visible = geo.shows(t, view_width);
+        let moved_by_user = self.seen.is_some_and(|(x, zoom)| {
+            (x - geo.scroll_x).abs() > 0.5 || (zoom - geo.px_per_second).abs() > f32::EPSILON
+        });
+        if moved_by_user {
+            self.armed = visible;
+        } else if visible {
+            self.armed = true;
+        }
+        let paged = self.armed && geo.follow(t, view_width, forward);
+        self.seen = Some((geo.scroll_x, geo.px_per_second));
+        paged
+    }
+
+    /// 停下了：下次播放重新跟。
+    pub const fn stop(&mut self) {
+        self.armed = true;
+        self.seen = None;
     }
 }
 
@@ -573,5 +666,69 @@ mod tests {
         assert_eq!(g.insert_slot(boundary(3.0) + 40.0, 3), Some(3));
         // 标尺上不算
         assert_eq!(g.insert_slot(g.ruler_height - 1.0, 3), None);
+    }
+
+    #[test]
+    fn playback_pages_the_view_when_the_playhead_leaves_it() {
+        // 视图 1132 宽：轨道头 132 + 片段区 1000（50 像素 / 秒，看得见 20 秒）
+        let mut g = TimelineGeometry::default();
+        let width = 1132.0;
+        assert!(!g.follow(Time::from_secs(10), width, true), "看得见不动");
+        assert!(g.follow(Time::from_secs(25), width, true));
+        // 翻页后播放头在片段区一成处
+        assert!((g.time_to_x(Time::from_secs(25)) - (132.0 + 100.0)).abs() < 0.5);
+        // 倒放走出左边：翻到九成处
+        assert!(g.follow(Time::from_secs(20), width, false));
+        assert!((g.time_to_x(Time::from_secs(20)) - (132.0 + 900.0)).abs() < 0.5);
+        // 已经滚到头了：开头那段再往左也不能滚
+        g.scroll_x = 0.0;
+        assert!(!g.follow(Time::ZERO, width, false));
+    }
+
+    #[test]
+    fn dragging_near_an_edge_scrolls_faster_the_closer_it_gets() {
+        let g = TimelineGeometry::default();
+        let width = 1132.0;
+        assert!(g.edge_scroll(600.0, width).abs() < f32::EPSILON, "中间不滚");
+        let near = g.edge_scroll(width - 20.0, width);
+        let at = g.edge_scroll(width - 1.0, width);
+        let out = g.edge_scroll(width + 300.0, width);
+        assert!(0.0 < near && near < at && at <= out, "{near} {at} {out}");
+        assert!(g.edge_scroll(132.0 + 5.0, width) < 0.0, "左边往回滚");
+        assert!(g.edge_scroll(0.0, width) < 0.0);
+    }
+
+    #[test]
+    fn playback_follows_until_the_user_scrolls_away_and_loops_land_at_the_left() {
+        let mut g = TimelineGeometry {
+            px_per_second: 100.0,
+            ..TimelineGeometry::default()
+        };
+        let width = 1000.0;
+        let lane = width - g.header_width;
+        let mut f = PlayFollow::default();
+        let t = |s: f64| Time::from_secs_f64(s);
+        // 正常播放：走出右边就翻页
+        assert!(!f.step(&mut g, t(1.0), width, true));
+        assert!(f.step(&mut g, t(9.0), width, true));
+        assert!((g.time_to_x(t(9.0)) - (g.header_width + lane * 0.1)).abs() < 1.0);
+        // 用户自己往后滚，播放头不在视图里了：不拉回
+        g.scroll_by(3000.0);
+        let away = g.scroll_x;
+        assert!(!f.step(&mut g, t(9.1), width, true));
+        assert!(!f.step(&mut g, t(9.2), width, true));
+        assert!((g.scroll_x - away).abs() < f32::EPSILON, "没被拉回");
+        // 播放头自己走进视图后恢复跟随
+        let back = g.x_to_time(g.header_width + lane * 0.5);
+        assert!(!f.step(&mut g, back, width, true));
+        let later = g.x_to_time(width + 10.0);
+        assert!(f.step(&mut g, later, width, true));
+        // 循环播放跳回起点（在视图左边外面）：正放落在一成处，不是九成处
+        assert!(f.step(&mut g, t(20.0), width, true));
+        assert!((g.time_to_x(t(20.0)) - (g.header_width + lane * 0.1)).abs() < 1.0);
+        // 停下再播：重新跟随
+        f.stop();
+        g.scroll_by(5000.0);
+        assert!(f.step(&mut g, t(0.6), width, true));
     }
 }

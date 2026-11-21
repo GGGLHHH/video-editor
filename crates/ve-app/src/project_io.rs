@@ -20,14 +20,20 @@ pub struct Opened {
 /// # Errors
 /// 写文件失败时返回给用户看的说明。
 pub fn save(doc: &mut Document, path: &Path) -> Result<PathBuf, String> {
-    let path = if path.extension().is_some() {
-        path.to_path_buf()
-    } else {
-        path.with_extension(PROJECT_EXTENSION)
-    };
+    let path = with_extension(path);
     ve_core::save_project(&doc.project, &path).map_err(|e| format!("保存失败：{e}"))?;
     doc.mark_saved(path.clone());
     Ok(path)
+}
+
+/// 没有扩展名时补 `.vep`。
+#[must_use]
+pub fn with_extension(path: &Path) -> PathBuf {
+    if path.extension().is_some() {
+        path.to_path_buf()
+    } else {
+        path.with_extension(PROJECT_EXTENSION)
+    }
 }
 
 /// 打开工程文件。

@@ -86,6 +86,38 @@ pub enum Prop {
     Tint,
     /// 音量（dB，-60–12）。
     Volume,
+    /// 圆角（外观）。
+    Radius,
+    /// 描边粗细。
+    StrokeWidth,
+    /// 阴影不透明度。
+    ShadowOpacity,
+    /// 阴影模糊。
+    ShadowBlur,
+    /// 阴影距离。
+    ShadowDistance,
+    /// 阴影角度（度）。
+    ShadowAngle,
+    /// 色度抠图强度。
+    KeyIntensity,
+    /// 色度抠图阴影。
+    KeyShadow,
+    /// 蒙版水平位置。
+    MaskX,
+    /// 蒙版垂直位置。
+    MaskY,
+    /// 蒙版宽。
+    MaskWidth,
+    /// 蒙版高。
+    MaskHeight,
+    /// 蒙版旋转（度）。
+    MaskRotation,
+    /// 蒙版羽化。
+    MaskFeather,
+    /// 蒙版圆角。
+    MaskRound,
+    /// 画面特效强度。
+    EffectAmount,
 }
 
 /// 属性面板里一行一个关键帧按钮（剪映电脑版按属性打帧）：位置（X、Y 一起）、缩放、旋转、
@@ -106,6 +138,10 @@ pub enum KeyGroup {
     Adjust(AdjustItem),
     /// 音量（「音频」标签）。
     Volume,
+    /// 外观的一项（圆角、描边、阴影、抠图、蒙版的滑条，[`Prop::LOOK`] 里的一个）。
+    Look(Prop),
+    /// 画面特效的强度。
+    Effect,
 }
 
 impl KeyGroup {
@@ -138,7 +174,31 @@ impl KeyGroup {
             Self::Adjust(AdjustItem::Temperature) => &[Prop::Temperature],
             Self::Adjust(AdjustItem::Tint) => &[Prop::Tint],
             Self::Volume => &[Prop::Volume],
+            Self::Effect => &[Prop::EffectAmount],
+            Self::Look(p) => look_slice(p),
         }
+    }
+}
+
+/// 一个外观属性自己组成的一组。
+const fn look_slice(p: Prop) -> &'static [Prop] {
+    match p {
+        Prop::Radius => &[Prop::Radius],
+        Prop::StrokeWidth => &[Prop::StrokeWidth],
+        Prop::ShadowOpacity => &[Prop::ShadowOpacity],
+        Prop::ShadowBlur => &[Prop::ShadowBlur],
+        Prop::ShadowDistance => &[Prop::ShadowDistance],
+        Prop::ShadowAngle => &[Prop::ShadowAngle],
+        Prop::KeyIntensity => &[Prop::KeyIntensity],
+        Prop::KeyShadow => &[Prop::KeyShadow],
+        Prop::MaskX => &[Prop::MaskX],
+        Prop::MaskY => &[Prop::MaskY],
+        Prop::MaskWidth => &[Prop::MaskWidth],
+        Prop::MaskHeight => &[Prop::MaskHeight],
+        Prop::MaskRotation => &[Prop::MaskRotation],
+        Prop::MaskFeather => &[Prop::MaskFeather],
+        Prop::MaskRound => &[Prop::MaskRound],
+        _ => &[],
     }
 }
 
@@ -181,14 +241,17 @@ impl Prop {
     /// 是不是画面属性（位置、缩放、旋转、不透明度、裁剪）。
     #[must_use]
     pub const fn is_transform(self) -> bool {
-        !matches!(
+        matches!(
             self,
-            Self::Brightness
-                | Self::Contrast
-                | Self::Saturation
-                | Self::Temperature
-                | Self::Tint
-                | Self::Volume
+            Self::X
+                | Self::Y
+                | Self::Scale
+                | Self::Rotation
+                | Self::Opacity
+                | Self::CropLeft
+                | Self::CropTop
+                | Self::CropRight
+                | Self::CropBottom
         )
     }
 
@@ -225,13 +288,142 @@ impl Prop {
         }
     }
 
+    /// 外观（圆角、描边、阴影、抠图、蒙版）的属性。
+    pub const LOOK: [Self; 15] = [
+        Self::Radius,
+        Self::StrokeWidth,
+        Self::ShadowOpacity,
+        Self::ShadowBlur,
+        Self::ShadowDistance,
+        Self::ShadowAngle,
+        Self::KeyIntensity,
+        Self::KeyShadow,
+        Self::MaskX,
+        Self::MaskY,
+        Self::MaskWidth,
+        Self::MaskHeight,
+        Self::MaskRotation,
+        Self::MaskFeather,
+        Self::MaskRound,
+    ];
+
+    /// 描边那一组。
+    pub const STROKE: [Self; 1] = [Self::StrokeWidth];
+    /// 阴影那一组。
+    pub const SHADOW: [Self; 4] = [
+        Self::ShadowOpacity,
+        Self::ShadowBlur,
+        Self::ShadowDistance,
+        Self::ShadowAngle,
+    ];
+    /// 色度抠图那一组。
+    pub const KEY: [Self; 2] = [Self::KeyIntensity, Self::KeyShadow];
+    /// 蒙版那一组。
+    pub const MASK: [Self; 7] = [
+        Self::MaskX,
+        Self::MaskY,
+        Self::MaskWidth,
+        Self::MaskHeight,
+        Self::MaskRotation,
+        Self::MaskFeather,
+        Self::MaskRound,
+    ];
+
+    /// 外观里这个属性现在的值；这一项没开（没有描边、没有蒙版……）或不是外观属性时 `None`。
+    #[must_use]
+    pub fn look_get(self, l: &crate::Look) -> Option<f32> {
+        let (stroke, shadow, key, mask) = (l.stroke, l.shadow, l.chroma, l.mask);
+        match self {
+            Self::Radius => Some(l.radius),
+            Self::StrokeWidth => stroke.map(|v| v.width),
+            Self::ShadowOpacity => shadow.map(|v| v.opacity),
+            Self::ShadowBlur => shadow.map(|v| v.blur),
+            Self::ShadowDistance => shadow.map(|v| v.distance),
+            Self::ShadowAngle => shadow.map(|v| v.angle),
+            Self::KeyIntensity => key.map(|v| v.intensity),
+            Self::KeyShadow => key.map(|v| v.shadow),
+            Self::MaskX => mask.map(|v| v.x),
+            Self::MaskY => mask.map(|v| v.y),
+            Self::MaskWidth => mask.map(|v| v.width),
+            Self::MaskHeight => mask.map(|v| v.height),
+            Self::MaskRotation => mask.map(|v| v.rotation),
+            Self::MaskFeather => mask.map(|v| v.feather),
+            Self::MaskRound => mask.map(|v| v.round),
+            _ => None,
+        }
+    }
+
+    /// 改外观里这个属性（这一项没开时不改）。
+    pub fn look_set(self, l: &mut crate::Look, v: f32) {
+        match self {
+            Self::Radius => l.radius = v,
+            Self::StrokeWidth => {
+                if let Some(s) = l.stroke.as_mut() {
+                    s.width = v;
+                }
+            }
+            Self::ShadowOpacity | Self::ShadowBlur | Self::ShadowDistance | Self::ShadowAngle => {
+                if let Some(s) = l.shadow.as_mut() {
+                    match self {
+                        Self::ShadowOpacity => s.opacity = v,
+                        Self::ShadowBlur => s.blur = v,
+                        Self::ShadowDistance => s.distance = v,
+                        _ => s.angle = v,
+                    }
+                }
+            }
+            Self::KeyIntensity | Self::KeyShadow => {
+                if let Some(c) = l.chroma.as_mut() {
+                    if self == Self::KeyIntensity {
+                        c.intensity = v;
+                    } else {
+                        c.shadow = v;
+                    }
+                }
+            }
+            _ => {
+                if let Some(m) = l.mask.as_mut() {
+                    match self {
+                        Self::MaskX => m.x = v,
+                        Self::MaskY => m.y = v,
+                        Self::MaskWidth => m.width = v,
+                        Self::MaskHeight => m.height = v,
+                        Self::MaskRotation => m.rotation = v,
+                        Self::MaskFeather => m.feather = v,
+                        Self::MaskRound => m.round = v,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// 是外观属性。
+    #[must_use]
+    pub fn is_look(self) -> bool {
+        Self::LOOK.contains(&self)
+    }
+
     /// 这个属性单独看是否合法（裁剪之和另算）。
     fn accepts(self, v: f32) -> bool {
         v.is_finite()
             && match self {
-                Self::X | Self::Y | Self::Rotation => true,
+                Self::X
+                | Self::Y
+                | Self::Rotation
+                | Self::MaskX
+                | Self::MaskY
+                | Self::MaskRotation
+                | Self::ShadowAngle => true,
                 Self::Scale => (Transform::SCALE_RANGE.0..=Transform::SCALE_RANGE.1).contains(&v),
-                Self::Opacity => (0.0..=1.0).contains(&v),
+                Self::Opacity
+                | Self::Radius
+                | Self::ShadowOpacity
+                | Self::KeyIntensity
+                | Self::KeyShadow
+                | Self::MaskFeather
+                | Self::MaskRound
+                | Self::EffectAmount => (0.0..=1.0).contains(&v),
                 Self::CropLeft | Self::CropTop | Self::CropRight | Self::CropBottom => {
                     (0.0..1.0).contains(&v)
                 }
@@ -241,6 +433,10 @@ impl Prop {
                 | Self::Temperature
                 | Self::Tint => (-1.0..=1.0).contains(&v),
                 Self::Volume => (VOLUME_RANGE_DB.0..=VOLUME_RANGE_DB.1).contains(&v),
+                Self::StrokeWidth | Self::ShadowBlur | Self::ShadowDistance => {
+                    (0.0..=0.1).contains(&v)
+                }
+                Self::MaskWidth | Self::MaskHeight => (0.01..=4.0).contains(&v),
             }
     }
 }
@@ -287,10 +483,31 @@ impl Animation {
         all
     }
 
+    /// 换掉某个属性的全部关键帧（`keys` 为空时这个属性不再有动画）。`keys` 要按时间排好。
+    pub fn set_keys(&mut self, prop: Prop, keys: Vec<Key>) {
+        if keys.is_empty() {
+            self.tracks.remove(&prop);
+        } else {
+            self.tracks.insert(prop, keys);
+        }
+    }
+
     /// 某个属性在 `at` 时刻的值；这个属性没有关键帧时返回 `None`。
     #[must_use]
     pub fn value_at(&self, prop: Prop, at: Time) -> Option<f32> {
         value_of(self.tracks.get(&prop)?, at)
+    }
+
+    /// `at` 时刻的外观：有关键帧的项按时间插值，其余用 `base`（那一项没开时不管）。
+    #[must_use]
+    pub fn apply_look(&self, base: &crate::Look, at: Time) -> crate::Look {
+        let mut l = *base;
+        for &prop in self.tracks.keys().filter(|p| p.is_look()) {
+            if let Some(v) = self.value_at(prop, at) {
+                prop.look_set(&mut l, v);
+            }
+        }
+        l
     }
 
     /// `at` 时刻的调色：有关键帧的项按时间插值，其余用 `base`。

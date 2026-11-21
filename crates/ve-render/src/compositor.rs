@@ -282,6 +282,8 @@ struct Target {
     /// 混合模式图层要读的底图：画它之前把已经合成好的画面拷进来。
     backdrop: wgpu::Texture,
     backdrop_bind: wgpu::BindGroup,
+    /// 半透明复合片段每组开始前拍下的画面（一组一张，按 [`Compositor::groups`] 的顺序）。
+    snapshots: Vec<(wgpu::Texture, wgpu::BindGroup)>,
 }
 
 /// 显卡合成器。
@@ -324,6 +326,14 @@ pub struct Compositor {
     dummy_layer: wgpu::BindGroup,
     /// 插件特效的管线（和同一块显卡上的合成器共用）。
     plugins: PluginCache,
+    /// 半透明复合片段的分组（[`Self::set_groups`]）。
+    groups: Vec<ve_core::compose::GroupPass>,
+    /// 分组那一道：快照和画好的画面按整组不透明度混合。
+    group_pipeline: wgpu::RenderPipeline,
+    /// 分组那一道的不透明度（uniform）布局。
+    group_layout: wgpu::BindGroupLayout,
+    /// 这一帧各组的不透明度绑定。
+    group_binds: Vec<wgpu::BindGroup>,
 }
 
 impl Drop for Compositor {
@@ -811,6 +821,65 @@ fn pipeline_from(
     })
 }
 
+/// 分组那一道的不透明度：一个 uniform（`vec4`，x 是不透明度）。
+fn group_bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("group"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    })
+}
+
+/// 分组那一道的管线：读快照（第 0 组）和画好的画面（第 1 组），按不透明度（第 2 组）混合后直接写回。
+fn group_pipeline(
+    device: &wgpu::Device,
+    backdrop: &wgpu::BindGroupLayout,
+    amount: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("group"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("group.wgsl").into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("group"),
+        bind_group_layouts: &[Some(backdrop), Some(backdrop), Some(amount)],
+        ..Default::default()
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("group"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs"),
+            buffers: &[],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 impl Compositor {
     /// 创建合成器（选显卡、编译着色器）。
     ///
@@ -835,6 +904,8 @@ impl Compositor {
             software,
             lost: _,
         } = shared_gpu(config.software)?;
+        let group_layout = group_bind_layout(&device);
+        let group_pipeline = group_pipeline(&device, &backdrop_layout, &group_layout);
         Ok(Self {
             device,
             queue,
@@ -863,6 +934,10 @@ impl Compositor {
             effect_pipeline,
             dummy_layer,
             plugins,
+            groups: Vec::new(),
+            group_pipeline,
+            group_layout,
+            group_binds: Vec::new(),
         })
     }
 
@@ -960,6 +1035,7 @@ impl Compositor {
             padded_row,
             backdrop,
             backdrop_bind,
+            snapshots: Vec::new(),
         });
         self.nv12_target = None;
     }
@@ -1134,6 +1210,66 @@ impl Compositor {
         self.effects.extend_from_slice(effects);
     }
 
+    /// 半透明复合片段的分组（[`ve_core::compose::GroupPass`]）：之后合成的帧都按它做，直到再设。
+    pub fn set_groups(&mut self, groups: &[ve_core::compose::GroupPass]) {
+        self.groups.clear();
+        self.groups.extend_from_slice(groups);
+        self.groups
+            .sort_by_key(|g| (g.start, std::cmp::Reverse(g.end)));
+    }
+
+    /// 每组一张快照纹理（和输出一样大）、一个不透明度绑定。
+    fn prepare_groups(&mut self) {
+        let Some(target) = self.target.as_mut() else {
+            return;
+        };
+        while target.snapshots.len() < self.groups.len() {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("group snapshot"),
+                size: extent(target.size),
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("group snapshot"),
+                layout: &self.backdrop_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                }],
+            });
+            target.snapshots.push((texture, bind));
+        }
+        self.group_binds = self
+            .groups
+            .iter()
+            .map(|g| {
+                let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("group amount"),
+                    size: 16,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let v = [g.opacity.clamp(0.0, 1.0), 0.0, 0.0, 0.0];
+                self.queue
+                    .write_buffer(&buffer, 0, bytemuck::cast_slice(&v));
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("group amount"),
+                    layout: &self.group_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffer.as_entire_binding(),
+                    }],
+                })
+            })
+            .collect();
+    }
+
     /// 底色：黑色经 `color` 调色后的颜色（调节片段作用在没有画面的地方）；之后合成的帧都用它，
     /// 直到再设。
     pub fn set_background(&mut self, color: &ve_core::ColorMatrix) {
@@ -1195,6 +1331,7 @@ impl Compositor {
     /// 把各层画到输出纹理上（底色见 [`Self::set_background`]）。普通图层连着画在一个通道里；
     /// 混合模式图层先把画到这里的结果拷成底图，再单独画它（读底图、直接写回）；
     /// 画面特效在它压着的那几层画完后做：同样拷成底图，再整个画面重画。
+    /// 半透明复合片段（分组）：开始前拍一张快照，组里画完后和快照按整组不透明度混合。
     fn draw(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, count: usize) {
         let (Some((instances, _)), Some(target)) = (&self.instances, &self.target) else {
             drop(self.begin_pass(encoder, view, true));
@@ -1202,45 +1339,51 @@ impl Compositor {
         };
         // 第 k 道特效在画完前 after 层后做（超出层数的放最后）
         let effect_at = |k: usize| self.effects[k].after.min(count);
+        let groups = &self.groups;
         let mut first = true;
         let mut next_effect = 0;
+        let mut next_group = 0;
+        // 还没合上的组（从外到里）
+        let mut open: Vec<usize> = Vec::new();
         let mut start = 0;
         loop {
-            // 压在前 start 层上的特效
+            // 1. 在这里结束的组（从里到外）：先做组里的特效，再和快照混合
+            while let Some(&gi) = open.last() {
+                let g = &groups[gi];
+                if g.end.min(count) > start {
+                    break;
+                }
+                while next_effect < g.effects_end.min(self.effects.len())
+                    && effect_at(next_effect) <= start
+                {
+                    self.effect_pass(encoder, view, target, instances, count, next_effect);
+                    next_effect += 1;
+                }
+                self.group_pass(encoder, view, target, gi);
+                open.pop();
+            }
+            // 2. 压在前 start 层上的特效
             while next_effect < self.effects.len() && effect_at(next_effect) <= start {
                 if first {
                     drop(self.begin_pass(encoder, view, true));
                     first = false;
                 }
-                let n = u32::try_from(count + next_effect).unwrap_or(u32::MAX);
-                let e = self.effects[next_effect].effect;
-                let plugin = (e.kind == ve_core::EffectKind::Plugin)
-                    .then(|| self.plugin_pipeline(e.plugin.as_str()));
-                match plugin {
-                    // 插件没登记或编译不过：跳过这道
-                    Some(None) => {}
-                    Some(Some(p)) => self.backdrop_pass(
-                        encoder,
-                        view,
-                        target,
-                        instances,
-                        &self.dummy_layer,
-                        n,
-                        &p,
-                        true,
-                    ),
-                    None => self.backdrop_pass(
-                        encoder,
-                        view,
-                        target,
-                        instances,
-                        &self.dummy_layer,
-                        n,
-                        &self.effect_pipeline,
-                        true,
-                    ),
-                }
+                self.effect_pass(encoder, view, target, instances, count, next_effect);
                 next_effect += 1;
+            }
+            // 3. 从这里开始的组（从外到里）：拍快照
+            while next_group < groups.len() && groups[next_group].start <= start {
+                if first {
+                    drop(self.begin_pass(encoder, view, true));
+                    first = false;
+                }
+                encoder.copy_texture_to_texture(
+                    target.texture.as_image_copy(),
+                    target.snapshots[next_group].0.as_image_copy(),
+                    extent(target.size),
+                );
+                open.push(next_group);
+                next_group += 1;
             }
             if start >= count {
                 break;
@@ -1250,27 +1393,22 @@ impl Compositor {
                     drop(self.begin_pass(encoder, view, true));
                     first = false;
                 }
-                let n = u32::try_from(start).unwrap_or(u32::MAX);
-                let bind = &self.slots[start].bind;
-                self.backdrop_pass(
-                    encoder,
-                    view,
-                    target,
-                    instances,
-                    bind,
-                    n,
-                    &self.blend_pipeline,
-                    false,
-                );
+                self.blend_layer_pass(encoder, view, target, instances, start);
                 start += 1;
                 continue;
             }
-            // 一段连续的普通图层：到下一个混合模式图层或下一道特效为止
-            let stop = if next_effect < self.effects.len() {
+            // 一段连续的普通图层：到下一个混合模式图层、下一道特效、下一个组的开头或结尾为止
+            let mut stop = if next_effect < self.effects.len() {
                 effect_at(next_effect)
             } else {
                 count
             };
+            if let Some(g) = groups.get(next_group) {
+                stop = stop.min(g.start);
+            }
+            if let Some(&gi) = open.last() {
+                stop = stop.min(groups[gi].end);
+            }
             let end = (start..stop)
                 .find(|&i| self.blended.get(i).copied().unwrap_or(false))
                 .unwrap_or(stop)
@@ -1293,6 +1431,88 @@ impl Compositor {
         if first {
             drop(self.begin_pass(encoder, view, true));
         }
+    }
+
+    /// 第 `i` 层是混合模式图层：读底图、算好后直接写回。
+    fn blend_layer_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        target: &Target,
+        instances: &wgpu::Buffer,
+        i: usize,
+    ) {
+        let n = u32::try_from(i).unwrap_or(u32::MAX);
+        self.backdrop_pass(
+            encoder,
+            view,
+            target,
+            instances,
+            &self.slots[i].bind,
+            n,
+            &self.blend_pipeline,
+            false,
+        );
+    }
+
+    /// 第 `k` 道画面特效（插件没登记或编译不过时跳过）。
+    fn effect_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        target: &Target,
+        instances: &wgpu::Buffer,
+        count: usize,
+        k: usize,
+    ) {
+        let n = u32::try_from(count + k).unwrap_or(u32::MAX);
+        let e = self.effects[k].effect;
+        let plugin = (e.kind == ve_core::EffectKind::Plugin)
+            .then(|| self.plugin_pipeline(e.plugin.as_str()));
+        match plugin {
+            Some(None) => {}
+            Some(Some(p)) => self.backdrop_pass(
+                encoder,
+                view,
+                target,
+                instances,
+                &self.dummy_layer,
+                n,
+                &p,
+                true,
+            ),
+            None => self.backdrop_pass(
+                encoder,
+                view,
+                target,
+                instances,
+                &self.dummy_layer,
+                n,
+                &self.effect_pipeline,
+                true,
+            ),
+        }
+    }
+
+    /// 第 `gi` 组画完：把画好的拷成底图，和组开始前的快照按整组不透明度混合后写回。
+    fn group_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        target: &Target,
+        gi: usize,
+    ) {
+        encoder.copy_texture_to_texture(
+            target.texture.as_image_copy(),
+            target.backdrop.as_image_copy(),
+            extent(target.size),
+        );
+        let mut pass = self.begin_pass(encoder, view, false);
+        pass.set_pipeline(&self.group_pipeline);
+        pass.set_bind_group(0, &target.snapshots[gi].1, &[]);
+        pass.set_bind_group(1, &target.backdrop_bind, &[]);
+        pass.set_bind_group(2, &self.group_binds[gi], &[]);
+        pass.draw(0..3, 0..1);
     }
 
     /// 插件 `name` 的管线：第一次用到时编译（拼上内置着色器）；没登记、编译失败返回 `None`（跳过这道）。
@@ -1372,6 +1592,7 @@ impl Compositor {
     ) -> Result<wgpu::CommandEncoder, RenderError> {
         self.upload(size, layers)?;
         self.ensure_target(size);
+        self.prepare_groups();
         let target = self
             .target
             .as_ref()
@@ -2370,6 +2591,60 @@ mod tests {
             tex.extend(solid(32, 1, [255, 0, 0, 255]));
         }
         tex
+    }
+
+    #[test]
+    fn a_translucent_group_fades_as_one_picture() {
+        let mut c = compositor();
+        let red = solid(2, 2, [0, 0, 255, 255]);
+        let green = solid(2, 2, [0, 255, 0, 255]);
+        let blue = solid(2, 2, [255, 0, 0, 255]);
+        let mut out = Vec::new();
+        let group = |start, end, opacity| ve_core::compose::GroupPass {
+            start,
+            end,
+            effects_end: 0,
+            opacity,
+        };
+        // 红、绿完全重叠，整组 50%：黑底上一半的绿，红一点都透不出来
+        c.set_groups(&[group(0, 2, 0.5)]);
+        c.compose_bgra(
+            SIZE,
+            &[layer(&red, 2, 2, FULL, 1.0), layer(&green, 2, 2, FULL, 1.0)],
+            &mut out,
+        )
+        .unwrap();
+        assert!(
+            near(px(&out, 20, 20), [0, 128, 0], 3),
+            "{:?}",
+            px(&out, 20, 20)
+        );
+        // 组下面还有一层蓝：蓝和绿各一半
+        c.set_groups(&[group(1, 2, 0.5)]);
+        c.compose_bgra(
+            SIZE,
+            &[
+                layer(&blue, 2, 2, FULL, 1.0),
+                layer(&green, 2, 2, FULL, 1.0),
+            ],
+            &mut out,
+        )
+        .unwrap();
+        assert!(
+            near(px(&out, 20, 20), [128, 128, 0], 3),
+            "{:?}",
+            px(&out, 20, 20)
+        );
+        // 嵌套：外层 50% 里面再套一层 50%
+        c.set_groups(&[group(0, 1, 0.5), group(0, 1, 0.5)]);
+        c.compose_bgra(SIZE, &[layer(&green, 2, 2, FULL, 1.0)], &mut out)
+            .unwrap();
+        assert!(
+            near(px(&out, 20, 20), [0, 64, 0], 3),
+            "{:?}",
+            px(&out, 20, 20)
+        );
+        c.set_groups(&[]);
     }
 
     #[test]

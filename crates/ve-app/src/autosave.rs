@@ -147,10 +147,12 @@ impl Workspace {
         if !self.doc.is_dirty() || !quiet || self.doc.in_gesture() {
             return;
         }
-        let path = self.doc.path().map_or_else(
+        // 在复合片段里面时存的是整个工程（里面的改动写回去之后的样子），路径用最外层的
+        let dir = a.dir.clone();
+        let path = self.outermost_path().map_or_else(
             || {
                 let (month, day, ..) = local_now();
-                unique_path(&a.dir, &draft_name(month, day))
+                unique_path(&dir, &draft_name(month, day))
             },
             Path::to_path_buf,
         );
@@ -159,7 +161,19 @@ impl Workspace {
         {
             log::warn!("建不了草稿目录 {}：{e}", dir.display());
         }
-        match crate::project_io::save(&mut self.doc, &path) {
+        let result = if self.compound_stack.is_empty() {
+            crate::project_io::save(&mut self.doc, &path)
+        } else {
+            let whole = self.whole_project();
+            let path = crate::project_io::with_extension(&path);
+            ve_core::save_project(&whole, &path)
+                .map_err(|e| format!("保存失败：{e}"))
+                .map(|()| {
+                    self.mark_whole_saved(&path);
+                    path
+                })
+        };
+        match result {
             Ok(saved) => {
                 let (.., h, m, s) = local_now();
                 if let Some(a) = self.autosave.as_mut() {

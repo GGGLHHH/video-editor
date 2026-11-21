@@ -25,9 +25,11 @@ impl Workspace {
     /// # Errors
     /// 写不进去。
     pub fn export_interchange(&self, kind: Interchange, path: &Path) -> std::io::Result<()> {
-        let project = ve_core::compound::flatten(&self.doc.project)
-            .unwrap_or_else(|| self.doc.project.clone());
-        let title = self.doc.title();
+        // 在复合片段里面时也导出整个工程
+        let whole = self.whole_project();
+        let project = ve_core::compound::flatten(&whole).unwrap_or(whole);
+        // 工程名（不带窗口标题里「未保存」的 *）
+        let title = self.doc.name();
         let text = match kind {
             Interchange::Otio => to_otio(&project, &title),
             Interchange::Edl => to_edl(&project, &title),

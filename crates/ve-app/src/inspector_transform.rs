@@ -286,9 +286,14 @@ impl Workspace {
     pub(crate) fn bound_visual_clip(&self) -> Option<(ClipId, Transform, Time)> {
         self.bound_video_clip().or_else(|| {
             let clip = self.inspector.bound?;
-            let (_, c) = self.doc.project.timeline.find_clip(clip)?;
-            c.subtitle_text()?;
-            let offset = (self.playhead - c.start).clamp(Time::ZERO, c.duration);
+            let (track, c) = self.doc.project.timeline.find_clip(clip)?;
+            // 字幕，或者视频轨上的复合片段（整组的位置大小）
+            let group = c.compound().is_some()
+                && self.doc.project.timeline.track(track)?.kind == TrackKind::Video;
+            if !group {
+                c.subtitle_text()?;
+            }
+            let offset = self.key_offset(c);
             Some((clip, c.transform_at(offset), offset))
         })
     }
@@ -308,7 +313,7 @@ impl Workspace {
         if kind != TrackKind::Video || c.asset().is_none() {
             return None;
         }
-        let offset = (self.playhead - c.start).clamp(Time::ZERO, c.duration);
+        let offset = self.key_offset(c);
         Some((clip, c.transform_at(offset), offset))
     }
 
@@ -334,6 +339,12 @@ impl Workspace {
     }
 
     /// 把片段的画面属性填进控件。
+    /// 属性面板「位置大小」几个输入框现在显示的文字（X、Y、缩放、四边裁剪、旋转）。
+    #[must_use]
+    pub fn transform_field_texts(&self) -> [String; 8] {
+        self.inspector.transform.shown.clone()
+    }
+
     pub(crate) fn fill_transform(
         &mut self,
         t: &Transform,
@@ -745,6 +756,12 @@ impl Workspace {
             self.prop_line(label, body, group, cx)
         };
         let subtitle = self.bound_is_subtitle();
+        // 复合片段：整组只有位置大小、旋转、不透明度生效，裁剪不生效（不显示，免得改了没反应）
+        let group = self
+            .inspector
+            .bound
+            .and_then(|id| self.doc.project.timeline.find_clip(id))
+            .is_some_and(|(_, c)| c.compound().is_some());
         let blend = (!subtitle).then(|| self.render_blend_group(&t, cx));
         let basic = v_flex()
             .gap_2()
@@ -786,7 +803,7 @@ impl Workspace {
                 )
             }))
             .children(self.render_radius_row(cx))
-            .children((!subtitle).then(|| {
+            .children((!subtitle && !group).then(|| {
                 line(
                     "裁剪 %",
                     h_flex()

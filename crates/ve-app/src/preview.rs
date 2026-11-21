@@ -42,6 +42,8 @@ pub struct PreviewState {
     pub em_font: String,
     /// 正在预览上拖动的图层。
     pub(crate) drag: Option<crate::preview_edit::PreviewDrag>,
+    /// 正在预览上拖动的蒙版（属性面板在「蒙版」时）。
+    pub(crate) mask_drag: Option<crate::preview_mask::MaskDrag>,
     /// 鼠标样式（悬停 / 拖动时按位置变）。
     pub(crate) cursor: gpui_kit::CursorStyle,
     /// 底栏「比例」菜单是否展开。
@@ -192,11 +194,22 @@ impl Workspace {
                 let margin = px(style.margin_px(shown_h_px) as f32);
                 let bottom = self.preview.bounds.size.height - (vy + video.size.height) + margin;
                 // 缩放以底边中点为中心（和 ASS 的 \an2 + \fscx 一致）、位置偏移、透明度
+                #[expect(clippy::cast_possible_truncation, reason = "几十像素")]
+                let metrics = TextMetrics {
+                    outline: outline * state.scale,
+                    spacing: style.spacing_px(shown_h_px) as f32 * state.scale,
+                    shadow: if style.shadow > 0.0 {
+                        (style.shadow_px(shown_h_px) as f32).max(1.0) * state.scale
+                    } else {
+                        0.0
+                    },
+                    padding: style.padding_px(shown_h_px) as f32 * state.scale,
+                };
                 subtitle_overlay(
                     show.text,
                     font * state.scale,
                     line * state.scale,
-                    outline * state.scale,
+                    metrics,
                     style,
                     show.chars.as_deref(),
                 )
@@ -602,12 +615,30 @@ pub fn aspect_label(width: u32, height: u32) -> String {
     format!("{w}:{h}")
 }
 
-/// 白字黑描边：8 个方向偏移的黑字垫底 + 白字。
+/// 预览里画字幕要的几个像素量（已经按显示大小和动画缩放算好）。
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TextMetrics {
+    /// 描边宽度。
+    pub outline: f32,
+    /// 字间距。
+    pub spacing: f32,
+    /// 阴影往右下偏多远。
+    pub shadow: f32,
+    /// 背景框比字多出的边。
+    pub padding: f32,
+}
+
+/// 字幕：描边色的字在 8 个方向偏移垫底作描边，阴影色的字再整体往右下偏作阴影；
+/// 有背景框时不描边，字底下一块背景（阴影变成框的影子），和 libass 的 `BorderStyle=3` 一样。
+#[expect(
+    clippy::too_many_lines,
+    reason = "阴影、描边、背景框照着 libass 一层层叠，拆开反而难对照导出"
+)]
 fn subtitle_overlay(
     text: &str,
     font: Pixels,
     line: Pixels,
-    outline: f32,
+    m: TextMetrics,
     style: &SubtitleStyle,
     chars: Option<&[(f32, f32)]>,
 ) -> gpui_kit::Div {
@@ -618,12 +649,23 @@ fn subtitle_overlay(
     } else {
         gpui_kit::FontWeight::NORMAL
     };
+    let boxed = style.has_background();
+    // 有字间距时也按一个字一个格子排（GPUI 的文字没有字间距）
+    let all_shown: Vec<(f32, f32)> = if m.spacing > 0.0 && chars.is_none() {
+        vec![(1.0, 1.0); text.chars().count()]
+    } else {
+        Vec::new()
+    };
+    let reveal = chars.or_else(|| (!all_shown.is_empty()).then_some(all_shown.as_slice()));
     // 逐字入场：每个字一个格子，各自的不透明度和缩放（底边对齐，和 ASS 的逐字 \alpha、\fscx 一样）
     let per_char = |color: gpui_kit::Hsla, reveal: &[(f32, f32)]| {
-        let mut rows = v_flex().w_full().items_center();
+        let mut rows = v_flex().items_center();
+        if !boxed {
+            rows = rows.w_full();
+        }
         let mut k = 0;
         for row_text in text.split('\n') {
-            let mut row = h_flex().items_end().justify_center();
+            let mut row = h_flex().items_end().justify_center().gap(px(m.spacing));
             for ch in row_text.chars() {
                 let (a, s) = reveal.get(k).copied().unwrap_or((1.0, 1.0));
                 k += 1;
@@ -641,48 +683,107 @@ fn subtitle_overlay(
         }
         rows
     };
-    let styled = |d: gpui_kit::Div, color: gpui_kit::Hsla| match chars {
-        Some(reveal) => d.w_full().child(per_char(color, reveal)),
-        None => d
+    let styled = |d: gpui_kit::Div, color: gpui_kit::Hsla| {
+        let mut d = if boxed { d } else { d.w_full() };
+        if style.italic {
+            d = d.italic();
+        }
+        if style.underline {
+            d = d.underline();
+        }
+        match reveal {
+            Some(reveal) => d.child(per_char(color, reveal)),
+            None => d
+                .text_center()
+                .text_size(font)
+                .line_height(line)
+                .font_family(family.clone())
+                .font_weight(weight)
+                .text_color(color)
+                .child(shared.clone()),
+        }
+    };
+    let color = |rgb: u32, opacity: f32| -> gpui_kit::Hsla {
+        let c: gpui_kit::Hsla = gpui_kit::rgb(rgb).into();
+        c.opacity(opacity)
+    };
+    let fill = color(style.color, style.opacity);
+    if boxed {
+        let shade = color(style.shadow_color, style.shadow_opacity);
+        let back = color(style.background_color, style.background_opacity);
+        let shadow = (m.shadow > 0.0).then(|| {
+            div()
+                .absolute()
+                .left(px(m.shadow))
+                .top(px(m.shadow))
+                .size_full()
+                .bg(shade)
+        });
+        let body = styled(div(), fill)
+            .id("subtitle-main")
+            .test_support()
+            .px(px(m.padding))
+            .py(px(m.padding))
+            .bg(back);
+        return h_flex()
             .w_full()
-            .text_center()
-            .text_size(font)
-            .line_height(line)
-            .font_family(family.clone())
-            .font_weight(weight)
-            .text_color(color)
-            .child(shared.clone()),
-    };
-    let (fill, edge): (gpui_kit::Hsla, gpui_kit::Hsla) = (
-        gpui_kit::rgb(style.color).into(),
-        gpui_kit::rgb(style.outline_color).into(),
+            .justify_center()
+            .child(div().relative().children(shadow).child(body));
+    }
+    let outline_copies: u8 = if m.outline > 0.0 { 8 } else { 0 };
+    let edge = color(
+        style.outline_color,
+        stacked_alpha(style.opacity, outline_copies),
     );
-    // 正文在文档流里，决定高度；8 个方向偏移的描边色字叠在下面作描边（描边为 0 时不画）
+    let shade = color(
+        style.shadow_color,
+        stacked_alpha(style.shadow_opacity, outline_copies + 1),
+    );
+    // 正文在文档流里，决定高度；描边色、阴影色的字叠在下面（为 0 时不画）
     let mut root = div().relative();
-    let offsets: &[(f32, f32)] = if outline > 0.0 {
-        &[
-            (-1.0, -1.0),
-            (0.0, -1.0),
-            (1.0, -1.0),
-            (-1.0, 0.0),
-            (1.0, 0.0),
-            (-1.0, 1.0),
-            (0.0, 1.0),
-            (1.0, 1.0),
-        ]
-    } else {
-        &[]
-    };
-    for &(dx, dy) in offsets {
+    let ring: &[(f32, f32)] = &[
+        (-1.0, -1.0),
+        (0.0, -1.0),
+        (1.0, -1.0),
+        (-1.0, 0.0),
+        (1.0, 0.0),
+        (-1.0, 1.0),
+        (0.0, 1.0),
+        (1.0, 1.0),
+    ];
+    let outline: &[(f32, f32)] = if m.outline > 0.0 { ring } else { &[] };
+    if m.shadow > 0.0 {
+        // 阴影是带描边的字整体的影子
+        for &(dx, dy) in std::iter::once(&(0.0, 0.0)).chain(outline) {
+            root = root.child(styled(
+                div()
+                    .absolute()
+                    .left(px(dx.mul_add(m.outline, m.shadow)))
+                    .top(px(dy.mul_add(m.outline, m.shadow))),
+                shade,
+            ));
+        }
+    }
+    for &(dx, dy) in outline {
         root = root.child(styled(
             div()
                 .absolute()
-                .left(px(dx * outline))
-                .top(px(dy * outline)),
+                .left(px(dx * m.outline))
+                .top(px(dy * m.outline)),
             edge,
         ));
     }
     root.child(styled(div(), fill).id("subtitle-main").test_support())
+}
+
+/// 描边、阴影是同一个字偏移着叠很多份画出来的；GPUI 的透明度逐份相乘，重叠处会越叠越实。
+/// 每份用这个透明度，`copies` 份叠满的地方合起来正好是 `alpha`（和 libass 整块一个透明度一致，
+/// 只有边缘叠得少的地方略淡）。
+fn stacked_alpha(alpha: f32, copies: u8) -> f32 {
+    if copies <= 1 || alpha >= 1.0 {
+        return alpha;
+    }
+    1.0 - (1.0 - alpha.max(0.0)).powf(1.0 / f32::from(copies))
 }
 
 /// 倍速 / 倒放时时间码旁边的提示（原速、暂停时不显示）。
@@ -700,6 +801,16 @@ fn shuttle_label(playing: bool, rate: f32) -> Option<SharedString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stacked_copies_add_up_to_the_set_opacity() {
+        for (a, k) in [(0.6_f32, 9_u8), (0.5, 8), (1.0, 8), (0.0, 9), (0.3, 1)] {
+            let each = stacked_alpha(a, k);
+            // k 份叠在一起：1 - (1 - each)^k
+            let total = 1.0 - (1.0 - each).powi(i32::from(k));
+            assert!((total - a).abs() < 1e-4, "{a} × {k}: {total}");
+        }
+    }
 
     #[test]
     fn aspect_labels_use_common_names() {

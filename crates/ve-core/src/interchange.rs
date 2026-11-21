@@ -350,6 +350,7 @@ fn media_clip(id: ClipId, asset: AssetId, c: &ExClip) -> Clip {
         frame_blend: false,
         stabilized: None,
         input_space: None,
+        parent: None,
     }
 }
 

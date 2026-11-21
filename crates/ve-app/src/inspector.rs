@@ -48,6 +48,8 @@ pub struct Inspector {
     pub(crate) effect: crate::inspector_effect::EffectFields,
     /// 「音频」标签的声音处理（降噪、均衡、压缩）。
     pub(crate) audio_fx: crate::inspector_audio_fx::AudioFxFields,
+    /// 「文本」标签的滑条、取色器、字体下拉框。
+    pub(crate) text_style: crate::inspector_text_style::TextStyleFields,
 }
 
 /// 属性面板的一级标签。
@@ -163,6 +165,8 @@ impl Inspector {
         let (grade, grade_subs) = crate::inspector_grade::GradeFields::new(window, cx);
         let (effect, effect_subs) = crate::inspector_effect::EffectFields::new(window, cx);
         let (audio_fx, audio_fx_subs) = crate::inspector_audio_fx::AudioFxFields::new(window, cx);
+        let (text_style, text_style_subs) =
+            crate::inspector_text_style::TextStyleFields::new(window, cx);
         let mut subs = vec![
             cx.subscribe_in(
                 &gain,
@@ -213,6 +217,7 @@ impl Inspector {
         subs.extend(grade_subs);
         subs.extend(effect_subs);
         subs.extend(audio_fx_subs);
+        subs.extend(text_style_subs);
         (
             Self {
                 gain,
@@ -230,6 +235,7 @@ impl Inspector {
                 grade,
                 effect,
                 audio_fx,
+                text_style,
                 transform,
                 adjust,
             },
@@ -253,7 +259,7 @@ impl Workspace {
             .project
             .timeline
             .find_clip(clip)
-            .map(|(_, c)| (self.playhead - c.start).clamp(Time::ZERO, c.duration))
+            .map(|(_, c)| self.key_offset(c))
         else {
             return;
         };
@@ -415,7 +421,7 @@ impl Workspace {
         };
         match &clip.content {
             ClipContent::Media { .. } => {
-                let offset = (self.playhead - clip.start).clamp(Time::ZERO, clip.duration);
+                let offset = self.key_offset(&clip);
                 let db = clip.gain_db_at(offset);
                 self.inspector
                     .gain
@@ -429,7 +435,7 @@ impl Workspace {
                 self.refresh_audio_fx_sliders(window, cx);
                 if let Some((_, t, _)) = self.bound_video_clip() {
                     self.fill_transform(&t, window, cx);
-                    let offset = (self.playhead - clip.start).clamp(Time::ZERO, clip.duration);
+                    let offset = self.key_offset(&clip);
                     self.fill_adjust(&clip.adjust_at(offset), window, cx);
                 }
             }
@@ -444,7 +450,12 @@ impl Workspace {
             }
             ClipContent::Adjustment => self.fill_adjust(&clip.adjust, window, cx),
             ClipContent::Effect(_) => self.refresh_effect_slider(window, cx),
-            ClipContent::Compound { .. } => {}
+            ClipContent::Compound { .. } => {
+                // 视频轨上的复合片段：整组的位置大小
+                if let Some((_, t, _)) = self.bound_visual_clip() {
+                    self.fill_transform(&t, window, cx);
+                }
+            }
         }
     }
 

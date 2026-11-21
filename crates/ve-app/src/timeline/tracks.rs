@@ -21,6 +21,11 @@ pub fn track_names(timeline: &Timeline) -> Vec<String> {
         .iter()
         .filter(|t| t.kind == TrackKind::Video)
         .count();
+    let texts = timeline
+        .tracks
+        .iter()
+        .filter(|t| t.kind == TrackKind::Subtitle)
+        .count();
     let (mut v, mut a, mut s) = (0, 0, 0);
     timeline
         .tracks
@@ -34,21 +39,22 @@ pub fn track_names(timeline: &Timeline) -> Vec<String> {
                 a += 1;
                 format!("A{a}")
             }
+            // 文字轨也从下往上数：贴着视频的是 S1（字幕），叠在上面的标题是 S2、S3…
             TrackKind::Subtitle => {
                 s += 1;
-                format!("S{s}")
+                format!("S{}", texts + 1 - s)
             }
         })
         .collect()
 }
 
-/// 这条轨能不能删：同类型至少留一条，字幕轨这一版只有一条。
+/// 这条轨能不能删：同类型至少留一条。
 #[must_use]
 pub fn deletable(timeline: &Timeline, index: usize) -> bool {
-    timeline.tracks.get(index).is_some_and(|t| {
-        t.kind != TrackKind::Subtitle
-            && timeline.tracks.iter().filter(|o| o.kind == t.kind).count() > 1
-    })
+    timeline
+        .tracks
+        .get(index)
+        .is_some_and(|t| timeline.tracks.iter().filter(|o| o.kind == t.kind).count() > 1)
 }
 
 impl Workspace {

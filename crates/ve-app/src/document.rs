@@ -23,6 +23,8 @@ pub struct Document {
     path: Option<PathBuf>,
     dirty: bool,
     revision: u64,
+    /// 手势（拖拽）开始时的时间轴：手势结束时看哪些轨道被拖空了。
+    gesture_before: Option<Timeline>,
 }
 
 impl Default for Document {
@@ -49,6 +51,7 @@ impl Document {
             path,
             dirty: false,
             revision: 0,
+            gesture_before: None,
         }
     }
 
@@ -95,6 +98,10 @@ impl Document {
             self.project = before;
             return Err(e);
         }
+        // 被这一步拖空 / 删空的轨道收掉；拖动中先不收（轨道一少，鼠标下面的轨道就变了），松手时再收
+        if !self.in_gesture() {
+            ve_core::edit::prune_emptied_tracks(&before.timeline, &mut self.project);
+        }
         if self.project != before {
             self.history.record(&before);
             self.changed();
@@ -105,15 +112,22 @@ impl Document {
     /// 开始一个连续手势（拖拽）：期间的编辑合成一步撤销。
     pub fn begin_gesture(&mut self) {
         self.history.begin_transaction(&self.project);
+        self.gesture_before = Some(self.project.timeline.clone());
     }
 
-    /// 结束连续手势。
+    /// 结束连续手势（拖空的轨道这时收掉，和拖动算同一步撤销）。
     pub fn end_gesture(&mut self) {
+        if let Some(before) = self.gesture_before.take()
+            && ve_core::edit::prune_emptied_tracks(&before, &mut self.project)
+        {
+            self.changed();
+        }
         self.history.commit_transaction(&self.project);
     }
 
     /// 放弃进行中的手势（拖到一半按 Esc）：回到手势开始前，不记撤销。没有手势返回 `false`。
     pub fn cancel_gesture(&mut self) -> bool {
+        self.gesture_before = None;
         let restored = self.history.abort_transaction(&mut self.project);
         if restored {
             self.changed();

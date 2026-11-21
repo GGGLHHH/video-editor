@@ -78,6 +78,9 @@ fn menu_groups() -> [(&'static str, Vec<MenuItem>); 2] {
                 item("menu-edl-out", "导出 EDL…", "", || {
                     Box::new(act::ExportEdl)
                 }),
+                item("menu-settings", "全局设置…", "", || {
+                    Box::new(act::OpenSettings)
+                }),
                 item("menu-export", "导出视频…", "Ctrl+E", || {
                     Box::new(act::Export)
                 }),

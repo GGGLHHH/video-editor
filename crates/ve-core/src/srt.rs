@@ -1,6 +1,6 @@
 //! SRT 字幕文件：解析、生成、导入工程、从工程导出。
 
-use crate::edit::{EditError, add_subtitle};
+use crate::edit::{EditError, add_caption};
 use crate::{ClipId, Project, Time, TrackKind};
 use std::fmt::Write as _;
 use thiserror::Error;
@@ -147,7 +147,7 @@ pub fn import_srt(project: &mut Project, cues: &[Cue]) -> Result<SrtImport, Edit
             report.skipped += 1;
             continue;
         }
-        match add_subtitle(&mut draft, start, cue.end - start, cue.text.clone()) {
+        match add_caption(&mut draft, start, cue.end - start, cue.text.clone()) {
             Ok(id) => {
                 report.added.push(id);
                 prev_end = cue.end;
@@ -163,11 +163,14 @@ pub fn import_srt(project: &mut Project, cues: &[Cue]) -> Result<SrtImport, Edit
 /// 导出字幕轨上的所有字幕（按时间排序）。
 #[must_use]
 pub fn export_srt(project: &Project) -> Vec<Cue> {
+    // 只导字幕轨（最下面那条文字轨）：上面叠的是标题，和字幕列表一样不算字幕
     let mut cues: Vec<Cue> = project
         .timeline
         .tracks
         .iter()
-        .filter(|t| t.kind == TrackKind::Subtitle && t.shows())
+        .rfind(|t| t.kind == TrackKind::Subtitle)
+        .filter(|t| t.shows())
+        .into_iter()
         .flat_map(|t| t.clips.iter())
         .filter(|c| c.enabled())
         .filter_map(|c| {
@@ -339,5 +342,20 @@ mod tests {
             let parsed = parse_srt(&write_srt(&cues)).unwrap();
             prop_assert_eq!(parsed, cues);
         }
+    }
+
+    #[test]
+    fn srt_export_takes_only_the_caption_track_not_titles() {
+        let (mut p, _) = sample_project();
+        crate::edit::add_subtitle(
+            &mut p,
+            Time::from_secs(1),
+            Time::from_secs(1),
+            "标题".into(),
+        )
+        .unwrap();
+        let cues = export_srt(&p);
+        assert_eq!(cues.len(), 1, "{cues:?}");
+        assert_eq!(cues[0].text, "你好");
     }
 }
