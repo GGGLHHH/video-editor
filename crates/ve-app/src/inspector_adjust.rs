@@ -81,9 +81,6 @@ impl AdjustFields {
     }
 }
 
-/// 属性行右边 ‹ ◇ › 那一组的宽（没有关键帧的行留同样宽的空位对齐；按发布版截图量的）。
-const KEYS_WIDTH: f32 = 42.0;
-
 /// 色温（冷 → 暖）、色调（绿 → 品红）滑条下面的渐变条（剪映的滑轨是渐变色）。
 fn gradient_strip(item: AdjustItem) -> Option<gpui_kit::AnyElement> {
     let (id, from, to) = match item {
@@ -138,13 +135,23 @@ impl Workspace {
         };
         let c = std::sync::Arc::clone(c);
         let offset = self.key_offset(&c);
-        let colour_keys = Prop::ADJUST
+        let colour_keys = Prop::ADJUST_ALL
             .iter()
             .any(|p| !c.animation.keys(*p).is_empty());
         if (force || colour_keys) && !self.inspector.adjust.gesture {
             let a = c.adjust_at(offset);
-            for (item, slider) in AdjustItem::ALL.iter().zip(&self.inspector.adjust.sliders) {
-                let v = slider_value(item.get(&a));
+            let rows = AdjustItem::ALL
+                .iter()
+                .map(|item| item.get(&a))
+                .zip(&self.inspector.adjust.sliders)
+                .chain(
+                    AdjustExtra::ALL
+                        .iter()
+                        .map(|x| x.get(&a))
+                        .zip(&self.inspector.adjust.extras),
+                );
+            for (value, slider) in rows {
+                let v = slider_value(value);
                 if (slider.read(cx).value().start() - v).abs() > f32::EPSILON {
                     slider.update(cx, |s, cx| s.set_value(v, window, cx));
                 }
@@ -206,7 +213,7 @@ impl Workspace {
         }
     }
 
-    /// 高光、阴影、光感、锐化、颗粒、暗角六行（没有关键帧按钮）。
+    /// 高光、阴影、光感、锐化、颗粒、暗角六行（每行右边 ‹ ◇ ›）。
     fn render_adjust_extras(
         &self,
         current: &ColorAdjust,
@@ -249,8 +256,7 @@ impl Workspace {
                         32.0,
                         cx,
                     ))
-                    // 和上面有关键帧按钮（‹ ◇ › 三个小按钮）的行对齐
-                    .child(div().w(px(KEYS_WIDTH)).flex_none())
+                    .child(self.render_group_keys(KeyGroup::Extra(x), cx))
                     .into_any_element()
             })
             .collect()
@@ -386,7 +392,7 @@ impl Workspace {
                                                 this.apply_adjust_to_all(window, cx);
                                             })),
                                     )
-                                    // 组标题上的 ‹ ◇ ›：五项一起打帧（剪映）
+                                    // 组标题上的 ‹ ◇ ›：「基础」11 项一起打帧（剪映）
                                     .child(self.render_group_keys(KeyGroup::AdjustAll, cx))
                                     .into_any_element(),
                             ),

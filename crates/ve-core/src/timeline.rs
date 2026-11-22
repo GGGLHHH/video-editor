@@ -262,6 +262,8 @@ impl Clip {
             prop.get(&self.transform_at(offset))
         } else if let Some(item) = prop.adjust_item() {
             item.get(&self.adjust_at(offset))
+        } else if let Some(x) = prop.adjust_extra() {
+            x.get(&self.adjust_at(offset))
         } else if prop.is_look() {
             prop.look_get(&self.look_at(offset)).unwrap_or_default()
         } else if prop == crate::Prop::EffectAmount {
@@ -283,6 +285,8 @@ impl Clip {
             prop.set(&mut self.transform, value);
         } else if let Some(item) = prop.adjust_item() {
             item.set(&mut self.adjust, value);
+        } else if let Some(x) = prop.adjust_extra() {
+            x.set(&mut self.adjust, value);
         } else if prop.is_look() {
             prop.look_set(&mut self.look, value);
         } else if prop == crate::Prop::EffectAmount {

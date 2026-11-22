@@ -1270,7 +1270,7 @@ pub fn set_adjust(
     ensure_video(project, clip)?;
     update_clip(project, clip, |c| {
         c.adjust = adjust;
-        for prop in crate::Prop::ADJUST {
+        for prop in crate::Prop::ADJUST_ALL {
             c.animation.remove_between(prop, Time::ZERO, Time(i64::MAX));
         }
         Ok(())
@@ -1304,9 +1304,16 @@ pub fn apply_adjust_at(
                 c.animation.upsert(prop, at, value);
             }
         }
-        // 高光、阴影、光感、锐化、颗粒、暗角不做关键帧，直接改
-        for extra in crate::AdjustExtra::ALL {
-            extra.set(&mut c.adjust, extra.get(&adjust));
+        for prop in crate::Prop::ADJUST_EXTRA {
+            let Some(x) = prop.adjust_extra() else {
+                continue;
+            };
+            let value = x.get(&adjust);
+            if c.animation.keys(prop).is_empty() {
+                x.set(&mut c.adjust, value);
+            } else if moved(x.get(&now), value) {
+                c.animation.upsert(prop, at, value);
+            }
         }
         Ok(())
     })
@@ -1975,8 +1982,6 @@ pub fn apply_transform_at(
     ensure_visual(project, clip)?;
     update_clip(project, clip, |c| {
         let now = c.keyed_transform_at(at);
-        // 横竖比例不做关键帧，直接改
-        c.transform.stretch = t.stretch;
         for prop in crate::Prop::TRANSFORM {
             let value = prop.get(&t);
             if c.animation.keys(prop).is_empty() {
@@ -3982,10 +3987,13 @@ mod tests {
     fn keyframes_per_property_group() {
         use crate::{KeyGroup, Prop};
         let (mut p, ids) = sample_project();
-        // 只给「缩放」打关键帧：别的属性仍是固定值
+        // 只给「缩放」（连同缩放 Y）打关键帧：别的属性仍是固定值
         add_keyframe_props(&mut p, ids.v1, secs(0), KeyGroup::Scale.props()).unwrap();
         let anim = &clip(&p, ids.v1).animation;
-        assert_eq!(anim.props().collect::<Vec<_>>(), [Prop::Scale]);
+        assert_eq!(
+            anim.props().collect::<Vec<_>>(),
+            [Prop::Scale, Prop::Stretch]
+        );
         // 2 秒处改位置和缩放：缩放有关键帧 → 打新帧；位置没有 → 改固定值
         let moved = Transform {
             x: 0.2,
@@ -4224,6 +4232,62 @@ mod tests {
         add_keyframe(&mut p, ids.v2, secs(2)).unwrap();
         set_speed(&mut p, ids.v2, 2.0).unwrap();
         assert_eq!(clip(&p, ids.v2).animation.times(), [secs(1)]);
+    }
+
+    #[test]
+    fn the_six_extra_adjust_items_take_keyframes() {
+        let (mut p, ids) = sample_project();
+        let vivid = crate::ColorAdjust {
+            highlights: -0.6,
+            grain: 0.8,
+            vignette: 0.5,
+            ..crate::ColorAdjust::NONE
+        };
+        let keyed = [crate::Prop::Highlights, crate::Prop::Grain];
+        add_keyframe_props(&mut p, ids.v1, secs(0), &keyed).unwrap();
+        apply_adjust_at(&mut p, ids.v1, secs(2), vivid).unwrap();
+        set_keyframe_easing(&mut p, ids.v1, secs(0), &keyed, crate::Easing::Linear).unwrap();
+        let c = clip(&p, ids.v1);
+        let mid = c.adjust_at(secs(1));
+        assert!((mid.highlights + 0.3).abs() < 1e-5, "{mid:?}");
+        assert!((mid.grain - 0.4).abs() < 1e-5, "{mid:?}");
+        assert!((mid.vignette - 0.5).abs() < 1e-6, "没打帧的项改固定值");
+        assert_eq!(c.animation.keys(crate::Prop::Vignette), []);
+        assert!((c.value_at(crate::Prop::Grain, secs(1)) - 0.4).abs() < 1e-5);
+        // 删掉关键帧后固定值取删之前那一刻的值
+        remove_keyframe_props(&mut p, ids.v1, secs(0), &[crate::Prop::Grain]).unwrap();
+        assert!((clip(&p, ids.v1).adjust_at(secs(0)).grain - 0.8).abs() < 1e-6);
+        // 组标题的 ◇ 管「基础」里全部 11 项；整套换掉时关键帧一起清
+        assert_eq!(crate::KeyGroup::AdjustAll.props().len(), 11);
+        assert_eq!(
+            crate::KeyGroup::Extra(crate::AdjustExtra::Sharpen).props(),
+            [crate::Prop::Sharpen]
+        );
+        set_adjust(&mut p, ids.v1, crate::ColorAdjust::NONE).unwrap();
+        assert!(clip(&p, ids.v1).animation.is_empty());
+    }
+
+    #[test]
+    fn stretch_keyframes_along_with_scale() {
+        let (mut p, ids) = sample_project();
+        let scale = crate::KeyGroup::Scale.props();
+        assert_eq!(scale, [crate::Prop::Scale, crate::Prop::Stretch]);
+        add_keyframe_props(&mut p, ids.v1, secs(0), scale).unwrap();
+        let squashed = Transform {
+            stretch: 0.5,
+            ..Transform::default()
+        };
+        apply_transform_at(&mut p, ids.v1, secs(2), squashed).unwrap();
+        set_keyframe_easing(&mut p, ids.v1, secs(0), scale, crate::Easing::Linear).unwrap();
+        let c = clip(&p, ids.v1);
+        assert!((c.transform_at(secs(1)).stretch - 0.75).abs() < 1e-5);
+        assert!((c.transform.stretch - 1.0).abs() < 1e-6, "固定值不动");
+        // 整体打帧也记下横竖比例
+        add_keyframe(&mut p, ids.v2, secs(1)).unwrap();
+        assert_eq!(
+            clip(&p, ids.v2).animation.keys(crate::Prop::Stretch).len(),
+            1
+        );
     }
 
     #[test]

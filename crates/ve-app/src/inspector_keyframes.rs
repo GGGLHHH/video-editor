@@ -241,6 +241,12 @@ impl Workspace {
             KeyGroup::Effect => "effect",
             KeyGroup::Look(p) => look_key_name(p),
             KeyGroup::AdjustAll => "adjust-all",
+            KeyGroup::Extra(ve_core::AdjustExtra::Highlights) => "highlights",
+            KeyGroup::Extra(ve_core::AdjustExtra::Shadows) => "shadows",
+            KeyGroup::Extra(ve_core::AdjustExtra::Light) => "light",
+            KeyGroup::Extra(ve_core::AdjustExtra::Sharpen) => "sharpen",
+            KeyGroup::Extra(ve_core::AdjustExtra::Grain) => "grain",
+            KeyGroup::Extra(ve_core::AdjustExtra::Vignette) => "vignette",
             KeyGroup::Hsl(p) => match p.hsl_target().map(|(_, ch)| ch) {
                 Some(ve_core::HslChannel::Hue) => "hsl-hue",
                 Some(ve_core::HslChannel::Saturation) => "hsl-sat",

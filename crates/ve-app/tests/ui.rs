@@ -879,6 +879,46 @@ fn hsl_rows_have_keyframe_buttons(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn the_extra_adjust_rows_take_keyframes(cx: &mut TestAppContext) {
+    use ve_core::Prop;
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click_timeline(cx, &ui, 0.5, 1.0, gpui_kit::Modifiers::default());
+    click(cx, &ui, "insp-tab-adjust");
+    cx.update_window(ui.win, |_, window, wcx| {
+        window.scroll(
+            "inspector-body",
+            ScrollDelta::Pixels(point(px(0.), px(-300.))),
+            wcx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    // 第 0 秒在「颗粒」那行打一帧
+    seek_to(cx, &ui, Time::ZERO);
+    click(cx, &ui, "tf-key-grain");
+    assert_eq!(
+        first_video_clip(cx, &ui).animation.keys(Prop::Grain).len(),
+        1
+    );
+    // 第 1 秒输入 80：自动在这里再打一帧，中间渐变
+    seek_to(cx, &ui, Time::from_secs(1));
+    click(cx, &ui, "adj-grain-value");
+    cx.update_window(ui.win, |_, window, wcx| {
+        window.press("ctrl-a", wcx);
+        window.input("80", wcx);
+        window.press("enter", wcx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let c = first_video_clip(cx, &ui);
+    assert_eq!(c.animation.keys(Prop::Grain).len(), 2);
+    let half = c.adjust_at(Time::from_millis(500)).grain;
+    assert!((half - 0.4).abs() < 0.02, "{half}");
+    assert_eq!(c.animation.keys(Prop::Vignette).len(), 0);
+}
+
+#[gpui_kit::test]
 fn the_group_title_keys_every_adjust_item_at_once(cx: &mut TestAppContext) {
     let ui = open(cx);
     import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
@@ -887,14 +927,14 @@ fn the_group_title_keys_every_adjust_item_at_once(cx: &mut TestAppContext) {
     seek_to(cx, &ui, Time::from_millis(500));
     click(cx, &ui, "tf-key-adjust-all");
     let c = first_video_clip(cx, &ui);
-    for p in ve_core::Prop::ADJUST {
+    for p in ve_core::Prop::ADJUST_ALL {
         assert_eq!(c.animation.keys(p).len(), 1, "{p:?}");
     }
     // 再点一次：这一组在这一刻的关键帧都删掉
     click(cx, &ui, "tf-key-adjust-all");
     let cleared = first_video_clip(cx, &ui);
     assert!(
-        ve_core::Prop::ADJUST
+        ve_core::Prop::ADJUST_ALL
             .iter()
             .all(|p| cleared.animation.keys(*p).is_empty())
     );
@@ -3765,12 +3805,12 @@ fn each_row_keys_only_its_own_property(cx: &mut TestAppContext) {
     import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
     click_timeline(cx, &ui, 0.5, 1.0, gpui_kit::Modifiers::default());
     seek_to(cx, &ui, Time::ZERO);
-    // 「缩放」一行的 ◇：只有缩放有关键帧
+    // 「缩放」一行的 ◇：只有缩放（连同缩放 Y）有关键帧
     click(cx, &ui, "tf-key-scale");
     let keyed = |app: &TestAppContext| -> Vec<Prop> {
         first_video_clip(app, &ui).animation.props().collect()
     };
-    assert_eq!(keyed(cx), [Prop::Scale]);
+    assert_eq!(keyed(cx), [Prop::Scale, Prop::Stretch]);
     // 1 秒处改缩放：自动打第二帧；改位置：只改固定值
     seek_to(cx, &ui, Time::from_secs(1));
     type_into(cx, &ui, "tf-scale", "50");
