@@ -1771,7 +1771,12 @@ fn home_page_lists_drafts_newest_first_and_opens_them(cx: &mut TestAppContext) {
     let _old = save("旧的", 7200);
     let newer = save("新的", 60);
     let ui = open(cx);
-    ui.view.update(cx, |w, cx| w.show_home_in(dir.path(), cx));
+    // 最近打开用空的临时文件：不然会读到本机真实的最近列表，卡片数随机器变
+    let recent = dir.path().join("recent.json");
+    ui.view.update(cx, |w, cx| {
+        w.use_recent_file(recent);
+        w.show_home_in(dir.path(), cx);
+    });
     cx.run_until_parked();
     assert!(exists(cx, &ui, "home"));
     assert!(!exists(cx, &ui, "timeline"), "首页盖住编辑器");

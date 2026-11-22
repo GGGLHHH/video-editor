@@ -130,6 +130,16 @@ fn menu_groups() -> [(&'static str, Vec<MenuItem>); 3] {
     ]
 }
 
+/// 顶栏上能点的东西：挡住下面标题栏的拖动区。整条顶栏是拖动区（[`WindowControlArea::Drag`]），
+/// Windows 问「鼠标在哪」时，只要鼠标下面压着拖动区就答「标题栏」，系统按下后进拖窗口的循环、
+/// 把抬起吞掉，按钮就永远等不到点击（无界面测试不走这一步，测不出来；决策 138）。挡住之后鼠标
+/// 在按钮上算客户区，空白处照旧能拖、双击最大化。
+///
+/// [`WindowControlArea::Drag`]: gpui_kit::WindowControlArea::Drag
+fn clickable(el: impl IntoElement) -> gpui_kit::Div {
+    div().occlude().child(el)
+}
+
 impl Workspace {
     /// 顶栏放在窗口自己的标题栏里（没有系统标题栏）：右边是最小化 / 最大化 / 关闭，空白处拖动窗口。
     pub(crate) fn render_topbar(&self, cx: &Context<'_, Self>) -> impl IntoElement {
@@ -184,10 +194,10 @@ impl Workspace {
                     .child(self.render_project_name(cx)),
             )
             .child(div().flex_1())
-            .children(self.render_export_status(cx))
-            .child(self.render_shortcuts_button(cx))
-            .child(self.render_layout_button(cx))
-            .child(
+            .children(self.render_export_status(cx).map(clickable))
+            .child(clickable(self.render_shortcuts_button(cx)))
+            .child(clickable(self.render_layout_button(cx)))
+            .child(clickable(
                 Button::new("tb-export")
                     .primary()
                     .compact()
@@ -195,7 +205,7 @@ impl Workspace {
                     .label("导出")
                     .disabled(self.export.is_some())
                     .on_click(cx.listener(|this, _, w, cx| this.export(&act::Export, w, cx))),
-            )
+            ))
     }
 
     /// 顶栏正中的草稿名：点一下变成输入框改名（剪映）。
@@ -204,6 +214,7 @@ impl Workspace {
             return div()
                 .id("project-rename")
                 .test_support()
+                .occlude()
                 .w(px(220.))
                 .child(gpui_kit::component::input::Input::new(&r.input).small())
                 .into_any_element();
@@ -211,6 +222,7 @@ impl Workspace {
         div()
             .id("project-name")
             .test_support()
+            .occlude()
             .px_2()
             .rounded(px(4.))
             .cursor_text()
@@ -238,7 +250,7 @@ impl Workspace {
     }
 
     fn render_menu_button(&self, cx: &Context<'_, Self>) -> impl IntoElement {
-        div()
+        clickable(div())
             .relative()
             .child(
                 Button::new("tb-menu")
