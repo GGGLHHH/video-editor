@@ -499,6 +499,9 @@ struct Gpu {
     sampler: wgpu::Sampler,
     effect_pipeline: wgpu::RenderPipeline,
     dummy_layer: wgpu::BindGroup,
+    /// 复合片段分组那一道（每个合成器都编一次太慢：着色器拼着整份共用函数）。
+    group_pipeline: wgpu::RenderPipeline,
+    group_layout: wgpu::BindGroupLayout,
     /// 编译好的插件特效（按插件名和源码）；编译失败的记 `None`，不再试。
     plugins: PluginCache,
     adapter: String,
@@ -516,7 +519,7 @@ type PluginCache = std::sync::Arc<
 enum Shared {
     /// 还没建，或者上次建失败了 / 设备丢了（下次再建）。
     None,
-    Gpu(Gpu),
+    Gpu(Box<Gpu>),
     /// 要硬件显卡却只有软件显卡：用软件那一套。
     FellBack,
 }
@@ -537,7 +540,7 @@ fn shared_gpu(software: bool) -> Result<Gpu, RenderError> {
     if !software {
         let mut hw = lock(&HARDWARE);
         match &*hw {
-            Shared::Gpu(g) if alive(g) => return Ok(g.clone()),
+            Shared::Gpu(g) if alive(g) => return Ok((**g).clone()),
             Shared::FellBack => {}
             _ => {
                 // 建设备也串行（几十个线程同时建 DX12 设备会卡死；万一选到的是 WARP 也不并行）
@@ -547,7 +550,7 @@ fn shared_gpu(software: bool) -> Result<Gpu, RenderError> {
                 };
                 match made {
                     Ok(g) if !g.software => {
-                        *hw = Shared::Gpu(g.clone());
+                        *hw = Shared::Gpu(Box::new(g.clone()));
                         return Ok(g);
                     }
                     // 退回了软件显卡：丢掉这一个，和软件模式共用一套
@@ -564,7 +567,7 @@ fn shared_gpu(software: bool) -> Result<Gpu, RenderError> {
     if let Shared::Gpu(g) = &*sw
         && alive(g)
     {
-        return Ok(g.clone());
+        return Ok((**g).clone());
     }
     let made = {
         let _serial = software_guard(true);
@@ -572,7 +575,7 @@ fn shared_gpu(software: bool) -> Result<Gpu, RenderError> {
     };
     *sw = made
         .as_ref()
-        .map_or(Shared::None, |g| Shared::Gpu(g.clone()));
+        .map_or(Shared::None, |g| Shared::Gpu(Box::new(g.clone())));
     made
 }
 
@@ -643,6 +646,8 @@ fn build_gpu((device, queue, adapter, cpu): DeviceParts) -> Gpu {
             },
         ],
     });
+    let group_layout = group_bind_layout(&device);
+    let group_pipeline = group_pipeline(&device, &backdrop_layout, &group_layout);
     Gpu {
         device,
         queue,
@@ -657,6 +662,8 @@ fn build_gpu((device, queue, adapter, cpu): DeviceParts) -> Gpu {
         sampler,
         effect_pipeline,
         dummy_layer,
+        group_pipeline,
+        group_layout,
         plugins: PluginCache::default(),
         adapter,
         software: cpu,
@@ -1016,6 +1023,8 @@ impl Compositor {
             sampler,
             effect_pipeline,
             dummy_layer,
+            group_pipeline,
+            group_layout,
             plugins,
             adapter,
             software,
@@ -1033,8 +1042,6 @@ impl Compositor {
                 view_formats: &[],
             })
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let group_layout = group_bind_layout(&device);
-        let group_pipeline = group_pipeline(&device, &backdrop_layout, &group_layout);
         Ok(Self {
             device,
             queue,

@@ -540,6 +540,11 @@ mod tests {
     }
 
     fn engine() -> Engine {
+        // 先把进程共用的软件显卡和管线建好（第一次要编译着色器，CI 上插桩跑覆盖率时要几秒），
+        // 下面等画面的几秒才只算引擎自己的时间
+        drop(ve_render::Compositor::new(&ve_render::RenderConfig {
+            software: true,
+        }));
         Engine::new(EngineConfig {
             audio: AudioBackend::Capture,
             render: ve_render::RenderConfig { software: true },
