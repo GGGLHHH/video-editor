@@ -7,7 +7,9 @@
 
 ## [未发布]
 
-第四轮对照剪映（`docs/jianying-gaps.md`）的四批。
+## [0.3.0] - 2026-11-23
+
+第四、第五轮对照剪映（`docs/jianying-gaps.md`）：清单里除 AI / 在线内容以外都做完了；另有程序图标和顶栏按钮在 Windows 上点不动的修复。
 
 ### 新增
 
@@ -145,6 +147,7 @@
 - **界面**：剪映式深色界面、标签式素材面板和属性面板、剪映（FCP X）快捷键。
 - **发布**：GitHub Actions 全量检查，推 `v*` 标签自动打包 Windows 压缩包（自带 ffmpeg）。
 
-[未发布]: https://github.com/GGGLHHH/video-editor/compare/v0.2.0...HEAD
+[未发布]: https://github.com/GGGLHHH/video-editor/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/GGGLHHH/video-editor/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/GGGLHHH/video-editor/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/GGGLHHH/video-editor/releases/tag/v0.1.0
