@@ -9,6 +9,25 @@
 
 @group(0) @binding(0) var tex: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
+// 文字蒙版的距离场（crate::text_mask）：128 = 正好在字的边上，越大越在字里面，每 TEXT_SPREAD
+// 个纹素差 127；没有文字蒙版的图层绑 1×1 占位
+@group(0) @binding(2) var text_field: texture_2d<f32>;
+const TEXT_SPREAD: f32 = 12.0;
+
+// 文字形状的有向距离（外面为正，像素）：字按蒙版框（半宽高 hb）等比放进去、居中
+fn text_sd(p: vec2<f32>, hb: vec2<f32>) -> f32 {
+    let dims = vec2<f32>(textureDimensions(text_field));
+    let k = min(2.0 * hb.x / dims.x, 2.0 * hb.y / dims.y);  // 一个纹素多少像素
+    let uv = p / (k * dims) + vec2(0.5);
+    let s = textureSampleLevel(text_field, samp, clamp(uv, vec2(0.0), vec2(1.0)), 0.0).r;
+    var d = -((s * 255.0 - 128.0) / 127.0) * TEXT_SPREAD * k;
+    // 字的框外面：至少按离框的距离算（框边上本来就是留白）
+    let q = abs(p) - 0.5 * k * dims;
+    if q.x > 0.0 || q.y > 0.0 {
+        d = max(d, length(max(q, vec2(0.0))) + TEXT_SPREAD * k);
+    }
+    return d;
+}
 @group(1) @binding(0) var backdrop: texture_2d<f32>;
 @group(2) @binding(0) var lut: texture_3d<f32>;
 @group(2) @binding(1) var lut_samp: sampler;

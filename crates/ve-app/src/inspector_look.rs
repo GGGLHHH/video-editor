@@ -6,9 +6,10 @@ use crate::theme::palette;
 use crate::workspace::Workspace;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
-use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
     ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
@@ -182,6 +183,8 @@ pub(crate) struct LookFields {
     pub(crate) picking: bool,
     /// 「蒙版」里正在改第几个蒙版（0 = 第一个）。
     pub(crate) mask_index: usize,
+    /// 文字蒙版的字（回车或失焦时写回）。
+    pub(crate) mask_text: Entity<InputState>,
 }
 
 /// 正在改第 `i` 个蒙版时面板看到的外观：`mask` 换成那一个（其余不变）；没有那一个时就是原样。
@@ -228,10 +231,20 @@ const SWATCHES: [u32; 8] = [
 impl LookFields {
     /// 创建滑条并订阅。
     pub(crate) fn new(
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<'_, Workspace>,
     ) -> (Self, Vec<Subscription>) {
         let mut subs = Vec::new();
+        let mask_text = cx.new(|cx| InputState::new(window, cx).placeholder("输入文字"));
+        subs.push(cx.subscribe_in(
+            &mask_text,
+            window,
+            |this: &mut Workspace, _, e: &InputEvent, window, cx| {
+                if matches!(e, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                    this.commit_mask_text(window, cx);
+                }
+            },
+        ));
         let sliders = LookField::ALL
             .iter()
             .map(|&f| {
@@ -260,6 +273,7 @@ impl LookFields {
                 seg: PictureSeg::default(),
                 picking: false,
                 mask_index: 0,
+                mask_text,
             },
             subs,
         )
@@ -305,6 +319,46 @@ impl Workspace {
     }
 
     /// 选中的视频轨媒体片段和它在播放头这一刻的外观。
+    /// 把选中片段的文字蒙版的字填进输入框（没有时空着）。
+    pub(crate) fn fill_mask_text(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let text = self
+            .bound_look_clip()
+            .and_then(|id| self.doc.project.timeline.find_clip(id))
+            .and_then(|(_, c)| c.mask_text.as_ref().map(|t| t.text.clone()))
+            .unwrap_or_default();
+        self.inspector
+            .look
+            .mask_text
+            .update(cx, |s, cx| s.set_value(text, window, cx));
+    }
+
+    /// 输入框里的字写回片段（一步撤销）；空的不收，输入框换回原来的字。
+    fn commit_mask_text(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(clip) = self.bound_look_clip() else {
+            return;
+        };
+        let text = self.inspector.look.mask_text.read(cx).value().to_string();
+        let current = self
+            .doc
+            .project
+            .timeline
+            .find_clip(clip)
+            .and_then(|(_, c)| c.mask_text.as_ref().map(|t| t.text.clone()));
+        if current.is_none() || current.as_deref() == Some(text.as_str()) {
+            return;
+        }
+        let ok = ve_core::MaskText {
+            text: text.clone(),
+            font: String::new(),
+        }
+        .is_valid();
+        if ok {
+            self.apply(window, cx, |p| ve_core::edit::set_mask_text(p, clip, &text));
+        } else {
+            self.fill_mask_text(window, cx);
+        }
+    }
+
     fn bound_look(&self) -> Option<(ClipId, Look)> {
         self.bound_look_at().map(|(clip, look, _)| (clip, look))
     }
@@ -878,12 +932,22 @@ impl Workspace {
         ))
     }
 
-    /// 「蒙版」分段：形状一排（无 + 6 种），选了形状后下面是反转和各项数值。
-    pub(crate) fn render_mask_seg(&self, cx: &Context<'_, Self>) -> Option<AnyElement> {
-        let (_, look) = self.bound_look()?;
-        let current = look.mask.map(|m| m.shape);
+    /// 形状一排：无 + 各种形状（复合片段整组的蒙版不支持文字形状）。
+    fn render_mask_shapes(
+        &self,
+        clip: ClipId,
+        current: Option<MaskShape>,
+        cx: &Context<'_, Self>,
+    ) -> AnyElement {
+        let compound = self
+            .doc
+            .project
+            .timeline
+            .find_clip(clip)
+            .is_some_and(|(_, c)| c.compound().is_some());
         let shapes = std::iter::once((None, "无"))
             .chain(MaskShape::ALL.map(|s| (Some(s), s.label())))
+            .filter(|(shape, _)| !(compound && *shape == Some(MaskShape::Text)))
             .map(|(shape, label)| {
                 let id = SharedString::from(format!(
                     "mask-{}",
@@ -892,17 +956,45 @@ impl Workspace {
                 crate::chrome::chip(id, label, current == shape, cx)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.edit_look(|l| l.mask = shape.map(Mask::new), window, cx);
+                        this.fill_mask_text(window, cx);
                     }))
                     .into_any_element()
             });
+        h_flex()
+            .flex_wrap()
+            .gap_1()
+            .children(shapes)
+            .into_any_element()
+    }
+
+    /// 文字蒙版的字：一行输入框（回车或失焦写回）。
+    fn render_mask_text_row(&self, cx: &Context<'_, Self>) -> AnyElement {
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(
+                div()
+                    .w(px(52.))
+                    .flex_none()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("文字"),
+            )
+            .child(
+                div()
+                    .id("mask-text-input")
+                    .test_support()
+                    .flex_1()
+                    .child(Input::new(&self.inspector.look.mask_text).small()),
+            )
+            .into_any_element()
+    }
+
+    /// 「蒙版」分段：形状一排（无 + 7 种，复合片段没有文字），选了形状后下面是反转和各项数值。
+    pub(crate) fn render_mask_seg(&self, cx: &Context<'_, Self>) -> Option<AnyElement> {
+        let (clip, look) = self.bound_look()?;
         let mut rows: Vec<AnyElement> = self.render_mask_tabs(cx).into_iter().collect();
-        rows.push(
-            h_flex()
-                .flex_wrap()
-                .gap_1()
-                .children(shapes)
-                .into_any_element(),
-        );
+        rows.push(self.render_mask_shapes(clip, look.mask.map(|m| m.shape), cx));
         // 还没有蒙版：「添加蒙版」也能加一个
         if look.mask.is_none() {
             rows.push(
@@ -913,6 +1005,9 @@ impl Workspace {
                     )
                     .into_any_element(),
             );
+        }
+        if look.mask.is_some_and(|m| m.shape == MaskShape::Text) {
+            rows.push(self.render_mask_text_row(cx));
         }
         if let Some(m) = look.mask {
             rows.push(

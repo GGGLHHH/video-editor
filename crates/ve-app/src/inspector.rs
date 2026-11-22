@@ -443,6 +443,7 @@ impl Workspace {
                     self.fill_transform(&t, window, cx);
                     let offset = self.key_offset(&clip);
                     self.fill_adjust(&clip.adjust_at(offset), window, cx);
+                    self.fill_mask_text(window, cx);
                 }
             }
             ClipContent::Subtitle { text, .. } => {

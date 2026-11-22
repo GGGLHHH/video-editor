@@ -49,7 +49,7 @@ pub use grade::{
 pub use history::History;
 pub use ids::{AssetId, ClipId, IdGen, TrackId};
 pub use keyframe::{Animation, Easing, Key, KeyGroup, Prop};
-pub use look::{BlendMode, ChromaKey, Look, Mask, MaskShape, Shadow, Stroke};
+pub use look::{BlendMode, ChromaKey, Look, Mask, MaskShape, MaskText, Shadow, Stroke};
 pub use project::{Project, ProjectSettings};
 pub use project_file::{LoadedProject, ProjectFileError, load_project, save_project};
 pub use speed_curve::{CurvePreset, SpeedCurve, SpeedPoint};

@@ -32,6 +32,8 @@ pub struct LayerSource {
     pub detail: crate::adjust::Detail,
     /// 帧融合：慢放时把 `source_time` 前后两帧按时间混合（[`crate::Clip::blends_frames`]）。
     pub frame_blend: bool,
+    /// 文字蒙版的字（外观里有文字形状的蒙版时才有）。
+    pub mask_text: Option<std::sync::Arc<crate::MaskText>>,
 }
 
 /// 时间点 `t` 上要合成的东西：各层画面和底色的调色。
@@ -411,6 +413,10 @@ fn layer_of(
             crate::adjust::Detail { seed, ..a.detail() }
         },
         frame_blend: clip.blends_frames(),
+        mask_text: {
+            let look = clip.look_at(offset);
+            look.uses_text().then(|| clip.mask_text.clone()).flatten()
+        },
     })
 }
 

@@ -137,6 +137,9 @@ pub struct Clip {
     /// 没分离时不写进文件。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub audio_split: bool,
+    /// 文字蒙版的字（蒙版选了「文字」时用；换成别的形状时留着，换回来还是它）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask_text: Option<Arc<crate::MaskText>>,
     /// 摊开的复合片段里的片段：外面那段复合片段（[`crate::compound::flatten`] 填，不存进文件）。
     /// 合成时它的画面属性、调色套在这一段上面（[`crate::compose`]）。
     #[serde(skip)]

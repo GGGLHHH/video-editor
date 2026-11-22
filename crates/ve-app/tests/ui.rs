@@ -491,6 +491,7 @@ fn a_compound_takes_a_mask_and_round_corners_as_a_whole(cx: &mut TestAppContext)
     cx.run_until_parked();
     frame(cx, &ui);
     click(cx, &ui, "seg-mask");
+    assert!(!exists(cx, &ui, "mask-6"), "复合片段整组的蒙版没有文字形状");
     click(cx, &ui, "mask-2");
     let c = selected_compound(cx, &ui);
     assert_eq!(
@@ -2489,6 +2490,43 @@ fn scale_can_be_non_uniform_with_the_toggle_and_edge_handles(cx: &mut TestAppCon
         (dragged.scale * dragged.stretch - 0.5).abs() < 1e-3,
         "高不变 {dragged:?}"
     );
+}
+
+#[gpui_kit::test]
+fn a_text_mask_takes_its_words_from_the_panel(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click_timeline(cx, &ui, 0.5, 1.0, gpui_kit::Modifiers::default());
+    click(cx, &ui, "seg-mask");
+    let words = |app: &TestAppContext| {
+        ui.view.read_with(app, |w, _| {
+            w.document()
+                .project
+                .timeline
+                .tracks
+                .iter()
+                .flat_map(|t| t.clips.iter())
+                .find(|c| c.asset().is_some())
+                .and_then(|c| c.mask_text.as_ref().map(|t| t.text.clone()))
+        })
+    };
+    assert!(!exists(cx, &ui, "mask-text-input"));
+    // 选「文字」形状：默认写「文字」，下面多一个输入框
+    click(cx, &ui, "mask-6");
+    assert_eq!(
+        first_video_look(cx, &ui).mask.map(|m| m.shape),
+        Some(ve_core::MaskShape::Text)
+    );
+    assert_eq!(words(cx).as_deref(), Some("文字"));
+    assert!(exists(cx, &ui, "mask-text-input"));
+    // 改字：回车写回，一步撤销
+    type_into(cx, &ui, "mask-text-input", "你好");
+    assert_eq!(words(cx).as_deref(), Some("你好"));
+    click(cx, &ui, "tb-undo");
+    assert_eq!(words(cx).as_deref(), Some("文字"));
+    // 清空不收
+    type_into(cx, &ui, "mask-text-input", "");
+    assert_eq!(words(cx).as_deref(), Some("文字"));
 }
 
 #[gpui_kit::test]

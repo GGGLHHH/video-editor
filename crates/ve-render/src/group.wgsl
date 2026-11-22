@@ -4,6 +4,11 @@
 // 形状函数（sd_round_box、shape_sd、mask_alpha）在 shapes.wgsl，编译时拼在前面。
 
 @group(0) @binding(0) var before: texture_2d<f32>;
+
+// 复合片段整组的蒙版不支持文字形状（面板上也不给选）：当作不裁
+fn text_sd(p: vec2<f32>, hb: vec2<f32>) -> f32 {
+    return -1e6;
+}
 @group(1) @binding(0) var after: texture_2d<f32>;
 
 struct Amount {

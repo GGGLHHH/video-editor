@@ -201,17 +201,20 @@ pub enum MaskShape {
     Heart,
     /// 五角星。
     Star,
+    /// 文字：字的形状（字写在片段的 [`crate::Clip::mask_text`] 里）。
+    Text,
 }
 
 impl MaskShape {
     /// 全部（剪映里的顺序）。
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Linear,
         Self::Mirror,
         Self::Circle,
         Self::Rectangle,
         Self::Heart,
         Self::Star,
+        Self::Text,
     ];
 
     /// 名字。
@@ -224,6 +227,7 @@ impl MaskShape {
             Self::Rectangle => "矩形",
             Self::Heart => "爱心",
             Self::Star => "星形",
+            Self::Text => "文字",
         }
     }
 
@@ -237,6 +241,7 @@ impl MaskShape {
             Self::Rectangle => 3,
             Self::Heart => 4,
             Self::Star => 5,
+            Self::Text => 6,
         }
     }
 }
@@ -273,6 +278,7 @@ impl Mask {
             MaskShape::Mirror => (1.0, 0.3),
             MaskShape::Circle | MaskShape::Heart | MaskShape::Star => (0.5, 0.5),
             MaskShape::Rectangle => (0.6, 0.5),
+            MaskShape::Text => (0.8, 0.4),
         };
         Self {
             shape,
@@ -285,6 +291,29 @@ impl Mask {
             round: 0.0,
             invert: false,
         }
+    }
+}
+
+/// 文字蒙版的字（剪映「蒙版 › 文字」）：字按蒙版的宽高等比放进去，留下字的形状。
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MaskText {
+    /// 字（可以多行）。
+    pub text: String,
+    /// 字体名（空 = 系统默认的无衬线字体）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub font: String,
+}
+
+impl MaskText {
+    /// 新选文字蒙版时的字。
+    pub const DEFAULT_TEXT: &'static str = "文字";
+    /// 最多几个字。
+    pub const MAX_CHARS: usize = 50;
+
+    /// 有字、不太长。
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        !self.text.trim().is_empty() && self.text.chars().count() <= Self::MAX_CHARS
     }
 }
 
@@ -398,7 +427,13 @@ impl Look {
         chroma: None,
     };
 
-    /// 所有蒙版（第一个在前）。
+    /// 有文字蒙版（第一个或另外的蒙版里有文字形状）。
+    #[must_use]
+    pub fn uses_text(&self) -> bool {
+        self.masks().any(|m| m.shape == MaskShape::Text)
+    }
+
+    /// 全部蒙版（第一个和另外的）。
     pub fn masks(&self) -> impl Iterator<Item = Mask> + '_ {
         self.mask
             .into_iter()

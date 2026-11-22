@@ -164,6 +164,7 @@ fn new_media_clip(
         frame_blend: false,
         stabilized: None,
         input_space: None,
+        mask_text: None,
         parent: None,
         audio_split: false,
         motion: crate::motion::ClipMotion::NONE,
@@ -2116,6 +2117,40 @@ pub fn set_look(project: &mut Project, clip: ClipId, look: crate::Look) -> Resul
             return Err(EditError::WrongTrackKind);
         }
         c.look = look;
+        default_mask_text(c);
+        Ok(())
+    })
+}
+
+/// 刚选了文字蒙版、片段上还没有字：写上默认的字。
+fn default_mask_text(c: &mut Clip) {
+    if c.mask_text.is_none() && c.look.uses_text() {
+        c.mask_text = Some(Arc::new(crate::MaskText {
+            text: crate::MaskText::DEFAULT_TEXT.to_owned(),
+            font: String::new(),
+        }));
+    }
+}
+
+/// 改文字蒙版的字（字体不变）。
+///
+/// # Errors
+/// 片段不存在、不是视频轨上的片段；字是空的或超过 [`crate::MaskText::MAX_CHARS`] 个。
+pub fn set_mask_text(project: &mut Project, clip: ClipId, text: &str) -> Result<(), EditError> {
+    ensure_video(project, clip)?;
+    update_clip(project, clip, |c| {
+        let next = crate::MaskText {
+            text: text.to_owned(),
+            font: c
+                .mask_text
+                .as_ref()
+                .map(|t| t.font.clone())
+                .unwrap_or_default(),
+        };
+        if !next.is_valid() {
+            return Err(EditError::InvalidValue);
+        }
+        c.mask_text = Some(Arc::new(next));
         Ok(())
     })
 }
@@ -2166,6 +2201,7 @@ pub fn apply_look_at(
                 c.animation.remove_between(prop, Time::ZERO, Time(i64::MAX));
             }
         }
+        default_mask_text(c);
         Ok(())
     })
 }
@@ -2646,6 +2682,7 @@ fn overlay_clip(id: ClipId, start: Time, duration: Time, content: ClipContent) -
         frame_blend: false,
         stabilized: None,
         input_space: None,
+        mask_text: None,
         parent: None,
         audio_split: false,
         motion: crate::motion::ClipMotion::NONE,
@@ -2814,6 +2851,7 @@ fn text_clip(id: ClipId, start: Time, duration: Time, text: String, on_top: bool
         frame_blend: false,
         stabilized: None,
         input_space: None,
+        mask_text: None,
         parent: None,
         audio_split: false,
         motion: crate::motion::ClipMotion::NONE,
@@ -4876,6 +4914,45 @@ mod tests {
         let fx_clip = Arc::clone(p.timeline.find_clip(fx).unwrap().1);
         assert_eq!(fx_clip.animation.keys(crate::Prop::EffectAmount).len(), 1);
         assert_eq!(fx_clip.effect().unwrap().kind, crate::EffectKind::Sharpen);
+    }
+
+    #[test]
+    fn a_text_mask_carries_its_words() {
+        let (mut p, ids) = sample_project();
+        let words = |proj: &Project| {
+            clip(proj, ids.v1)
+                .mask_text
+                .as_deref()
+                .map(|t| t.text.clone())
+        };
+        let mut look = crate::Look::NONE;
+        look.mask = Some(crate::Mask::new(crate::MaskShape::Text));
+        apply_look_at(&mut p, ids.v1, secs(0), look).unwrap();
+        // 选文字蒙版时默认写「文字」
+        assert_eq!(words(&p).as_deref(), Some("文字"));
+        set_mask_text(&mut p, ids.v1, "你好").unwrap();
+        assert_eq!(words(&p).as_deref(), Some("你好"));
+        assert_eq!(
+            set_mask_text(&mut p, ids.v1, "  "),
+            Err(EditError::InvalidValue)
+        );
+        // 合成时文字跟着图层走
+        let layers = crate::compose::resolve_layers(&p, secs(1));
+        let text = layers
+            .iter()
+            .find(|l| l.clip == ids.v1)
+            .and_then(|l| l.mask_text.clone());
+        assert_eq!(text.map(|t| t.text.clone()).as_deref(), Some("你好"));
+        // 存盘读回还在
+        let json = serde_json::to_string(&p).unwrap();
+        let back: Project = serde_json::from_str(&json).unwrap();
+        assert_eq!(words(&back).as_deref(), Some("你好"));
+        // 换成别的形状：图层不再带文字（片段上的字留着，换回来还是它）
+        look.mask = Some(crate::Mask::new(crate::MaskShape::Circle));
+        apply_look_at(&mut p, ids.v1, secs(0), look).unwrap();
+        let plain = crate::compose::resolve_layers(&p, secs(1));
+        assert!(plain.iter().all(|l| l.mask_text.is_none()));
+        assert_eq!(words(&p).as_deref(), Some("你好"));
     }
 
     #[test]

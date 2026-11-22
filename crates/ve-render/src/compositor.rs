@@ -72,6 +72,8 @@ pub struct Layer<'a> {
     pub grades: &'a [ve_core::GradeStep],
     /// 锐化、颗粒、暗角。
     pub detail: ve_core::Detail,
+    /// 文字蒙版的字（外观里有文字形状的蒙版时才有）。
+    pub mask_text: Option<&'a ve_core::MaskText>,
 }
 
 /// 另外几个蒙版（[`ve_core::Look::extra_masks`]）：每个实例一条，放在存储缓冲里（实例顶点属性的
@@ -250,8 +252,11 @@ struct LookParams {
 /// 一个图层槽位：纹理按尺寸复用。
 struct Slot {
     texture: wgpu::Texture,
+    view: wgpu::TextureView,
     size: (u32, u32),
     bind: wgpu::BindGroup,
+    /// 绑着哪段字的文字距离场（`None` 绑的是占位）。
+    text: Option<ve_core::MaskText>,
 }
 
 /// 导出用的 NV12：Y 平面（宽×高）后接 UV 交错平面（宽×高/2），紧密排列，宽高为偶数。
@@ -390,6 +395,10 @@ pub struct Compositor {
     effect_pipeline: wgpu::RenderPipeline,
     /// 特效那一道不读图层纹理，第 0 组绑个 1×1 的占位。
     dummy_layer: wgpu::BindGroup,
+    /// 没有文字蒙版的图层在文字距离场那个位置绑的 1×1 占位。
+    no_text: wgpu::TextureView,
+    /// 算好的文字距离场（按字和字体），满了就清空重来；算不出来的记 `None`。
+    text_fields: std::collections::HashMap<ve_core::MaskText, Option<wgpu::TextureView>>,
     /// 插件特效的管线（和同一块显卡上的合成器共用）。
     plugins: PluginCache,
     /// 半透明复合片段的分组（[`Self::set_groups`]）。
@@ -623,6 +632,10 @@ fn build_gpu((device, queue, adapter, cpu): DeviceParts) -> Gpu {
                 binding: 1,
                 resource: wgpu::BindingResource::Sampler(&sampler),
             },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&dummy_view),
+            },
         ],
     });
     Gpu {
@@ -697,6 +710,17 @@ fn layer_bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 binding: 1,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            // 文字蒙版的距离场（[`crate::text_mask`]）
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
                 count: None,
             },
         ],
@@ -992,6 +1016,18 @@ impl Compositor {
             software,
             lost: _,
         } = shared_gpu(config.software)?;
+        let no_text = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("no-text-mask"),
+                size: extent((1, 1)),
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
         let group_layout = group_bind_layout(&device);
         let group_pipeline = group_pipeline(&device, &backdrop_layout, &group_layout);
         Ok(Self {
@@ -1023,6 +1059,8 @@ impl Compositor {
             effects: Vec::new(),
             effect_pipeline,
             dummy_layer,
+            no_text,
+            text_fields: std::collections::HashMap::new(),
             plugins,
             groups: Vec::new(),
             group_pipeline,
@@ -1043,6 +1081,69 @@ impl Compositor {
         self.device.limits().max_texture_dimension_2d
     }
 
+    /// 一层的第 0 组：画面、采样器、文字距离场。
+    fn layer_bind(&self, view: &wgpu::TextureView, text: &wgpu::TextureView) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("layer"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(text),
+                },
+            ],
+        })
+    }
+
+    /// 这段字的距离场纹理（第一次用时算好上传；算不出来时 `None`）。
+    fn text_field(&mut self, text: &ve_core::MaskText) -> Option<wgpu::TextureView> {
+        if let Some(v) = self.text_fields.get(text) {
+            return v.clone();
+        }
+        if self.text_fields.len() >= 32 {
+            self.text_fields.clear();
+        }
+        let view = crate::text_mask::rasterize(&text.text, &text.font).map(|f| {
+            let size = extent((f.width, f.height));
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("text-mask"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &f.data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(f.width),
+                    rows_per_image: Some(f.height),
+                },
+                size,
+            );
+            texture.create_view(&wgpu::TextureViewDescriptor::default())
+        });
+        self.text_fields.insert(text.clone(), view.clone());
+        view
+    }
+
     fn new_slot(&self, size: (u32, u32)) -> Slot {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("layer"),
@@ -1055,24 +1156,13 @@ impl Compositor {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("layer"),
-            layout: &self.layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
+        let bind = self.layer_bind(&view, &self.no_text);
         Slot {
             texture,
+            view,
             size,
             bind,
+            text: None,
         }
     }
 
@@ -1167,6 +1257,13 @@ impl Compositor {
                 } else {
                     self.slots.push(slot);
                 }
+            }
+            let want = layer.mask_text.cloned();
+            if self.slots[i].text != want {
+                let field = want.as_ref().and_then(|t| self.text_field(t));
+                let text = field.as_ref().unwrap_or(&self.no_text);
+                self.slots[i].bind = self.layer_bind(&self.slots[i].view, text);
+                self.slots[i].text = want;
             }
             let slot = &self.slots[i];
             let FramePixels::Bgra { data, .. } = layer.pixels;
@@ -2187,6 +2284,7 @@ mod tests {
             look: ve_core::Look::NONE,
             grades: &[],
             detail: ve_core::Detail::default(),
+            mask_text: None,
         }
     }
 
@@ -2424,6 +2522,60 @@ mod tests {
     }
 
     #[test]
+    fn a_text_mask_keeps_only_the_letters() {
+        use ve_core::{Mask, MaskShape, MaskText};
+        let mut c = compositor();
+        let white = solid(2, 2, [255; 4]);
+        let mask = Mask {
+            width: 0.95,
+            height: 0.95,
+            ..Mask::new(MaskShape::Text)
+        };
+        let words = MaskText {
+            text: "I".to_owned(),
+            font: String::new(),
+        };
+        let masked = |m: Mask| {
+            let mut l = with_look(
+                layer(&white, 2, 2, FULL, 1.0),
+                ve_core::Look {
+                    mask: Some(m),
+                    ..ve_core::Look::NONE
+                },
+            );
+            l.mask_text = Some(&words);
+            l
+        };
+        let out = compose(&mut c, &[masked(mask)]);
+        // 「I」是中间一竖：中间那一行有亮的，两边和四角都去掉
+        let row: Vec<u8> = (0..SIZE.0).map(|x| px(&out, x, SIZE.1 / 2)[0]).collect();
+        let lit: Vec<u32> = (0..SIZE.0).filter(|&x| row[x as usize] > 200).collect();
+        assert!(!lit.is_empty(), "{row:?}");
+        assert!(
+            lit.iter().all(|&x| x.abs_diff(SIZE.0 / 2) <= 4),
+            "只有中间亮：{lit:?}"
+        );
+        assert!(near(px(&out, 1, 1), [0, 0, 0], 2));
+        assert!(near(px(&out, 10, SIZE.1 / 2), [0, 0, 0], 2));
+        // 反转：字去掉、别处留下
+        let inverted = compose(
+            &mut c,
+            &[masked(Mask {
+                invert: true,
+                ..mask
+            })],
+        );
+        assert!(near(px(&inverted, 10, SIZE.1 / 2), [255, 255, 255], 2));
+        let dark = lit.iter().all(|&x| px(&inverted, x, SIZE.1 / 2)[0] < 60);
+        assert!(dark, "字的地方去掉了");
+        // 没有字时（文字蒙版但片段上没写）也不出错：整层去掉
+        let mut blank = masked(mask);
+        blank.mask_text = None;
+        let none = compose(&mut c, &[blank]);
+        assert!(near(px(&none, SIZE.0 / 2, SIZE.1 / 2), [0, 0, 0], 2));
+    }
+
+    #[test]
     #[expect(clippy::shadow_unrelated, reason = "测试：一次一次合成")]
     fn masks_keep_their_shape() {
         use ve_core::{Mask, MaskShape};
@@ -2433,7 +2585,7 @@ mod tests {
             mask: Some(m),
             ..ve_core::Look::NONE
         };
-        for shape in MaskShape::ALL {
+        for shape in MaskShape::ALL.into_iter().filter(|s| *s != MaskShape::Text) {
             let m = Mask::new(shape);
             let out = compose(
                 &mut c,

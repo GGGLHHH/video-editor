@@ -123,8 +123,8 @@ impl MaskFrame {
                     .collect();
                 vec![ring]
             }
-            // 矩形、爱心、星形：画外接框
-            MaskShape::Rectangle | MaskShape::Heart | MaskShape::Star => {
+            // 矩形、爱心、星形、文字：画外接框
+            MaskShape::Rectangle | MaskShape::Heart | MaskShape::Star | MaskShape::Text => {
                 let (w, h) = (self.hw, self.hh);
                 vec![
                     [(-w, -h), (w, -h), (w, h), (-w, h), (-w, -h)]

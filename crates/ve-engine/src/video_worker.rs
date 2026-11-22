@@ -382,6 +382,7 @@ impl Worker<'_> {
                     look: l.look,
                     grades: &l.grades,
                     detail: l.detail,
+                    mask_text: l.mask_text.as_deref(),
                 })
             })
             .collect();

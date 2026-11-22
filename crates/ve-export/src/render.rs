@@ -47,16 +47,30 @@ struct LayerFrame {
     look: ve_core::Look,
     grades: ve_core::GradeChain,
     detail: ve_core::Detail,
+    mask_text: Option<Arc<ve_core::MaskText>>,
 }
 
-/// 一层的画面属性、调色、外观、调色链和锐化颗粒暗角。
+/// 一层的画面属性、调色、外观、调色链、锐化颗粒暗角和文字蒙版的字。
 type Appearance = (
     Transform,
     ve_core::ColorMatrix,
     ve_core::Look,
     ve_core::GradeChain,
     ve_core::Detail,
+    Option<Arc<ve_core::MaskText>>,
 );
+
+/// 一层的 [`Appearance`]。
+fn appearance(l: &ve_core::compose::LayerSource) -> Appearance {
+    (
+        l.transform,
+        l.color,
+        l.look,
+        l.grades.clone(),
+        l.detail,
+        l.mask_text.clone(),
+    )
+}
 
 /// 一帧要合成的东西：各层画面（从下往上）和底色的调色。
 /// 一帧要合成的东西：各层画面，底色调色，画面特效（`after` 已按画出来的层换算）。
@@ -236,7 +250,7 @@ fn layer_frames(
             stepper,
             l.source_time,
             source,
-            (l.transform, l.color, l.look, l.grades.clone(), l.detail),
+            appearance(l),
             (asset.name.clone(), l.frame_blend),
         ));
     }
@@ -245,7 +259,7 @@ fn layer_frames(
         mut stepper,
         time,
         source,
-        (transform, color, look, grades, detail),
+        (transform, color, look, grades, detail, mask_text),
         (name, blend),
     ): (Key, Stepper, Time, (u32, u32), Appearance, (String, bool))| {
         let r = stepper
@@ -262,6 +276,7 @@ fn layer_frames(
                 look,
                 grades,
                 detail,
+                mask_text,
             }),
         )
     };
@@ -381,6 +396,7 @@ pub fn render_video(
                     look: l.look,
                     grades: &l.grades,
                     detail: l.detail,
+                    mask_text: l.mask_text.as_deref(),
                 })
                 .collect();
             compositor.set_background_chain(&background.0, &background.1);

@@ -93,6 +93,7 @@ fn compound_clip(id: ClipId, start: Time, inner: Arc<Compound>) -> Clip {
         frame_blend: false,
         stabilized: None,
         input_space: None,
+        mask_text: None,
         parent: None,
         audio_split: false,
         motion: crate::motion::ClipMotion::NONE,

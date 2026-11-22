@@ -8020,6 +8020,7 @@ name = "ve-render"
 version = "0.2.0"
 dependencies = [
  "bytemuck",
+ "cosmic-text",
  "log",
  "pollster 1.0.1",
  "thiserror 2.0.21",

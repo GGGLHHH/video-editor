@@ -35,7 +35,8 @@ fn sd_star5(p_in: vec2<f32>, r: f32, rf: f32) -> f32 {
     return length(p - ba * h) * sign(p.y * ba.x - p.x * ba.y);
 }
 
-// 一个蒙版的有向距离：形状编号（-1 = 没有）、（中心、半宽高）、（旋转、羽化、圆角、反转）
+// 一个蒙版的有向距离：形状编号（-1 = 没有）、（中心、半宽高）、（旋转、羽化、圆角、反转）。
+// 文字形状要读字的距离场，`text_sd` 由拼在后面的着色器自己给（图层着色器读纹理，分组着色器不支持）
 fn shape_sd(local: vec2<f32>, shape: f32, mask: vec4<f32>, mask2: vec4<f32>) -> f32 {
     if shape < -0.5 {
         return -1e6;
@@ -59,9 +60,11 @@ fn shape_sd(local: vec2<f32>, shape: f32, mask: vec4<f32>, mask2: vec4<f32>) -> 
         // 爱心：高 2*hb.y、宽 2*hb.x；iq 的爱心底尖在 0、顶在约 1.07、宽约 ±0.6
         let q = vec2(p.x / hb.x * 0.6, (-p.y / hb.y) * 0.54 + 0.5);
         d = sd_heart(q) * s * 1.6;
-    } else {
+    } else if shape < 5.5 {
         let q = vec2(p.x / hb.x, -p.y / hb.y);
         d = sd_star5(q, 1.0, 0.45) * s;
+    } else {
+        d = text_sd(p, hb);                         // 文字
     }
     if mask2.w > 0.5 {
         d = -d;
