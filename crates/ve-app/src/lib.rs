@@ -19,6 +19,8 @@ mod clip_label;
 mod clip_ops;
 mod compound_ui;
 mod cover;
+mod crop_box;
+mod crop_ui;
 pub mod document;
 mod effect_bin;
 mod effect_preview;

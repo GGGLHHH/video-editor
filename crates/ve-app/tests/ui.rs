@@ -3315,6 +3315,14 @@ fn cursor_shows_what_a_press_would_do(cx: &mut TestAppContext) {
     assert_eq!(cursors(cx, &ui).1, CursorStyle::PointingHand);
 }
 
+/// 点对话框里的按钮关掉它，等关闭动画放完（焦点回到工作区）。
+fn close_dialog_with(cx: &mut TestAppContext, ui: &Ui, id: &'static str) {
+    click(cx, ui, id);
+    cx.executor().advance_clock(Duration::from_millis(600));
+    cx.run_until_parked();
+    frame(cx, ui);
+}
+
 #[gpui_kit::test]
 fn the_crop_button_crops_to_a_ratio(cx: &mut TestAppContext) {
     let ui = open(cx);
@@ -3322,13 +3330,74 @@ fn the_crop_button_crops_to_a_ratio(cx: &mut TestAppContext) {
     click_timeline(cx, &ui, 0.5, 1.0, gpui_kit::Modifiers::default());
     click(cx, &ui, "tb-crop");
     click(cx, &ui, "crop-1-1");
+    assert_eq!(
+        first_video_transform(cx, &ui).crop,
+        ve_core::Crop::default(),
+        "点「确定」才生效"
+    );
+    close_dialog_with(cx, &ui, "crop-ok");
     let c = first_video_transform(cx, &ui).crop;
     assert!(
         (c.left - 0.21875).abs() < 1e-4 && (c.right - 0.21875).abs() < 1e-4,
         "{c:?}"
     );
+    // 再打开：框从现在的裁剪开始；「重置」回到不裁
     click(cx, &ui, "tb-crop");
-    click(cx, &ui, "crop-free");
+    click(cx, &ui, "crop-reset");
+    close_dialog_with(cx, &ui, "crop-ok");
+    assert_eq!(
+        first_video_transform(cx, &ui).crop,
+        ve_core::Crop::default()
+    );
+}
+
+#[gpui_kit::test]
+fn the_crop_box_is_dragged_on_the_picture(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    click_timeline(cx, &ui, 0.5, 1.0, gpui_kit::Modifiers::default());
+    click(cx, &ui, "tb-crop");
+    let stage = cx
+        .update_window(ui.win, |_, window, _| window.find("crop-stage").bounds())
+        .unwrap();
+    // 右下角拖到正中：右、下各裁掉一半
+    let corner = point(
+        stage.origin.x + stage.size.width - px(1.0),
+        stage.origin.y + stage.size.height - px(1.0),
+    );
+    let center = stage.center();
+    press_and_move(cx, &ui, corner, center);
+    release(cx, &ui, center);
+    // 拖中间往左上挪到头：框大小不变、贴着左上角
+    let inside = point(
+        stage.origin.x + stage.size.width / 4.0,
+        stage.origin.y + stage.size.height / 4.0,
+    );
+    let far = point(stage.origin.x + px(5.0), stage.origin.y + px(5.0));
+    press_and_move(cx, &ui, inside, far);
+    release(cx, &ui, far);
+    assert_eq!(
+        first_video_transform(cx, &ui).crop,
+        ve_core::Crop::default(),
+        "拖的时候还没写回"
+    );
+    close_dialog_with(cx, &ui, "crop-ok");
+    let c = first_video_transform(cx, &ui).crop;
+    assert!(c.left < 0.01 && c.top < 0.01, "{c:?}");
+    assert!(
+        (c.right - 0.5).abs() < 0.02 && (c.bottom - 0.5).abs() < 0.02,
+        "{c:?}"
+    );
+    press(cx, &ui, "ctrl-z");
+    assert_eq!(
+        first_video_transform(cx, &ui).crop,
+        ve_core::Crop::default(),
+        "一步撤销"
+    );
+    // 取消：什么都不改
+    click(cx, &ui, "tb-crop");
+    click(cx, &ui, "crop-9-16");
+    close_dialog_with(cx, &ui, "crop-cancel");
     assert_eq!(
         first_video_transform(cx, &ui).crop,
         ve_core::Crop::default()
