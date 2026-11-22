@@ -33,6 +33,10 @@ env_logger.workspace = true
 raw-window-handle.workspace = true
 windows-sys.workspace = true
 
+[build-dependencies]
+# 程序图标编进 exe（Windows 资源）；GPUI 已经在用这个库，不多引入依赖
+embed-resource = "3.0.12"
+
 [dev-dependencies]
 pathdiff.workspace = true
 gpui-kit = { workspace = true, features = ["test-support"] }

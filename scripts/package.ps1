@@ -33,6 +33,7 @@ Copy-Item (Join-Path $FfmpegDir 'bin\ffmpeg.exe') $stage
 
 Copy-Item LICENSE (Join-Path $stage 'licenses\video-editor-Apache-2.0.txt')
 Copy-Item (Join-Path $FfmpegDir 'LICENSE') (Join-Path $stage 'licenses\FFmpeg-GPLv3.txt')
+Copy-Item crates\ve-app\assets\icon\LICENSE-material-symbols.txt (Join-Path $stage 'licenses\icon-Material-Symbols-Apache-2.0.txt')
 $readme = @"
 视频剪辑器 $version（Windows x64）
 
@@ -44,6 +45,7 @@ $readme = @"
   所以整个压缩包按 GPLv3 分发。授权全文见 licenses/。
 - FFmpeg 源码：https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz
   这份构建的说明和所用组件：https://github.com/GyanD/codexffmpeg/releases/tag/9.0.2
+- 程序图标的图形来自 Material Symbols（movie_edit），按 Apache-2.0 使用，见 licenses/。
 "@
 Set-Content -Path (Join-Path $stage '说明.txt') -Value $readme -Encoding utf8
 
