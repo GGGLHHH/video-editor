@@ -12,6 +12,8 @@ use ve_media::AudioDecoder;
 
 /// 每次混音的样本帧数（48k 下约 21ms）。
 const CHUNK: usize = 1024;
+/// 拖动播放头时放的那一小段有几块（4 × 1024 帧，48 kHz 下约 85 毫秒）。
+const SCRUB_CHUNKS: usize = 4;
 
 struct ClipAudio {
     asset: AssetId,
@@ -409,6 +411,7 @@ pub(crate) fn run(shared: &Shared, mut producer: Producer<f32>) {
     let mut revision = None;
     let mut pos = Time::ZERO;
     let mut mix = vec![0.0f32; CHUNK * 2];
+    let mut last_scrub = None;
 
     while !shared.is_shutdown() {
         let (project, playing, current_gen, start, current_rev, play_rate) = {
@@ -445,8 +448,35 @@ pub(crate) fn run(shared: &Shared, mut producer: Producer<f32>) {
         }
         if !playing {
             let c = shared.control();
+            let scrub = c.scrub.filter(|&(_, n)| Some(n) != last_scrub);
+            if let Some((at, n)) = scrub
+                && c.generation == current_gen
+                && !c.playing
+                && shared.out.scrub_pending() == 0
+            {
+                drop(c);
+                last_scrub = Some(n);
+                mixer.shuttle = None;
+                let mut pushed = 0;
+                let mut at = at;
+                for _ in 0..SCRUB_CHUNKS {
+                    if producer.slots() < CHUNK * 2 {
+                        break;
+                    }
+                    let step = mixer.render_at_rate(&project, at, 1.0, &mut mix);
+                    if producer.push_entire_slice(&mix).is_err() {
+                        break;
+                    }
+                    pushed += CHUNK;
+                    at += step;
+                }
+                shared.out.add_scrub(pushed);
+                continue;
+            }
             if c.generation == current_gen && !c.playing {
-                shared.wait(c, Duration::from_millis(50));
+                // 有一段拖动的声音在等上一段放完：隔一会儿再看
+                let wait = if scrub.is_some() { 5 } else { 50 };
+                shared.wait(c, Duration::from_millis(wait));
             } else {
                 drop(c);
             }

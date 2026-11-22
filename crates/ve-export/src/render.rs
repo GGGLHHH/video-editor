@@ -46,14 +46,16 @@ struct LayerFrame {
     color: ve_core::ColorMatrix,
     look: ve_core::Look,
     grades: ve_core::GradeChain,
+    detail: ve_core::Detail,
 }
 
-/// 一层的画面属性、调色、外观和调色链。
+/// 一层的画面属性、调色、外观、调色链和锐化颗粒暗角。
 type Appearance = (
     Transform,
     ve_core::ColorMatrix,
     ve_core::Look,
     ve_core::GradeChain,
+    ve_core::Detail,
 );
 
 /// 一帧要合成的东西：各层画面（从下往上）和底色的调色。
@@ -234,7 +236,7 @@ fn layer_frames(
             stepper,
             l.source_time,
             source,
-            (l.transform, l.color, l.look, l.grades.clone()),
+            (l.transform, l.color, l.look, l.grades.clone(), l.detail),
             (asset.name.clone(), l.frame_blend),
         ));
     }
@@ -243,7 +245,7 @@ fn layer_frames(
         mut stepper,
         time,
         source,
-        (transform, color, look, grades),
+        (transform, color, look, grades, detail),
         (name, blend),
     ): (Key, Stepper, Time, (u32, u32), Appearance, (String, bool))| {
         let r = stepper
@@ -259,6 +261,7 @@ fn layer_frames(
                 color,
                 look,
                 grades,
+                detail,
             }),
         )
     };
@@ -377,6 +380,7 @@ pub fn render_video(
                     color: l.color,
                     look: l.look,
                     grades: &l.grades,
+                    detail: l.detail,
                 })
                 .collect();
             compositor.set_background_chain(&background.0, &background.1);

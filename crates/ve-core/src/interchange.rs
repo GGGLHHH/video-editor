@@ -351,6 +351,9 @@ fn media_clip(id: ClipId, asset: AssetId, c: &ExClip) -> Clip {
         stabilized: None,
         input_space: None,
         parent: None,
+        audio_split: false,
+        motion: crate::motion::ClipMotion::NONE,
+        group: None,
     }
 }
 

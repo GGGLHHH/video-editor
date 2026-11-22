@@ -182,6 +182,52 @@ pub fn customized(cx: &App) -> bool {
         .is_some_and(|m| !m.overrides.is_empty())
 }
 
+/// 别的键位（不是 `slot`）现在用着 `key` 的话，返回那个键位。
+#[must_use]
+pub fn taken_by(cx: &App, slot: &str, key: &str) -> Option<String> {
+    let map = cx.try_global::<Keymap>()?;
+    all_slots(cx)
+        .into_iter()
+        .find(|s| s != slot && map.overrides.current(s) == key)
+}
+
+/// Premiere 方案：和默认（剪映 / FCP X 键位）不一样的几个键：（默认键，Premiere 的键）。
+pub const PREMIERE: [(&str, &str); 3] = [
+    // 分割（Premiere 的「添加编辑」）
+    ("ctrl-b", "ctrl-k"),
+    // 整条时间线放进视图
+    ("shift-z", "\\"),
+    // 全部分割
+    ("ctrl-shift-b", "ctrl-shift-k"),
+];
+
+/// 换成 Premiere 方案（先恢复默认，再换上 [`PREMIERE`] 里的键）。
+pub fn use_premiere(cx: &mut App) {
+    reset(cx);
+    for (from, to) in PREMIERE {
+        if let Some(slot) = slot_for_default(cx, from) {
+            assign(cx, &slot, to);
+        }
+    }
+}
+
+/// 现在用的是不是 Premiere 方案（只改了 [`PREMIERE`] 里的那几个键）。
+#[must_use]
+pub fn is_premiere(cx: &App) -> bool {
+    let Some(map) = cx.try_global::<Keymap>() else {
+        return false;
+    };
+    let wanted: Vec<(String, String)> = PREMIERE
+        .iter()
+        .filter_map(|(from, to)| slot_for_default(cx, from).map(|s| (s, (*to).to_owned())))
+        .collect();
+    !wanted.is_empty()
+        && map.overrides.0.len() == wanted.len()
+        && wanted
+            .iter()
+            .all(|(s, k)| map.overrides.0.get(s).is_some_and(|v| v == k))
+}
+
 /// 给键位换一个键。别的键位正在用这个键时把它去掉（同一个键只做一件事），返回被去掉的那个键位。
 pub fn assign(cx: &mut App, slot: &str, key: &str) -> Option<String> {
     let all_slots = all_slots(cx);

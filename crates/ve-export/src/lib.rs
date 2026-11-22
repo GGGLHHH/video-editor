@@ -7,8 +7,8 @@ pub mod run;
 
 pub use ass::{SubtitleStyle, has_subtitles, write_ass};
 pub use graph::{
-    AudioFormat, Codec, Encoder, ExportError, ExportSettings, FfmpegJob, Output, build_job,
-    estimated_bytes, recommended_kbps,
+    AudioCodec, AudioFormat, Codec, Encoder, ExportError, ExportSettings, FfmpegJob, Output,
+    VideoAudio, build_job, estimated_bytes, recommended_kbps,
 };
 pub use render::{frame_count, output_size};
 pub use run::{

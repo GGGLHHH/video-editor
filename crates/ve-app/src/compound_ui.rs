@@ -204,6 +204,7 @@ impl Workspace {
         p.timeline = ve_core::Timeline {
             tracks: inner.tracks.clone(),
             markers: Vec::new(),
+            marker_colors: Vec::new(),
             range: None,
             cover: None,
         };

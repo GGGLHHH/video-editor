@@ -212,6 +212,46 @@ impl Workspace {
         video.then(|| (clip, c.grade.as_deref().cloned().unwrap_or_default()))
     }
 
+    /// 选中片段在播放头这一刻的进阶调色（HSL 有关键帧时按动画求值）和播放头相对片段起点的时间。
+    fn bound_grade_at(&self) -> Option<(ClipId, Grade, ve_core::Time)> {
+        let clip = self.inspector.bound?;
+        let (track, c) = self.doc.project.timeline.find_clip(clip)?;
+        let video = self.doc.project.timeline.track(track)?.kind == ve_core::TrackKind::Video;
+        let offset = self.key_offset(c);
+        video.then(|| {
+            (
+                clip,
+                c.grade_at(offset).as_deref().cloned().unwrap_or_default(),
+                offset,
+            )
+        })
+    }
+
+    /// 拖 HSL 滑条：这个颜色的这一项有关键帧时在播放头打帧，没有时改固定值。
+    fn edit_hsl(
+        &mut self,
+        channel: usize,
+        v: f32,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((clip, g, offset)) = self.bound_grade_at() else {
+            return;
+        };
+        let band = self.inspector.grade.band;
+        let mut h = g.hsl[band.index()];
+        let ch = [
+            ve_core::HslChannel::Hue,
+            ve_core::HslChannel::Saturation,
+            ve_core::HslChannel::Lightness,
+        ][channel.min(2)];
+        ch.set(&mut h, v);
+        let _ = self
+            .doc
+            .edit(|p| ve_core::edit::apply_hsl_at(p, clip, offset, band, h));
+        self.after_change(window, cx);
+    }
+
     /// 改进阶调色：在拖动手势里时并进同一步撤销，否则单独一步。
     fn edit_grade(
         &mut self,
@@ -264,6 +304,10 @@ impl Workspace {
             SliderEvent::Change(v) => {
                 let v = v.start() / 100.0;
                 self.begin_grade_gesture();
+                if let GradeSlider::Hsl(i) = which {
+                    self.edit_hsl(i, v, window, cx);
+                    return;
+                }
                 let band = self.inspector.grade.band.index();
                 self.edit_grade(
                     |g| match which {
@@ -293,7 +337,7 @@ impl Workspace {
         if self.inspector.grade.gesture {
             return;
         }
-        let Some((_, g)) = self.bound_grade() else {
+        let Some((_, g, _)) = self.bound_grade_at() else {
             return;
         };
         let f = &self.inspector.grade;
@@ -406,6 +450,7 @@ impl Workspace {
     }
 
     fn slider_row(
+        &self,
         label: &'static str,
         id: &'static str,
         s: &Entity<SliderState>,
@@ -423,12 +468,7 @@ impl Workspace {
                     .child(label),
             )
             .child(div().flex_1().id(id).test_support().child(Slider::new(s)))
-            .child(
-                div()
-                    .w(px(36.))
-                    .text_sm()
-                    .child(SharedString::from(format!("{}", (value * 100.0).round()))),
-            )
+            .child(self.value_box(id, s, format!("{}", (value * 100.0).round()), 36.0, cx))
             .into_any_element()
     }
 
@@ -464,7 +504,7 @@ impl Workspace {
                     ),
             )
             .children(g.lut.as_ref().map(|l| {
-                Self::slider_row(
+                self.slider_row(
                     "强度",
                     "lut-intensity",
                     &self.inspector.grade.lut_intensity,
@@ -519,8 +559,20 @@ impl Workspace {
                     cx.notify();
                 }))
         });
-        let h = g.hsl[current.index()];
+        let h = self.bound_grade_at().map_or_else(
+            || g.hsl[current.index()],
+            |(_, now, _)| now.hsl[current.index()],
+        );
         let f = &self.inspector.grade;
+        let keys = |ch: ve_core::HslChannel| {
+            self.render_group_keys(ve_core::KeyGroup::Hsl(ve_core::Prop::hsl(current, ch)), cx)
+        };
+        let row = |label, id, s, v, ch| {
+            h_flex()
+                .gap_1()
+                .child(div().flex_1().child(self.slider_row(label, id, s, v, cx)))
+                .child(keys(ch))
+        };
         Some(
             v_flex()
                 .id("insp-hsl")
@@ -528,20 +580,26 @@ impl Workspace {
                 .gap_3()
                 .child(h_flex().gap_2().children(rings))
                 .child(div().text_sm().child(current.label()))
-                .child(Self::slider_row("色相", "hsl-hue", &f.hsl[0], h.hue, cx))
-                .child(Self::slider_row(
+                .child(row(
+                    "色相",
+                    "hsl-hue",
+                    &f.hsl[0],
+                    h.hue,
+                    ve_core::HslChannel::Hue,
+                ))
+                .child(row(
                     "饱和度",
                     "hsl-sat",
                     &f.hsl[1],
                     h.saturation,
-                    cx,
+                    ve_core::HslChannel::Saturation,
                 ))
-                .child(Self::slider_row(
+                .child(row(
                     "亮度",
                     "hsl-light",
                     &f.hsl[2],
                     h.lightness,
-                    cx,
+                    ve_core::HslChannel::Lightness,
                 ))
                 .child(
                     Button::new("hsl-reset")

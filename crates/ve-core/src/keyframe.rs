@@ -118,6 +118,54 @@ pub enum Prop {
     MaskRound,
     /// 画面特效强度。
     EffectAmount,
+    /// HSL 红色的色相。
+    HslRedHue,
+    /// HSL 红色的饱和度。
+    HslRedSat,
+    /// HSL 红色的亮度。
+    HslRedLight,
+    /// HSL 橙色的色相。
+    HslOrangeHue,
+    /// HSL 橙色的饱和度。
+    HslOrangeSat,
+    /// HSL 橙色的亮度。
+    HslOrangeLight,
+    /// HSL 黄色的色相。
+    HslYellowHue,
+    /// HSL 黄色的饱和度。
+    HslYellowSat,
+    /// HSL 黄色的亮度。
+    HslYellowLight,
+    /// HSL 绿色的色相。
+    HslGreenHue,
+    /// HSL 绿色的饱和度。
+    HslGreenSat,
+    /// HSL 绿色的亮度。
+    HslGreenLight,
+    /// HSL 青色的色相。
+    HslCyanHue,
+    /// HSL 青色的饱和度。
+    HslCyanSat,
+    /// HSL 青色的亮度。
+    HslCyanLight,
+    /// HSL 蓝色的色相。
+    HslBlueHue,
+    /// HSL 蓝色的饱和度。
+    HslBlueSat,
+    /// HSL 蓝色的亮度。
+    HslBlueLight,
+    /// HSL 紫色的色相。
+    HslPurpleHue,
+    /// HSL 紫色的饱和度。
+    HslPurpleSat,
+    /// HSL 紫色的亮度。
+    HslPurpleLight,
+    /// HSL 品红色的色相。
+    HslMagentaHue,
+    /// HSL 品红色的饱和度。
+    HslMagentaSat,
+    /// HSL 品红色的亮度。
+    HslMagentaLight,
 }
 
 /// 属性面板里一行一个关键帧按钮（剪映电脑版按属性打帧）：位置（X、Y 一起）、缩放、旋转、
@@ -142,6 +190,10 @@ pub enum KeyGroup {
     Look(Prop),
     /// 画面特效的强度。
     Effect,
+    /// HSL 的一项（「调整 › HSL」某个颜色的色相 / 饱和度 / 亮度，[`Prop::HSL`] 里的一个）。
+    Hsl(Prop),
+    /// 「基础调节」整组（组标题上的 ‹ ◇ ›）：亮度、对比度、饱和度、色温、色调一起。
+    AdjustAll,
 }
 
 impl KeyGroup {
@@ -176,7 +228,40 @@ impl KeyGroup {
             Self::Volume => &[Prop::Volume],
             Self::Effect => &[Prop::EffectAmount],
             Self::Look(p) => look_slice(p),
+            Self::Hsl(p) => hsl_slice(p),
+            Self::AdjustAll => &Prop::ADJUST,
         }
+    }
+}
+
+/// 一个 HSL 属性自己组成的一组。
+const fn hsl_slice(p: Prop) -> &'static [Prop] {
+    match p {
+        Prop::HslRedHue => &[Prop::HslRedHue],
+        Prop::HslRedSat => &[Prop::HslRedSat],
+        Prop::HslRedLight => &[Prop::HslRedLight],
+        Prop::HslOrangeHue => &[Prop::HslOrangeHue],
+        Prop::HslOrangeSat => &[Prop::HslOrangeSat],
+        Prop::HslOrangeLight => &[Prop::HslOrangeLight],
+        Prop::HslYellowHue => &[Prop::HslYellowHue],
+        Prop::HslYellowSat => &[Prop::HslYellowSat],
+        Prop::HslYellowLight => &[Prop::HslYellowLight],
+        Prop::HslGreenHue => &[Prop::HslGreenHue],
+        Prop::HslGreenSat => &[Prop::HslGreenSat],
+        Prop::HslGreenLight => &[Prop::HslGreenLight],
+        Prop::HslCyanHue => &[Prop::HslCyanHue],
+        Prop::HslCyanSat => &[Prop::HslCyanSat],
+        Prop::HslCyanLight => &[Prop::HslCyanLight],
+        Prop::HslBlueHue => &[Prop::HslBlueHue],
+        Prop::HslBlueSat => &[Prop::HslBlueSat],
+        Prop::HslBlueLight => &[Prop::HslBlueLight],
+        Prop::HslPurpleHue => &[Prop::HslPurpleHue],
+        Prop::HslPurpleSat => &[Prop::HslPurpleSat],
+        Prop::HslPurpleLight => &[Prop::HslPurpleLight],
+        Prop::HslMagentaHue => &[Prop::HslMagentaHue],
+        Prop::HslMagentaSat => &[Prop::HslMagentaSat],
+        Prop::HslMagentaLight => &[Prop::HslMagentaLight],
+        _ => &[],
     }
 }
 
@@ -398,6 +483,57 @@ impl Prop {
         }
     }
 
+    /// HSL 的 24 项（8 个颜色 × 色相、饱和度、亮度）。
+    pub const HSL: [Self; 24] = [
+        Self::HslRedHue,
+        Self::HslRedSat,
+        Self::HslRedLight,
+        Self::HslOrangeHue,
+        Self::HslOrangeSat,
+        Self::HslOrangeLight,
+        Self::HslYellowHue,
+        Self::HslYellowSat,
+        Self::HslYellowLight,
+        Self::HslGreenHue,
+        Self::HslGreenSat,
+        Self::HslGreenLight,
+        Self::HslCyanHue,
+        Self::HslCyanSat,
+        Self::HslCyanLight,
+        Self::HslBlueHue,
+        Self::HslBlueSat,
+        Self::HslBlueLight,
+        Self::HslPurpleHue,
+        Self::HslPurpleSat,
+        Self::HslPurpleLight,
+        Self::HslMagentaHue,
+        Self::HslMagentaSat,
+        Self::HslMagentaLight,
+    ];
+
+    /// 某个颜色的色相 / 饱和度 / 亮度。
+    #[must_use]
+    pub const fn hsl(band: crate::HslBand, channel: crate::HslChannel) -> Self {
+        let c = match channel {
+            crate::HslChannel::Hue => 0,
+            crate::HslChannel::Saturation => 1,
+            crate::HslChannel::Lightness => 2,
+        };
+        Self::HSL[band.index() * 3 + c]
+    }
+
+    /// 是 HSL 的哪一项（不是时 `None`）。
+    #[must_use]
+    pub fn hsl_target(self) -> Option<(crate::HslBand, crate::HslChannel)> {
+        let i = Self::HSL.iter().position(|p| *p == self)?;
+        let channel = [
+            crate::HslChannel::Hue,
+            crate::HslChannel::Saturation,
+            crate::HslChannel::Lightness,
+        ][i % 3];
+        Some((crate::HslBand::ALL[i / 3], channel))
+    }
+
     /// 是外观属性。
     #[must_use]
     pub fn is_look(self) -> bool {
@@ -431,7 +567,31 @@ impl Prop {
                 | Self::Contrast
                 | Self::Saturation
                 | Self::Temperature
-                | Self::Tint => (-1.0..=1.0).contains(&v),
+                | Self::Tint
+                | Self::HslRedHue
+                | Self::HslRedSat
+                | Self::HslRedLight
+                | Self::HslOrangeHue
+                | Self::HslOrangeSat
+                | Self::HslOrangeLight
+                | Self::HslYellowHue
+                | Self::HslYellowSat
+                | Self::HslYellowLight
+                | Self::HslGreenHue
+                | Self::HslGreenSat
+                | Self::HslGreenLight
+                | Self::HslCyanHue
+                | Self::HslCyanSat
+                | Self::HslCyanLight
+                | Self::HslBlueHue
+                | Self::HslBlueSat
+                | Self::HslBlueLight
+                | Self::HslPurpleHue
+                | Self::HslPurpleSat
+                | Self::HslPurpleLight
+                | Self::HslMagentaHue
+                | Self::HslMagentaSat
+                | Self::HslMagentaLight => (-1.0..=1.0).contains(&v),
                 Self::Volume => (VOLUME_RANGE_DB.0..=VOLUME_RANGE_DB.1).contains(&v),
                 Self::StrokeWidth | Self::ShadowBlur | Self::ShadowDistance => {
                     (0.0..=0.1).contains(&v)
@@ -481,6 +641,23 @@ impl Animation {
         all.sort_unstable();
         all.dedup();
         all
+    }
+
+    /// 把 `from` 处所有属性的关键帧挪到 `to`（缓动跟着走；`to` 处原来有的被盖掉）。返回是否挪了。
+    pub fn move_keys(&mut self, from: Time, to: Time) -> bool {
+        let mut moved = false;
+        for keys in self.tracks.values_mut() {
+            let Some(i) = keys.iter().position(|k| k.at == from) else {
+                continue;
+            };
+            let mut k = keys.remove(i);
+            k.at = to;
+            keys.retain(|other| other.at != to);
+            let j = keys.partition_point(|other| other.at < to);
+            keys.insert(j, k);
+            moved = true;
+        }
+        moved
     }
 
     /// 换掉某个属性的全部关键帧（`keys` 为空时这个属性不再有动画）。`keys` 要按时间排好。

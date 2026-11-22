@@ -60,6 +60,9 @@ pub const fn media_clip(id: ClipId, asset: AssetId, start: Time, duration: Time)
         stabilized: None,
         input_space: None,
         parent: None,
+        audio_split: false,
+        motion: crate::motion::ClipMotion::NONE,
+        group: None,
     }
 }
 
@@ -139,6 +142,9 @@ pub fn sample_project() -> (Project, SampleIds) {
         stabilized: None,
         input_space: None,
         parent: None,
+        audio_split: false,
+        motion: crate::motion::ClipMotion::NONE,
+        group: None,
     };
     // Project::new() 的轨道顺序固定为 字幕、视频、音频
     let [subs, video, audio] = &mut p.timeline.tracks[..] else {

@@ -12,6 +12,16 @@ use gpui_kit::{
 use ve_core::edit::{TrackFlag, add_track, remove_track, set_track_flag};
 use ve_core::{Timeline, TrackId, TrackKind};
 
+/// 轨道头上的类型图标（剪映的轨道头是图标）：视频 ▣、音频 ♪、文字 T。
+#[must_use]
+pub const fn track_icon(kind: TrackKind) -> &'static str {
+    match kind {
+        TrackKind::Video => "▣",
+        TrackKind::Audio => "♪",
+        TrackKind::Subtitle => "T",
+    }
+}
+
 /// 轨道名，和轨道列表一一对应。视频轨从下往上数 V1、V2…（越上层号越大），
 /// 音频轨从上往下数 A1、A2…，字幕轨 S1…。
 #[must_use]
@@ -135,7 +145,7 @@ impl Workspace {
                     })),
             );
         let rows = timeline.tracks.iter().enumerate().filter_map(|(i, track)| {
-            let top = geo.track_top(i) + (geo.track_height - HEADER_BUTTON) / 2.0;
+            let top = geo.track_top(i) + (geo.row_height(i) - HEADER_BUTTON) / 2.0;
             // 滚到标尺下面或时间轴下边以外的不画
             if top < geo.ruler_height || top > f32::from(self.timeline.bounds.size.height) {
                 return None;
@@ -161,7 +171,7 @@ impl Workspace {
             .tracks
             .iter()
             .position(|t| Some(t.id) == main)
-            .map(|i| geo.track_top(i) + (geo.track_height - HEADER_BUTTON) / 2.0)
+            .map(|i| geo.track_top(i) + (geo.row_height(i) - HEADER_BUTTON) / 2.0)
             .filter(|top| {
                 *top >= geo.ruler_height && *top <= f32::from(self.timeline.bounds.size.height)
             })
@@ -301,6 +311,12 @@ pub fn header_slots(timeline: &Timeline, index: usize) -> [Option<HeaderSlot>; 4
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_track_kind_has_its_own_icon() {
+        let icons = [TrackKind::Video, TrackKind::Audio, TrackKind::Subtitle].map(track_icon);
+        assert_eq!(icons, ["▣", "♪", "T"]);
+    }
     use ve_core::Project;
 
     #[test]

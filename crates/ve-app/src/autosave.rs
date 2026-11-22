@@ -147,6 +147,18 @@ impl Workspace {
         if !self.doc.is_dirty() || !quiet || self.doc.in_gesture() {
             return;
         }
+        self.autosave_now(cx);
+    }
+
+    /// 马上自动保存一次（有改动时；退出前也调它）：新草稿按日期命名存进草稿目录。
+    /// 没开自动保存、没有改动时什么都不做。
+    pub(crate) fn autosave_now(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(a) = self.autosave.as_ref() else {
+            return;
+        };
+        if !self.doc.is_dirty() {
+            return;
+        }
         // 在复合片段里面时存的是整个工程（里面的改动写回去之后的样子），路径用最外层的
         let dir = a.dir.clone();
         let path = self.outermost_path().map_or_else(

@@ -24,7 +24,7 @@ jobs:
       CARGO_TERM_COLOR: always
       LIBCLANG_PATH: C:\Program Files\LLVM\bin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Rust 工具链（按 rust-toolchain.toml）
         run: rustup toolchain install

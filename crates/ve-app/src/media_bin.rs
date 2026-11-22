@@ -11,6 +11,7 @@ use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::Input;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
@@ -247,8 +248,18 @@ impl Workspace {
             .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
                 if e.click_count() >= 2 {
                     this.append_to_timeline(id, window, cx);
+                } else {
+                    // 单击：播放器里先单独看这个素材
+                    this.start_asset_preview(id, cx);
                 }
             }))
+            .on_mouse_down(
+                gpui_kit::MouseButton::Right,
+                cx.listener(move |this, e: &gpui_kit::MouseDownEvent, _, cx| {
+                    this.open_asset_menu(id, e.position);
+                    cx.notify();
+                }),
+            )
             .child(
                 div()
                     .relative()
@@ -337,7 +348,46 @@ impl Workspace {
             )
     }
 
-    /// 素材标签的内容：顶部「导入」按钮，下面缩略图网格；空工程时一个大的虚线框。
+    /// 素材标签顶上一行：导入、导入进度、搜索框、排序。
+    fn render_media_header(&self, cx: &Context<'_, Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        h_flex()
+            .h(px(36.))
+            .flex_none()
+            .px_2()
+            .gap_2()
+            .child(
+                Button::new("bin-import")
+                    .compact()
+                    .icon(IconName::Plus)
+                    .label("导入")
+                    .on_click(cx.listener(|this, _, w, cx| this.import(&act::Import, w, cx))),
+            )
+            .children(
+                (self.importing > 0).then(|| div().text_xs().text_color(muted).child("导入中…")),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("bin-search")
+                    .test_support()
+                    .w(px(140.))
+                    .child(Input::new(&self.bin_search).xsmall()),
+            )
+            .child(
+                Button::new("bin-order")
+                    .ghost()
+                    .compact()
+                    .label(self.bin_order.label())
+                    .tooltip("排序")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.bin_order = this.bin_order.next();
+                        cx.notify();
+                    })),
+            )
+    }
+
+    /// 素材标签的内容：顶部「导入」、搜索和排序，下面缩略图网格；空工程时一个大的虚线框。
     fn render_media_tab(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let rate = self.doc.project.settings.frame_rate;
         let used: std::collections::HashSet<AssetId> = self
@@ -348,8 +398,12 @@ impl Workspace {
             .iter()
             .flat_map(|t| t.clips.iter().filter_map(|c| c.asset()))
             .collect();
-        let mut assets: Vec<&Asset> = self.doc.project.assets.values().collect();
-        assets.sort_by_key(|a| a.id);
+        let query = self.bin_search.read(cx).value();
+        let assets = arrange_assets(
+            self.doc.project.assets.values().collect(),
+            &query,
+            self.bin_order,
+        );
         let cards = assets
             .into_iter()
             .map(|a| self.render_asset_card(a, used.contains(&a.id), rate, cx));
@@ -357,26 +411,7 @@ impl Workspace {
         let muted = cx.theme().muted_foreground;
         v_flex()
             .size_full()
-            .child(
-                h_flex()
-                    .h(px(36.))
-                    .flex_none()
-                    .px_2()
-                    .gap_2()
-                    .child(
-                        Button::new("bin-import")
-                            .compact()
-                            .icon(IconName::Plus)
-                            .label("导入")
-                            .on_click(
-                                cx.listener(|this, _, w, cx| this.import(&act::Import, w, cx)),
-                            ),
-                    )
-                    .children(
-                        (self.importing > 0)
-                            .then(|| div().text_xs().text_color(muted).child("导入中…")),
-                    ),
-            )
+            .child(self.render_media_header(cx))
             .child(
                 div()
                     .id("media-list")
@@ -418,6 +453,53 @@ impl Workspace {
                             )
                     })),
             )
+    }
+
+    /// 贴纸标签：导入的图片（透明 PNG 放到画面上就是贴纸），点「+」放到播放头处。
+    fn render_sticker_tab(&self, cx: &Context<'_, Self>) -> impl IntoElement {
+        let rate = self.doc.project.settings.frame_rate;
+        let used: std::collections::HashSet<AssetId> = self
+            .doc
+            .project
+            .timeline
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter().filter_map(|c| c.asset()))
+            .collect();
+        let mut images: Vec<&Asset> = self
+            .doc
+            .project
+            .assets
+            .values()
+            .filter(|a| a.video.is_some_and(|v| v.still))
+            .collect();
+        images.sort_by_key(|a| a.id);
+        let empty = images.is_empty();
+        let cards = images
+            .into_iter()
+            .map(|a| self.render_asset_card(a, used.contains(&a.id), rate, cx));
+        v_flex()
+            .id("bin-sticker")
+            .test_support()
+            .size_full()
+            .p_2()
+            .gap_2()
+            .child(
+                h_flex().gap_2().child(
+                    Button::new("bin-sticker-import")
+                        .compact()
+                        .icon(IconName::Plus)
+                        .label("导入图片")
+                        .on_click(cx.listener(|this, _, w, cx| this.import(&act::Import, w, cx))),
+                ),
+            )
+            .child(h_flex().flex_wrap().items_start().gap_3().children(cards))
+            .children(empty.then(|| {
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("导入 PNG 图片（带透明底的最合适），放到画面上就是贴纸")
+            }))
     }
 
     /// 文本标签：「默认文本」（在播放头处加一条字幕）和「导入本地字幕」两个大方块。
@@ -491,10 +573,11 @@ impl Workspace {
         let content = match self.bin_tab {
             BinTab::Media => self.render_media_tab(cx).into_any_element(),
             BinTab::Text => Self::render_text_tab(cx).into_any_element(),
+            BinTab::Sticker => self.render_sticker_tab(cx).into_any_element(),
             BinTab::Transition => self.render_transition_tab(cx).into_any_element(),
             BinTab::Audio => self.render_audio_tab(cx).into_any_element(),
             BinTab::Filter => self.render_filter_tab(cx).into_any_element(),
-            BinTab::Adjust => Self::render_adjust_bin_tab(cx).into_any_element(),
+            BinTab::Adjust => self.render_adjust_bin_tab(cx).into_any_element(),
             BinTab::Effect => self.render_effect_bin_tab(cx).into_any_element(),
         };
         v_flex()
@@ -542,6 +625,61 @@ impl Workspace {
 /// 卡片宽度（缩略图 16:9）。
 const CARD_W: f32 = 104.0;
 
+/// 素材面板里素材怎么排（剪映素材面板右上的「排序」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AssetOrder {
+    /// 按导入的先后。
+    #[default]
+    Imported,
+    /// 按名称。
+    Name,
+    /// 按时长（短的在前）。
+    Duration,
+}
+
+impl AssetOrder {
+    /// 点一下排序按钮换到的下一种。
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Imported => Self::Name,
+            Self::Name => Self::Duration,
+            Self::Duration => Self::Imported,
+        }
+    }
+
+    /// 按钮上的字。
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Imported => "导入顺序",
+            Self::Name => "名称",
+            Self::Duration => "时长",
+        }
+    }
+}
+
+/// 按文件名筛选（不分大小写，`query` 为空时不筛）再按 `order` 排。
+#[must_use]
+pub fn arrange_assets<'a>(
+    mut assets: Vec<&'a Asset>,
+    query: &str,
+    order: AssetOrder,
+) -> Vec<&'a Asset> {
+    let q = query.trim().to_lowercase();
+    if !q.is_empty() {
+        assets.retain(|a| a.name.to_lowercase().contains(&q));
+    }
+    match order {
+        AssetOrder::Imported => assets.sort_by_key(|a| a.id),
+        AssetOrder::Name => {
+            assets.sort_by_key(|a| a.name.to_lowercase());
+        }
+        AssetOrder::Duration => assets.sort_by_key(|a| (a.duration, a.id)),
+    }
+    assets
+}
+
 /// 素材面板顶部的一级标签（剪映的 13 个里和剪辑有关的 7 个）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BinTab {
@@ -552,6 +690,8 @@ pub enum BinTab {
     Audio,
     /// 文本：默认文本、导入字幕。
     Text,
+    /// 贴纸：导入的图片（透明 PNG 放上去就是贴纸）。
+    Sticker,
     /// 画面特效。
     Effect,
     /// 转场（后续）。
@@ -564,10 +704,11 @@ pub enum BinTab {
 
 impl BinTab {
     /// 从左到右的顺序。
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Media,
         Self::Audio,
         Self::Text,
+        Self::Sticker,
         Self::Effect,
         Self::Transition,
         Self::Filter,
@@ -579,6 +720,7 @@ impl BinTab {
             Self::Media => "bin-tab-media",
             Self::Audio => "bin-tab-audio",
             Self::Text => "bin-tab-text",
+            Self::Sticker => "bin-tab-sticker",
             Self::Effect => "bin-tab-effect",
             Self::Transition => "bin-tab-transition",
             Self::Filter => "bin-tab-filter",
@@ -593,6 +735,7 @@ impl BinTab {
             Self::Media => "素材",
             Self::Audio => "音频",
             Self::Text => "文本",
+            Self::Sticker => "贴纸",
             Self::Effect => "特效",
             Self::Transition => "转场",
             Self::Filter => "滤镜",
@@ -605,6 +748,7 @@ impl BinTab {
             Self::Media => Lucide::Film,
             Self::Audio => Lucide::Music,
             Self::Text => Lucide::Type,
+            Self::Sticker => Lucide::Image,
             Self::Effect => Lucide::Sparkles,
             Self::Transition => Lucide::ArrowRightLeft,
             Self::Filter => Lucide::Aperture,
@@ -618,6 +762,7 @@ impl BinTab {
             Self::Media => &["导入"],
             Self::Audio => &["音频提取"],
             Self::Text => &["新建文本"],
+            Self::Sticker => &["我的贴纸"],
             Self::Effect => &["画面特效"],
             Self::Transition => &["转场效果"],
             Self::Filter => &["滤镜库"],
@@ -638,3 +783,48 @@ trait SubStyle: gpui_kit::Styled + Sized {
 }
 
 impl<T: gpui_kit::Styled> SubStyle for T {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assets_are_filtered_by_name_and_sorted() {
+        use ve_core::{Asset, AssetId, Time};
+        let asset = |id: u64, name: &str, secs: i64| Asset {
+            id: AssetId(id),
+            path: name.into(),
+            name: name.into(),
+            duration: Time::from_secs(secs),
+            video: None,
+            audio: None,
+        };
+        let all = [
+            asset(1, "片头.mp4", 5),
+            asset(2, "Beach.mov", 2),
+            asset(3, "片尾.mp4", 9),
+        ];
+        let refs: Vec<&Asset> = all.iter().collect();
+        let ids = |v: Vec<&Asset>| v.iter().map(|a| a.id.0).collect::<Vec<_>>();
+        assert_eq!(
+            ids(arrange_assets(refs.clone(), "", AssetOrder::Imported)),
+            [1, 2, 3]
+        );
+        assert_eq!(
+            ids(arrange_assets(refs.clone(), "片", AssetOrder::Imported)),
+            [1, 3]
+        );
+        assert_eq!(
+            ids(arrange_assets(refs.clone(), "beach", AssetOrder::Imported)),
+            [2],
+            "不分大小写"
+        );
+        assert_eq!(
+            ids(arrange_assets(refs.clone(), "", AssetOrder::Duration)),
+            [2, 1, 3]
+        );
+        assert_eq!(ids(arrange_assets(refs, "", AssetOrder::Name)), [2, 1, 3]);
+        assert_eq!(AssetOrder::Imported.next(), AssetOrder::Name);
+        assert_eq!(AssetOrder::Duration.next(), AssetOrder::Imported);
+    }
+}

@@ -69,6 +69,18 @@ pub enum Hit {
     Empty,
 }
 
+/// 音频片段淡入 / 淡出拖点离片段上沿多远（像素）。
+pub const FADE_HANDLE_Y: f32 = 5.0;
+/// 淡入 / 淡出拖点的点击范围（像素，横竖各这么远）。
+pub const FADE_HIT_PX: f32 = 6.0;
+/// 没有淡入淡出时拖点离片段边缘多远画（不和修剪的边缘挤在一起，像素）。
+pub const FADE_INSET: f32 = 4.0;
+
+/// 关键帧小菱形的点击范围（像素，横竖各这么远）。
+pub const KEY_HIT_PX: f32 = 7.0;
+/// 片段两头的关键帧离片段边缘至少这么远画（整个菱形画在片段里，像素）。
+pub const KEY_INSET: f32 = 6.5;
+
 /// 轨道分界上下多少像素内算「缝」（拖进去新建轨道）。
 pub const INSERT_BAND: f32 = 6.0;
 
@@ -93,6 +105,11 @@ pub struct ScrollThumb {
     pub width: f32,
 }
 
+/// 只有特效 / 调节片段的视频轨高度是普通轨的几成（剪映的特效轨是细条）。
+pub const THIN_ROW: f32 = 0.5;
+/// 文字轨高度是普通轨的几成。
+pub const TEXT_ROW: f32 = 0.75;
+
 /// 时间轴视图的几何参数。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TimelineGeometry {
@@ -102,8 +119,12 @@ pub struct TimelineGeometry {
     pub scroll_x: f32,
     /// 纵向滚动（像素）：轨道多了放不下时，轨道行在标尺下面上下滚。
     pub scroll_y: f32,
-    /// 每条轨道高。
+    /// 普通轨道（视频、音频）的高；文字轨、特效轨按比例矮一些（[`Self::row_height`]）。
     pub track_height: f32,
+    /// 第 i 位是 1：第 i 条轨是细条（只有特效 / 调节片段的视频轨）。每帧按时间轴重算（[`Self::sync_rows`]）。
+    pub thin_rows: u64,
+    /// 第 i 位是 1：第 i 条轨是文字轨。
+    pub text_rows: u64,
     /// 标尺高。
     pub ruler_height: f32,
     /// 轨道头宽。
@@ -117,6 +138,8 @@ impl Default for TimelineGeometry {
             scroll_x: 0.0,
             scroll_y: 0.0,
             track_height: 56.0,
+            thin_rows: 0,
+            text_rows: 0,
             ruler_height: 28.0,
             header_width: 132.0,
         }
@@ -124,6 +147,44 @@ impl Default for TimelineGeometry {
 }
 
 impl TimelineGeometry {
+    /// 按时间轴记下哪几条轨是细条、哪几条是文字轨（只管前 64 条，再往后都按普通高度）。
+    pub fn sync_rows(&mut self, timeline: &Timeline) {
+        let (mut thin, mut text) = (0u64, 0u64);
+        for (i, t) in timeline.tracks.iter().enumerate().take(64) {
+            let bit = 1u64 << i;
+            match t.kind {
+                ve_core::TrackKind::Subtitle => text |= bit,
+                ve_core::TrackKind::Video
+                    if !t.clips.is_empty() && t.clips.iter().all(|c| c.is_overlay_tool()) =>
+                {
+                    thin |= bit;
+                }
+                _ => {}
+            }
+        }
+        self.thin_rows = thin;
+        self.text_rows = text;
+    }
+
+    /// 第 `i` 条轨道的高。
+    #[must_use]
+    pub fn row_height(&self, i: usize) -> f32 {
+        let bit = if i < 64 { 1u64 << i } else { 0 };
+        if self.thin_rows & bit != 0 {
+            self.track_height * THIN_ROW
+        } else if self.text_rows & bit != 0 {
+            self.track_height * TEXT_ROW
+        } else {
+            self.track_height
+        }
+    }
+
+    /// 前 `n` 条轨道加起来多高。
+    #[must_use]
+    pub fn rows_height(&self, n: usize) -> f32 {
+        (0..n).map(|i| self.row_height(i)).sum()
+    }
+
     /// 时间 → 横坐标。
     #[must_use]
     #[expect(
@@ -146,46 +207,114 @@ impl TimelineGeometry {
 
     /// 纵坐标所在的轨道下标。
     #[must_use]
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "已排除负数"
-    )]
     pub fn track_index_at(&self, y: f32, track_count: usize) -> Option<usize> {
         if y < self.ruler_height {
             return None;
         }
-        let i = ((y - self.ruler_height + self.scroll_y) / self.track_height).floor() as usize;
-        (i < track_count).then_some(i)
+        let mut rest = y - self.ruler_height + self.scroll_y;
+        for i in 0..track_count {
+            let h = self.row_height(i);
+            if rest < h {
+                return Some(i);
+            }
+            rest -= h;
+        }
+        None
+    }
+
+    /// 音频片段上沿的淡入 / 淡出拖点在哪（本地坐标的横坐标）：（淡入，淡出）。
+    #[must_use]
+    pub fn fade_handles(&self, clip: &ve_core::Clip) -> (f32, f32) {
+        let (x0, x1) = (self.time_to_x(clip.start), self.time_to_x(clip.end()));
+        let fin = self
+            .time_to_x(clip.start + clip.fade_in)
+            .max(x0 + FADE_INSET);
+        let fout = self
+            .time_to_x(clip.end() - clip.fade_out)
+            .min(x1 - FADE_INSET);
+        (fin.min(x1), fout.max(x0))
+    }
+
+    /// 本地坐标 `(x, y)` 按在哪个音频片段的淡入（`true`）/ 淡出（`false`）拖点上。
+    #[must_use]
+    pub fn fade_handle_at(&self, x: f32, y: f32, timeline: &Timeline) -> Option<(ClipId, bool)> {
+        let i = self.track_index_at(y, timeline.tracks.len())?;
+        let track = &timeline.tracks[i];
+        if track.kind != ve_core::TrackKind::Audio || track.locked {
+            return None;
+        }
+        if (y - (self.track_top(i) + FADE_HANDLE_Y)).abs() > FADE_HIT_PX {
+            return None;
+        }
+        track.clips.iter().find_map(|c| {
+            let (fin, fout) = self.fade_handles(c);
+            if (x - fin).abs() <= FADE_HIT_PX {
+                Some((c.id, true))
+            } else if (x - fout).abs() <= FADE_HIT_PX {
+                Some((c.id, false))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// 选中的片段（`selected`）中部的关键帧小菱形：本地坐标 `(x, y)` 按在哪个上面就返回
+    /// （片段，关键帧相对片段起点的时间）；离得最近的那个，横竖各 [`KEY_HIT_PX`] 像素以内。
+    #[must_use]
+    pub fn keyframe_at(
+        &self,
+        x: f32,
+        y: f32,
+        timeline: &Timeline,
+        selected: &[ClipId],
+    ) -> Option<(ClipId, Time)> {
+        let i = self.track_index_at(y, timeline.tracks.len())?;
+        let mid = self.track_top(i) + self.row_height(i) / 2.0;
+        if (y - mid).abs() > KEY_HIT_PX {
+            return None;
+        }
+        timeline.tracks[i]
+            .clips
+            .iter()
+            .filter(|c| selected.contains(&c.id))
+            .flat_map(|c| {
+                let (left, right) = (self.time_to_x(c.start), self.time_to_x(c.end()));
+                c.animation.times().into_iter().map(move |t| {
+                    let kx = self
+                        .time_to_x(c.start + t)
+                        .clamp(left + KEY_INSET, (right - KEY_INSET).max(left + KEY_INSET));
+                    ((kx - x).abs(), c.id, t)
+                })
+            })
+            .filter(|(d, ..)| *d <= KEY_HIT_PX)
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, id, t)| (id, t))
     }
 
     /// 纵坐标落在哪条「缝」上：第 `i` 条缝是第 `i - 1` 和第 `i` 条轨道的分界（0 是第一条轨道的上沿，
     /// `track_count` 是最后一条的下沿）。分界上下 [`INSERT_BAND`] 像素内、或最后一条轨道下面的空白，
     /// 都算在缝上；拖片段到缝上松手会在那里新建轨道。
     #[must_use]
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss,
-        reason = "已排除负数，轨道数很少"
-    )]
     pub fn insert_slot(&self, y: f32, track_count: usize) -> Option<usize> {
         if y < self.ruler_height {
             return None;
         }
-        let rows = (y - self.ruler_height + self.scroll_y) / self.track_height;
-        if rows >= track_count as f32 {
+        let at = y - self.ruler_height + self.scroll_y;
+        if at >= self.rows_height(track_count) {
             return Some(track_count);
         }
-        let nearest = rows.round();
-        ((rows - nearest).abs() * self.track_height <= INSERT_BAND).then_some(nearest as usize)
+        // 离得最近的那条缝（第 k 条缝在前 k 条轨道的下沿）
+        (0..=track_count)
+            .map(|k| (k, (self.rows_height(k) - at).abs()))
+            .filter(|&(_, d)| d <= INSERT_BAND)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(k, _)| k)
     }
 
     /// 内容总高（标尺 + 轨道）。
     #[must_use]
-    #[expect(clippy::cast_precision_loss, reason = "轨道数很少")]
     pub fn content_height(&self, track_count: usize) -> f32 {
-        self.ruler_height + self.track_height * track_count as f32
+        self.ruler_height + self.rows_height(track_count)
     }
 
     /// 命中检测。
@@ -234,7 +363,7 @@ impl TimelineGeometry {
             .enumerate()
             .filter(|(i, _)| {
                 let y0 = self.track_top(*i);
-                y0 < bottom && y0 + self.track_height > top
+                y0 < bottom && y0 + self.row_height(*i) > top
             })
             .flat_map(|(_, t)| t.clips.iter())
             .filter(|c| self.time_to_x(c.start) < right && self.time_to_x(c.end()) > left)
@@ -253,9 +382,8 @@ impl TimelineGeometry {
 
     /// 第 `i` 条轨道顶边的纵坐标（算上纵向滚动）。
     #[must_use]
-    #[expect(clippy::cast_precision_loss, reason = "轨道数很少")]
     pub fn track_top(&self, i: usize) -> f32 {
-        self.ruler_height + self.track_height * i as f32 - self.scroll_y
+        self.ruler_height + self.rows_height(i) - self.scroll_y
     }
 
     /// 纵向滚动，夹在「刚好露出最后一条轨」以内；放得下时不滚。
@@ -432,6 +560,46 @@ mod tests {
             scroll_x: 0.0,
             ..TimelineGeometry::default()
         }
+    }
+
+    #[test]
+    fn effect_only_and_text_tracks_are_shorter_rows() {
+        let (mut p, _) = sample_project();
+        ve_core::edit::add_adjustment(&mut p, Time::ZERO, Time::from_secs(2)).unwrap();
+        let mut g = geo();
+        g.sync_rows(&p.timeline);
+        let tl = &p.timeline;
+        let h = g.track_height;
+        let heights: Vec<f32> = (0..tl.tracks.len()).map(|i| g.row_height(i)).collect();
+        for (i, t) in tl.tracks.iter().enumerate() {
+            let want = if t.kind == ve_core::TrackKind::Subtitle {
+                h * TEXT_ROW
+            } else if t.kind == ve_core::TrackKind::Video
+                && t.clips.iter().all(|c| c.is_overlay_tool())
+            {
+                h * THIN_ROW
+            } else {
+                h
+            };
+            assert!(
+                (heights[i] - want).abs() < 1e-3,
+                "第 {i} 条 {:?}：{heights:?}",
+                t.kind
+            );
+        }
+        assert!(
+            heights.iter().any(|&x| (x - h * THIN_ROW).abs() < 1e-3),
+            "调节轨是细条"
+        );
+        // 行的位置、点中哪条、总高都按各自的高度算
+        let mut top = g.ruler_height;
+        for (i, &rh) in heights.iter().enumerate() {
+            assert!((g.track_top(i) - top).abs() < 1e-3);
+            assert_eq!(g.track_index_at(top + rh - 1.0, heights.len()), Some(i));
+            top += rh;
+        }
+        assert!((g.content_height(heights.len()) - top).abs() < 1e-3);
+        assert_eq!(g.insert_slot(g.track_top(1) + 1.0, heights.len()), Some(1));
     }
 
     #[test]

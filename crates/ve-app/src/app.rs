@@ -1,25 +1,21 @@
 //! 启动：初始化组件库、主题、快捷键、播放引擎，打开主窗口。
 
 use crate::{actions, theme, workspace};
-use gpui_kit::{App, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
+use gpui_kit::{App, Bounds, WindowBounds, WindowOptions, px, size};
 use std::path::PathBuf;
 use ve_engine::{Engine, EngineConfig};
 
-/// 主窗口选项。
+/// 主窗口选项：不要系统标题栏（剪映），顶栏自己画最小化 / 最大化 / 关闭，空白处拖动窗口。
 #[must_use]
 pub fn window_options(cx: &App) -> WindowOptions {
     WindowOptions {
-        titlebar: Some(TitlebarOptions {
-            title: Some("视频剪辑器".into()),
-            ..Default::default()
-        }),
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
             size(px(1440.), px(900.)),
             cx,
         ))),
         window_min_size: Some(size(px(960.), px(600.))),
-        ..Default::default()
+        ..gpui_kit::component::TitleBar::window_options()
     }
 }
 
@@ -42,9 +38,12 @@ pub struct Args {
     pub bench_seconds: Option<u64>,
     /// 播放性能测试时把素材铺成几层（见 `ve_core::bench`），默认 1。
     pub bench_layers: usize,
+    /// 截图核对用：打开后选中第一段视频、切到这个面板（见 `Workspace::show_panel`）。
+    pub show: Option<String>,
 }
 
-/// 解析命令行：`ve-app [工程.vep] [素材...] [--bench-playback 素材 --seconds N --layers N]`。
+/// 解析命令行：`ve-app [工程.vep] [素材...] [--bench-playback 素材 --seconds N --layers N]
+/// [--show 面板]`。
 #[must_use]
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Args {
     let mut out = Args::default();
@@ -57,6 +56,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Args {
             }
             "--seconds" => out.bench_seconds = it.next().and_then(|s| s.parse().ok()),
             "--layers" => out.bench_layers = it.next().and_then(|s| s.parse().ok()).unwrap_or(1),
+            "--show" => out.show = it.next(),
             _ if a.to_ascii_lowercase().ends_with(".vep") => out.project = Some(PathBuf::from(a)),
             _ => out.media.push(PathBuf::from(a)),
         }
@@ -103,6 +103,12 @@ pub fn run() {
                             log::warn!("插件目录建不了：{e}");
                         }
                         ws.use_plugin_dir(dir, window, cx);
+                        // 没带工程、素材启动：先进草稿首页（剪映）
+                        if args.project.is_none() && args.media.is_empty() {
+                            ws.show_home(cx);
+                        }
+                        // 第一次打开：新手引导（等这一轮更新完再弹，主窗口还在搭）
+                        cx.defer_in(window, workspace::Workspace::show_guide_if_new);
                         ws.enable_recovery(
                             crate::recovery::Sessions::new(
                                 crate::recovery::Sessions::default_dir(),
@@ -145,6 +151,10 @@ mod tests {
             (vec![PathBuf::from("z.mp4")], Some(30))
         );
         assert_eq!(args(&["--bench-playback", "z.mp4"]).bench_seconds, Some(10));
+        assert_eq!(
+            args(&["p.vep", "--show", "mask"]).show.as_deref(),
+            Some("mask")
+        );
         assert_eq!(
             args(&["--bench-playback", "z.mp4", "--layers", "3"]).bench_layers,
             3

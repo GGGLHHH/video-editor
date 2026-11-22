@@ -70,6 +70,52 @@ pub struct Layer<'a> {
     pub look: ve_core::Look,
     /// 整条调色链（用到进阶调色时才有）：烘焙成 3D 查找表逐像素查，不再用 `color`。
     pub grades: &'a [ve_core::GradeStep],
+    /// 锐化、颗粒、暗角。
+    pub detail: ve_core::Detail,
+}
+
+/// 另外几个蒙版（[`ve_core::Look::extra_masks`]）：每个实例一条，放在存储缓冲里（实例顶点属性的
+/// 16 个槽已经用满）。第 0 个 `vec4` 的 x 是有几个，之后每个蒙版三个 `vec4`：
+/// （中心 x、y、半宽、半高）、（旋转、羽化、圆角、反转）、（形状，0，0，0）。
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ExtraMasks {
+    v: [[f32; 4]; 1 + 3 * (ve_core::look::MAX_MASKS - 1)],
+}
+
+/// 蒙版换算成着色器要的（形状编号，中心和半宽高，旋转羽化圆角反转）。
+fn mask_params(m: &ve_core::Mask, w: f32, h: f32) -> (f32, [f32; 4], [f32; 4]) {
+    let half_min = w.min(h) / 2.0;
+    let (hw, hh) = (m.width * w / 2.0, m.height * h / 2.0);
+    #[expect(clippy::cast_precision_loss, reason = "形状编号很小")]
+    let shape = m.shape.code() as f32;
+    (
+        shape,
+        [w * (0.5 + m.x), h * (0.5 + m.y), hw, hh],
+        [
+            m.rotation.to_radians(),
+            m.feather * half_min,
+            m.round * hw.min(hh),
+            if m.invert { 1.0 } else { 0.0 },
+        ],
+    )
+}
+
+/// 一层另外几个蒙版的记录。
+fn extra_masks(look: &ve_core::Look, w: f32, h: f32) -> ExtraMasks {
+    let mut out = ExtraMasks::zeroed();
+    let mut used = 0usize;
+    for m in look.extra_masks.iter().flatten() {
+        let (shape, center, more) = mask_params(m, w, h);
+        out.v[1 + used * 3] = center;
+        out.v[2 + used * 3] = more;
+        out.v[3 + used * 3] = [shape, 0.0, 0.0, 0.0];
+        used += 1;
+    }
+    #[expect(clippy::cast_precision_loss, reason = "最多三个")]
+    let count = used as f32;
+    out.v[0] = [count, 0.0, 0.0, 0.0];
+    out
 }
 
 /// 每层的参数，作为实例顶点数据传给着色器。
@@ -103,13 +149,15 @@ struct LayerInstance {
     key: [f32; 4],
     /// 高阈值、开没开。
     key2: [f32; 4],
+    /// 锐化、颗粒、暗角、颗粒种子。
+    detail: [f32; 4],
 }
 
-const INSTANCE_ATTRS: [wgpu::VertexAttribute; 15] = wgpu::vertex_attr_array![
+const INSTANCE_ATTRS: [wgpu::VertexAttribute; 16] = wgpu::vertex_attr_array![
     0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4,
     4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4,
     8 => Float32x4, 9 => Float32x4, 10 => Float32x4, 11 => Float32x4,
-    12 => Float32x4, 13 => Float32x4, 14 => Float32x4
+    12 => Float32x4, 13 => Float32x4, 14 => Float32x4, 15 => Float32x4
 ];
 
 /// 外观换成着色器参数（`size` 是显示部分的像素大小，`short` 是画布短边，`angle` 是图层旋转角）。
@@ -132,21 +180,9 @@ fn look_params(look: &ve_core::Look, size: (f32, f32), short: f32, angle: f32) -
         let [r, g, b, _] = rgb(s.color);
         ([r, g, b, s.opacity], off, s.blur * short)
     });
-    let (mask_shape, mask, mask2) = look.mask.map_or((-1.0, [0.0; 4], [0.0; 4]), |m| {
-        let (hw, hh) = (m.width * w / 2.0, m.height * h / 2.0);
-        #[expect(clippy::cast_precision_loss, reason = "形状编号很小")]
-        let shape = m.shape.code() as f32;
-        (
-            shape,
-            [w * (0.5 + m.x), h * (0.5 + m.y), hw, hh],
-            [
-                m.rotation.to_radians(),
-                m.feather * half_min,
-                m.round * hw.min(hh),
-                if m.invert { 1.0 } else { 0.0 },
-            ],
-        )
-    });
+    let (mask_shape, mask, mask2) = look
+        .mask
+        .map_or((-1.0, [0.0; 4], [0.0; 4]), |m| mask_params(&m, w, h));
     let (key, key2) = look.chroma.map_or(([0.0; 4], [0.0; 4]), |k| {
         let (lo, hi) = k.thresholds();
         let [r, g, b, _] = rgb(k.color);
@@ -296,6 +332,7 @@ pub struct Compositor {
     layout: wgpu::BindGroupLayout,
     backdrop_layout: wgpu::BindGroupLayout,
     lut_layout: wgpu::BindGroupLayout,
+    extras_layout: wgpu::BindGroupLayout,
     lut_sampler: wgpu::Sampler,
     /// 不用查找表的图层绑的占位表。
     no_lut: wgpu::BindGroup,
@@ -309,6 +346,8 @@ pub struct Compositor {
     slots: Vec<Slot>,
     /// 各层参数（实例顶点缓冲）和容量，不够时重建。
     instances: Option<(wgpu::Buffer, usize)>,
+    /// 另外几个蒙版的存储缓冲、它的绑定组和容量（条数），不够时重建。
+    extras: Option<(wgpu::Buffer, wgpu::BindGroup, usize)>,
     target: Option<Target>,
     nv12: Option<Nv12Pipelines>,
     nv12_target: Option<Nv12Target>,
@@ -345,6 +384,7 @@ impl Drop for Compositor {
         self.nv12_target = None;
         self.target = None;
         self.instances = None;
+        self.extras = None;
         self.slots.clear();
         self.luts.clear();
     }
@@ -412,6 +452,7 @@ struct Gpu {
     layout: wgpu::BindGroupLayout,
     backdrop_layout: wgpu::BindGroupLayout,
     lut_layout: wgpu::BindGroupLayout,
+    extras_layout: wgpu::BindGroupLayout,
     lut_sampler: wgpu::Sampler,
     no_lut: wgpu::BindGroup,
     sampler: wgpu::Sampler,
@@ -507,7 +548,8 @@ fn build_gpu((device, queue, adapter, cpu): DeviceParts) -> Gpu {
     let layout = layer_bind_layout(&device);
     let backdrop_layout = backdrop_bind_layout(&device);
     let lut_layout = lut_bind_layout(&device);
-    let layouts = [&layout, &backdrop_layout, &lut_layout];
+    let extras_layout = extras_bind_layout(&device);
+    let layouts = [&layout, &backdrop_layout, &lut_layout, &extras_layout];
     let pipeline = compose_pipeline(&device, layouts, Pass::Normal);
     let blend_pipeline = compose_pipeline(&device, layouts, Pass::Blend);
     let effect_pipeline = compose_pipeline(&device, layouts, Pass::Effect);
@@ -564,6 +606,7 @@ fn build_gpu((device, queue, adapter, cpu): DeviceParts) -> Gpu {
         layout,
         backdrop_layout,
         lut_layout,
+        extras_layout,
         lut_sampler,
         no_lut,
         sampler,
@@ -630,6 +673,23 @@ fn layer_bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 count: None,
             },
         ],
+    })
+}
+
+/// 另外几个蒙版的存储缓冲（第 3 组）。
+fn extras_bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("extra-masks"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
     })
 }
 
@@ -755,7 +815,7 @@ enum Pass {
 
 fn compose_pipeline(
     device: &wgpu::Device,
-    layouts: [&wgpu::BindGroupLayout; 3],
+    layouts: [&wgpu::BindGroupLayout; 4],
     pass: Pass,
 ) -> wgpu::RenderPipeline {
     let entry = match pass {
@@ -775,19 +835,19 @@ fn compose_pipeline(
 /// 用源码 `source` 的入口 `entry` 建一条合成管线（`blend` 为真时预乘透明叠加，否则直接写回）。
 fn pipeline_from(
     device: &wgpu::Device,
-    layouts: [&wgpu::BindGroupLayout; 3],
+    layouts: [&wgpu::BindGroupLayout; 4],
     source: &str,
     entry: &str,
     blend: bool,
 ) -> wgpu::RenderPipeline {
-    let [layout, backdrop, lut] = layouts;
+    let [layout, backdrop, lut, extras] = layouts;
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("compose"),
         source: wgpu::ShaderSource::Wgsl(source.into()),
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("compose"),
-        bind_group_layouts: &[Some(layout), Some(backdrop), Some(lut)],
+        bind_group_layouts: &[Some(layout), Some(backdrop), Some(lut), Some(extras)],
         ..Default::default()
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -894,6 +954,7 @@ impl Compositor {
             layout,
             backdrop_layout,
             lut_layout,
+            extras_layout,
             lut_sampler,
             no_lut,
             sampler,
@@ -914,6 +975,7 @@ impl Compositor {
             layout,
             backdrop_layout,
             lut_layout,
+            extras_layout,
             lut_sampler,
             no_lut,
             luts: std::collections::HashMap::new(),
@@ -922,6 +984,7 @@ impl Compositor {
             sampler,
             slots: Vec::new(),
             instances: None,
+            extras: None,
             target: None,
             nv12: None,
             nv12_target: None,
@@ -1065,6 +1128,7 @@ impl Compositor {
         let (cw, ch) = (f64::from(size.0), f64::from(size.1));
         let short = to_f32(cw.min(ch));
         let mut instances = Vec::with_capacity(layers.len());
+        let mut extras = Vec::with_capacity(layers.len());
         self.blended.clear();
         self.layer_luts.clear();
         for (i, layer) in layers.iter().enumerate() {
@@ -1131,6 +1195,7 @@ impl Compositor {
                 self.luts.insert(key, bind);
             }
             self.layer_luts.push(lut);
+            extras.push(extra_masks(&layer.look, shown.w, shown.h));
             instances.push(LayerInstance {
                 top: [tl.0, tl.1, tr.0, tr.1],
                 bottom: [bl.0, bl.1, br.0, br.1],
@@ -1162,10 +1227,17 @@ impl Compositor {
                     if lut.is_some() { 1.0 } else { 0.0 },
                     0.0,
                 ],
+                detail: [
+                    layer.detail.sharpen,
+                    layer.detail.grain,
+                    layer.detail.vignette,
+                    layer.detail.seed,
+                ],
             });
         }
         // 画面特效：每道一个铺满画布的四边形，参数是（种类、强度、秒数）
         for e in &self.effects {
+            extras.push(ExtraMasks::zeroed());
             instances.push(LayerInstance {
                 top: [-1.0, 1.0, 1.0, 1.0],
                 bottom: [-1.0, -1.0, 1.0, -1.0],
@@ -1175,7 +1247,37 @@ impl Compositor {
             });
         }
         self.write_instances(&instances);
+        self.write_extras(&extras);
         Ok(())
+    }
+
+    /// 写各层另外几个蒙版；容量不够时按 2 的幂重建缓冲和绑定组（至少一条，空缓冲不能绑）。
+    fn write_extras(&mut self, extras: &[ExtraMasks]) {
+        let need = extras.len().max(1);
+        if self.extras.as_ref().is_none_or(|(_, _, cap)| *cap < need) {
+            let cap = need.next_power_of_two();
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("extra-masks"),
+                size: (cap * size_of::<ExtraMasks>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("extra-masks"),
+                layout: &self.extras_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                }],
+            });
+            self.extras = Some((buffer, bind, cap));
+        }
+        if let Some((buffer, ..)) = &self.extras
+            && !extras.is_empty()
+        {
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(extras));
+        }
     }
 
     /// 写各层参数；容量不够时按 2 的幂重建缓冲。
@@ -1419,6 +1521,9 @@ impl Compositor {
             pass.set_pipeline(&self.pipeline);
             pass.set_vertex_buffer(0, instances.slice(..));
             pass.set_bind_group(1, &target.backdrop_bind, &[]);
+            if let Some((_, extras, _)) = &self.extras {
+                pass.set_bind_group(3, extras, &[]);
+            }
             for i in start..end {
                 let n = u32::try_from(i).unwrap_or(u32::MAX);
                 pass.set_bind_group(0, &self.slots[i].bind, &[]);
@@ -1533,7 +1638,12 @@ impl Compositor {
                 // 显卡后端（DX12 的着色器编译器）编不过的算内部错误，也要接住
                 let internal = self.device.push_error_scope(wgpu::ErrorFilter::Internal);
                 let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-                let layouts = [&self.layout, &self.backdrop_layout, &self.lut_layout];
+                let layouts = [
+                    &self.layout,
+                    &self.backdrop_layout,
+                    &self.lut_layout,
+                    &self.extras_layout,
+                ];
                 let full = crate::plugin::full_source(&source);
                 let pipeline = pipeline_from(
                     &self.device,
@@ -1581,6 +1691,9 @@ impl Compositor {
         };
         pass.set_bind_group(2, lut, &[]);
         pass.set_bind_group(1, &target.backdrop_bind, &[]);
+        if let Some((_, extras, _)) = &self.extras {
+            pass.set_bind_group(3, extras, &[]);
+        }
         pass.draw(0..6, n..n + 1);
     }
 
@@ -2046,6 +2159,7 @@ mod tests {
             color: ve_core::ColorMatrix::IDENTITY,
             look: ve_core::Look::NONE,
             grades: &[],
+            detail: ve_core::Detail::default(),
         }
     }
 
@@ -2367,6 +2481,7 @@ mod tests {
             ..ve_core::ColorAdjust::NONE
         };
         let chain = vec![ve_core::GradeStep {
+            tone: None,
             input: None,
             matrix: warm.matrix(),
             grade: Some(Arc::new(g)),
@@ -2395,12 +2510,145 @@ mod tests {
     }
 
     #[test]
+    fn several_masks_show_what_any_of_them_keeps() {
+        use ve_core::{Mask, MaskShape};
+        let mut c = compositor();
+        let white = solid(2, 2, [255; 4]);
+        let rect = |x: f32| Mask {
+            x,
+            width: 0.3,
+            height: 1.0,
+            ..Mask::new(MaskShape::Rectangle)
+        };
+        let look = ve_core::Look {
+            mask: Some(rect(-0.3)),
+            extra_masks: [Some(rect(0.3)), None, None],
+            ..ve_core::Look::NONE
+        };
+        let out = compose(&mut c, &[with_look(layer(&white, 2, 2, FULL, 1.0), look)]);
+        assert!(near(px(&out, 13, 18), [255, 255, 255], 2), "左边蒙版留下的");
+        assert!(near(px(&out, 51, 18), [255, 255, 255], 2), "右边蒙版留下的");
+        assert!(near(px(&out, 32, 18), [0, 0, 0], 2), "两个都没留的中间");
+        // 第二个蒙版反转：除了它的那一块，别的地方都留下
+        let inv = ve_core::Look {
+            extra_masks: [
+                Some(Mask {
+                    invert: true,
+                    ..rect(0.3)
+                }),
+                None,
+                None,
+            ],
+            ..look
+        };
+        let inverted = compose(&mut c, &[with_look(layer(&white, 2, 2, FULL, 1.0), inv)]);
+        assert!(near(px(&inverted, 32, 18), [255, 255, 255], 2));
+        assert!(
+            near(px(&inverted, 51, 18), [0, 0, 0], 2),
+            "只有两个都不留的地方没了"
+        );
+    }
+
+    #[test]
+    fn vignette_grain_and_sharpen_run_in_the_shader() {
+        let mut c = compositor();
+        let gray = solid(64, 36, [128, 128, 128, 255]);
+        // 暗角：四角暗、中间不变
+        let mut vig = layer(&gray, 64, 36, FULL, 1.0);
+        vig.detail = ve_core::Detail {
+            vignette: 1.0,
+            ..ve_core::Detail::default()
+        };
+        let out = compose(&mut c, &[vig]);
+        assert!(
+            near(px(&out, 32, 18), [128, 128, 128], 2),
+            "{:?}",
+            px(&out, 32, 18)
+        );
+        assert!(px(&out, 0, 0)[0] < 60, "{:?}", px(&out, 0, 0));
+        // 颗粒：平的灰变得有起伏，换个种子图案就变
+        let mut grainy = layer(&gray, 64, 36, FULL, 1.0);
+        grainy.detail = ve_core::Detail {
+            grain: 1.0,
+            ..ve_core::Detail::default()
+        };
+        let first = compose(&mut c, &[grainy]);
+        let values: std::collections::HashSet<u8> = first.chunks(4).map(|p| p[0]).collect();
+        assert!(values.len() > 5, "{values:?}");
+        let mut reseeded = layer(&gray, 64, 36, FULL, 1.0);
+        reseeded.detail = ve_core::Detail {
+            grain: 1.0,
+            seed: 7.0,
+            ..ve_core::Detail::default()
+        };
+        assert_ne!(compose(&mut c, &[reseeded]), first);
+        // 锐化：左黑右白的竖边两边拉开
+        let mut edge = Vec::new();
+        for _ in 0..36 {
+            for x in 0..64 {
+                let v = if x < 32 { 64 } else { 192 };
+                edge.extend([v, v, v, 255]);
+            }
+        }
+        let plain = compose(&mut c, &[layer(&edge, 64, 36, FULL, 1.0)]);
+        let mut sharpened = layer(&edge, 64, 36, FULL, 1.0);
+        sharpened.detail = ve_core::Detail {
+            sharpen: 1.0,
+            ..ve_core::Detail::default()
+        };
+        let sharp = compose(&mut c, &[sharpened]);
+        assert!(
+            px(&sharp, 31, 18)[0] < px(&plain, 31, 18)[0],
+            "暗的一边更暗"
+        );
+        assert!(
+            px(&sharp, 32, 18)[0] > px(&plain, 32, 18)[0],
+            "亮的一边更亮"
+        );
+        assert!(near(px(&sharp, 10, 18), [64, 64, 64], 1), "平的地方不变");
+    }
+
+    #[test]
+    fn tone_items_match_the_cpu_chain() {
+        let mut c = compositor();
+        let data = solid(64, 36, [40, 60, 80, 255]);
+        let tone = ve_core::ColorAdjust {
+            shadows: 0.8,
+            light: 0.5,
+            ..ve_core::ColorAdjust::NONE
+        };
+        let chain = vec![ve_core::GradeStep {
+            input: None,
+            matrix: tone.matrix(),
+            tone: tone.tone(),
+            grade: None,
+        }];
+        let mut l = layer(&data, 64, 36, FULL, 1.0);
+        l.grades = &chain;
+        let out = compose(&mut c, &[l]);
+        let want = ve_core::grade::apply_chain(&chain, [80.0 / 255.0, 60.0 / 255.0, 40.0 / 255.0]);
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "0–1 的颜色"
+        )]
+        let want = [want[2], want[1], want[0]].map(|v| (v * 255.0).round() as u8);
+        assert!(
+            near(px(&out, 32, 18), want, 3),
+            "{:?} / {want:?}",
+            px(&out, 32, 18)
+        );
+        assert!(px(&out, 32, 18)[2] > 90, "阴影、光感提亮了");
+    }
+
+    #[test]
     fn background_follows_the_adjustment_chain() {
         use std::sync::Arc;
         let mut c = compositor();
         let mut g = ve_core::Grade::default();
         g.wheels.offset = [0.4, 0.0, 0.0];
         let chain = vec![ve_core::GradeStep {
+            tone: None,
             input: None,
             matrix: ve_core::ColorMatrix::IDENTITY,
             grade: Some(Arc::new(g)),
@@ -2578,6 +2826,7 @@ mod tests {
                 kind,
                 amount,
                 plugin: ve_core::effect::PluginName::EMPTY,
+                speed: ve_core::Effect::DEFAULT_SPEED,
             },
             seconds,
         }

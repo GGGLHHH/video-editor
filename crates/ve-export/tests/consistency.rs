@@ -139,6 +139,7 @@ fn exported_frame(p: &Project, width: u32, height: u32, t: Time) -> VideoFrame {
         output: ve_export::Output::Video,
         loudness_lufs: None,
         range: None,
+        video_audio: ve_export::VideoAudio::default(),
     };
     export(p, &settings, |_| {}, &AtomicBool::new(false)).unwrap();
     let mut d = VideoDecoder::open(

@@ -381,6 +381,7 @@ impl Worker<'_> {
                     color: l.color,
                     look: l.look,
                     grades: &l.grades,
+                    detail: l.detail,
                 })
             })
             .collect();

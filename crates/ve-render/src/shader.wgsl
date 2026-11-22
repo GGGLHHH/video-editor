@@ -12,6 +12,12 @@
 @group(1) @binding(0) var backdrop: texture_2d<f32>;
 @group(2) @binding(0) var lut: texture_3d<f32>;
 @group(2) @binding(1) var lut_samp: sampler;
+// 另外几个蒙版（实例属性的 16 个槽已经用满）：每个实例一条，v[0].x 是个数，
+// 之后每个蒙版三个 vec4：（中心、半宽高）、（旋转、羽化、圆角、反转）、（形状）
+struct ExtraMasks {
+    v: array<vec4<f32>, 10>,
+};
+@group(3) @binding(0) var<storage, read> extras: array<ExtraMasks>;
 
 struct Instance {
     @location(0) top: vec4<f32>,       // NDC：左上 xy、右上 xy
@@ -29,6 +35,7 @@ struct Instance {
     @location(12) mask2: vec4<f32>,    // 蒙版旋转（弧度）、羽化（像素）、圆角（像素）、反转
     @location(13) key: vec4<f32>,      // 色度抠图颜色 rgb、低阈值
     @location(14) key2: vec4<f32>,     // 高阈值、开没开、用不用查找表（进阶调色）
+    @location(15) detail: vec4<f32>,   // 锐化（0–1）、颗粒（0–1）、暗角（-1–1）、颗粒种子
 };
 
 struct VOut {
@@ -47,10 +54,12 @@ struct VOut {
     @location(11) @interpolate(flat) mask2: vec4<f32>,
     @location(12) @interpolate(flat) key: vec4<f32>,
     @location(13) @interpolate(flat) key2: vec4<f32>,
+    @location(14) @interpolate(flat) detail: vec4<f32>,
+    @location(15) @interpolate(flat) inst: u32,
 };
 
 @vertex
-fn vs(@builtin(vertex_index) i: u32, layer: Instance) -> VOut {
+fn vs(@builtin(vertex_index) i: u32, @builtin(instance_index) inst: u32, layer: Instance) -> VOut {
     var corners = array<vec2<f32>, 6>(
         vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
         vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0),
@@ -77,6 +86,8 @@ fn vs(@builtin(vertex_index) i: u32, layer: Instance) -> VOut {
     o.mask2 = layer.mask2;
     o.key = layer.key;
     o.key2 = layer.key2;
+    o.detail = layer.detail;
+    o.inst = inst;
     return o;
 }
 
@@ -123,13 +134,17 @@ fn sd_star5(p_in: vec2<f32>, r: f32, rf: f32) -> f32 {
 
 // 蒙版形状的有向距离（像素，外面为正；反转时里外对调）；没有蒙版时是很大的负数（处处都在里面）
 fn mask_sd(local: vec2<f32>, v: VOut) -> f32 {
-    let shape = v.shadow2.w;
+    return shape_sd(local, v.shadow2.w, v.mask, v.mask2);
+}
+
+// 一个蒙版的有向距离：形状编号（-1 = 没有）、（中心、半宽高）、（旋转、羽化、圆角、反转）
+fn shape_sd(local: vec2<f32>, shape: f32, mask: vec4<f32>, mask2: vec4<f32>) -> f32 {
     if shape < -0.5 {
         return -1e6;
     }
-    let hb = max(v.mask.zw, vec2(0.5));
-    let ang = v.mask2.x;
-    let d0 = local - v.mask.xy;
+    let hb = max(mask.zw, vec2(0.5));
+    let ang = mask2.x;
+    let d0 = local - mask.xy;
     // 转回蒙版自己的方向
     let p = vec2(d0.x * cos(ang) + d0.y * sin(ang), -d0.x * sin(ang) + d0.y * cos(ang));
     let s = min(hb.x, hb.y);
@@ -141,7 +156,7 @@ fn mask_sd(local: vec2<f32>, v: VOut) -> f32 {
     } else if shape < 2.5 {
         d = (length(p / hb) - 1.0) * s;             // 圆形（椭圆）
     } else if shape < 3.5 {
-        d = sd_round_box(p, hb, v.mask2.z);         // 矩形
+        d = sd_round_box(p, hb, mask2.z);           // 矩形
     } else if shape < 4.5 {
         // 爱心：高 2*hb.y、宽 2*hb.x；iq 的爱心底尖在 0、顶在约 1.07、宽约 ±0.6
         let q = vec2(p.x / hb.x * 0.6, (-p.y / hb.y) * 0.54 + 0.5);
@@ -150,15 +165,38 @@ fn mask_sd(local: vec2<f32>, v: VOut) -> f32 {
         let q = vec2(p.x / hb.x, -p.y / hb.y);
         d = sd_star5(q, 1.0, 0.45) * s;
     }
-    if v.mask2.w > 0.5 {
+    if mask2.w > 0.5 {
         d = -d;
     }
     return d;
 }
 
+// 所有蒙版合起来（并集）的有向距离：取最小的（描边、阴影贴着它）
+fn masks_sd(local: vec2<f32>, v: VOut) -> f32 {
+    var d = mask_sd(local, v);
+    let e = extras[v.inst];
+    let n = i32(e.v[0].x + 0.5);
+    for (var k = 0; k < n; k = k + 1) {
+        d = min(d, shape_sd(local, e.v[3 + k * 3].x, e.v[1 + k * 3], e.v[2 + k * 3]));
+    }
+    return d;
+}
+
+// 所有蒙版合起来留下的比例：每个按自己的羽化算，取最大的
+fn masks_alpha(local: vec2<f32>, v: VOut) -> f32 {
+    var a = mask_alpha(mask_sd(local, v), v.mask2.y);
+    let e = extras[v.inst];
+    let n = i32(e.v[0].x + 0.5);
+    for (var k = 0; k < n; k = k + 1) {
+        let m2 = e.v[2 + k * 3];
+        a = max(a, mask_alpha(shape_sd(local, e.v[3 + k * 3].x, e.v[1 + k * 3], m2), m2.y));
+    }
+    return a;
+}
+
 // 蒙版留下的比例（0–1），按羽化渐变
-fn mask_alpha(d: f32, v: VOut) -> f32 {
-    let f = max(v.mask2.y, 0.75);
+fn mask_alpha(d: f32, feather: f32) -> f32 {
+    let f = max(feather, 0.75);
     return 1.0 - smoothstep(-f, f, d);
 }
 
@@ -178,15 +216,25 @@ fn layer_color(v: VOut) -> vec4<f32> {
     let half_size = size * 0.5;
     let radius = v.p0.w;
     let d_frame = sd_round_box(v.local - half_size, half_size, radius);
-    let d_mask = mask_sd(v.local, v);
+    let d_mask = masks_sd(v.local, v);
     // 画面的形状 = 框 ∩ 蒙版：描边、阴影都贴着它
     let d = max(d_frame, d_mask);
     // 画面本身：只在框里面取样（框外的纹理坐标落在裁剪区外面）
     let t = clamp(v.local / size, vec2(0.0), vec2(1.0));
     let uv = vec2(mix(v.uv.x, v.uv.z, t.x), mix(v.uv.y, v.uv.w, t.y));
-    let s = textureSampleLevel(tex, samp, uv, 0.0);
+    var s = textureSampleLevel(tex, samp, uv, 0.0);
+    // 锐化：减去上下左右四个邻点的平均（反锐化掩模），在预乘的值上做
+    if v.detail.x > 0.0 {
+        let texel = 1.0 / vec2<f32>(textureDimensions(tex));
+        let around = textureSampleLevel(tex, samp, uv + vec2(0.0, -texel.y), 0.0)
+            + textureSampleLevel(tex, samp, uv + vec2(0.0, texel.y), 0.0)
+            + textureSampleLevel(tex, samp, uv + vec2(-texel.x, 0.0), 0.0)
+            + textureSampleLevel(tex, samp, uv + vec2(texel.x, 0.0), 0.0);
+        let sharp = s.rgb + (s.rgb - around.rgb * 0.25) * (v.detail.x * 2.0);
+        s = vec4(clamp(sharp, vec3(0.0), vec3(s.a)), s.a);
+    }
     // 框内（圆角）和蒙版留下的比例
-    let cover = mask_alpha(d_mask, v) * clamp(0.5 - d_frame, 0.0, 1.0);
+    let cover = masks_alpha(v.local, v) * clamp(0.5 - d_frame, 0.0, 1.0);
     // 没调色、没抠像的图层直接用预乘的取样值（反预乘再预乘会让半透明边缘的颜色有误差）
     var c = s * cover;
     if (v.p0.y > 0.5 || v.key2.y > 0.5 || v.key2.z > 0.5) && s.a > 0.0 {
@@ -207,6 +255,22 @@ fn layer_color(v: VOut) -> vec4<f32> {
         }
         c = vec4(rgb * a, a);
     }
+    // 暗角：离中心越远越暗（负数是变亮的白边），按画面自己的范围算
+    if v.detail.z != 0.0 {
+        let dv = length(t - vec2(0.5)) * 1.41421356;
+        let w = smoothstep(0.25, 1.0, dv) * v.detail.z;
+        if w > 0.0 {
+            c = vec4(c.rgb * (1.0 - 0.85 * w), c.a);
+        } else {
+            c = vec4(mix(c.rgb, vec3(c.a), -0.85 * w), c.a);
+        }
+    }
+    // 颗粒：每个像素一个随机明暗，种子随素材时间变
+    if v.detail.y > 0.0 {
+        let p = floor(v.local) + vec2(v.detail.w * 13.0, v.detail.w * 7.0);
+        let n = fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
+        c = vec4(clamp(c.rgb + vec3(n * v.detail.y * 0.3 * c.a), vec3(0.0), vec3(c.a)), c.a);
+    }
     // 描边：框外一圈
     let w = v.sizes.w;
     if w > 0.0 {
@@ -216,7 +280,7 @@ fn layer_color(v: VOut) -> vec4<f32> {
     // 阴影：偏移过的框，按模糊半径渐隐
     if v.shadow.a > 0.0 {
         let q = v.local - v.shadow2.xy;
-        let ds = max(sd_round_box(q - half_size, half_size, radius), mask_sd(q, v));
+        let ds = max(sd_round_box(q - half_size, half_size, radius), masks_sd(q, v));
         let b = max(v.shadow2.z, 0.5);
         let sa = (1.0 - smoothstep(-b, b, ds)) * v.shadow.a;
         c = premul_over(c, vec4(v.shadow.rgb * sa, sa));

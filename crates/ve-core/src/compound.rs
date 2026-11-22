@@ -94,6 +94,9 @@ fn compound_clip(id: ClipId, start: Time, inner: Arc<Compound>) -> Clip {
         stabilized: None,
         input_space: None,
         parent: None,
+        audio_split: false,
+        motion: crate::motion::ClipMotion::NONE,
+        group: None,
     }
 }
 
@@ -226,6 +229,7 @@ fn window(
     let mut tl = crate::Timeline {
         tracks: vec![track.clone()],
         markers: Vec::new(),
+        marker_colors: Vec::new(),
         range: None,
         cover: None,
     };

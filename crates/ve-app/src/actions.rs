@@ -78,6 +78,35 @@ mod generated {
             ExportOtio,
             ExportEdl,
             ImportOtio,
+            NextEditPoint,
+            PrevEditPoint,
+            BigStepForward,
+            BigStepBack,
+            AddKeyframe,
+            ShowSpeed,
+            VolumeUp,
+            VolumeDown,
+            NextBinTab,
+            Quit,
+            ShowShortcuts,
+            About,
+            TrackTaller,
+            TrackShorter,
+            SeparateAudio,
+            PreviewZoomIn,
+            PreviewZoomOut,
+            PreviewZoomFit,
+            ToggleScrubAudio,
+            ShowHome,
+            ImportScript,
+            ExportStill,
+            MarkerColor,
+            ToggleGuides,
+            ExportSelection,
+            RevealInFolder,
+            GroupClips,
+            OpenCrop,
+            SaveAdjustPreset,
         ]
     );
 }
@@ -96,7 +125,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-n", NewProject, Some(CONTEXT)),
         KeyBinding::new("ctrl-o", Open, Some(CONTEXT)),
         KeyBinding::new("ctrl-s", Save, Some(CONTEXT)),
-        KeyBinding::new("ctrl-shift-s", SaveAs, Some(CONTEXT)),
+        // 剪映的 Ctrl+Shift+S 是「分离 / 还原音频」，另存为换到 Ctrl+Alt+S
+        KeyBinding::new("ctrl-alt-s", SaveAs, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-s", SeparateAudio, Some(NO_INPUT)),
         KeyBinding::new("ctrl-i", Import, Some(CONTEXT)),
         KeyBinding::new("ctrl-e", Export, Some(CONTEXT)),
         KeyBinding::new("ctrl-shift-f", ToggleFullscreen, Some(CONTEXT)),
@@ -153,6 +184,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("alt-shift-g", BreakCompound, Some(NO_INPUT)),
         // 剪映：M 添加标记，Shift+M / Alt+Shift+M 下一个 / 上一个标记
         KeyBinding::new("m", ToggleMarker, Some(NO_INPUT)),
+        // 剪映：Alt+M 换标记颜色
+        KeyBinding::new("alt-m", MarkerColor, Some(NO_INPUT)),
+        // 剪映：Ctrl+G 组合（已经是一组时取消组合）
+        KeyBinding::new("ctrl-g", GroupClips, Some(NO_INPUT)),
         KeyBinding::new("shift-m", NextMarker, Some(NO_INPUT)),
         KeyBinding::new("alt-shift-m", PrevMarker, Some(NO_INPUT)),
         KeyBinding::new("`", ToggleLinkage, Some(NO_INPUT)),
@@ -162,5 +197,28 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-x", RangeFromClips, Some(NO_INPUT)),
         KeyBinding::new("alt-x", ClearRange, Some(NO_INPUT)),
         KeyBinding::new("shift-enter", PlayRange, Some(NO_INPUT)),
+    ]);
+    cx.bind_keys([
+        // 剪映：↑ / ↓ 上一个 / 下一个分割点，Shift+← / → 大步移动，Shift+Alt+K 添加关键帧，
+        // Ctrl+R 唤起变速面板，Ctrl+. / Ctrl+, 音量 ±0.1 dB，Tab 切换素材面板，Ctrl+Q 退出
+        KeyBinding::new("up", PrevEditPoint, Some(NO_INPUT)),
+        KeyBinding::new("down", NextEditPoint, Some(NO_INPUT)),
+        KeyBinding::new("shift-right", BigStepForward, Some(NO_INPUT)),
+        KeyBinding::new("shift-left", BigStepBack, Some(NO_INPUT)),
+        KeyBinding::new("shift-alt-k", AddKeyframe, Some(NO_INPUT)),
+        KeyBinding::new("ctrl-r", ShowSpeed, Some(NO_INPUT)),
+        KeyBinding::new("ctrl-.", VolumeUp, Some(NO_INPUT)),
+        KeyBinding::new("ctrl-,", VolumeDown, Some(NO_INPUT)),
+        KeyBinding::new("tab", NextBinTab, Some(NO_INPUT)),
+        KeyBinding::new("ctrl-q", Quit, Some(CONTEXT)),
+        // 剪映：Ctrl+Alt+= / Ctrl+Alt+- 增高 / 降低轨道高度
+        KeyBinding::new("ctrl-alt-=", TrackTaller, Some(NO_INPUT)),
+        KeyBinding::new("ctrl-alt--", TrackShorter, Some(NO_INPUT)),
+        // 剪映：Alt+Shift+= / - 放大 / 缩小预览画面，Alt+Shift+Z 回到适应窗口
+        KeyBinding::new("alt-shift-=", PreviewZoomIn, Some(NO_INPUT)),
+        KeyBinding::new("alt-shift--", PreviewZoomOut, Some(NO_INPUT)),
+        KeyBinding::new("alt-shift-z", PreviewZoomFit, Some(NO_INPUT)),
+        // 剪映：Ctrl+; 参考线
+        KeyBinding::new("ctrl-;", ToggleGuides, Some(NO_INPUT)),
     ]);
 }

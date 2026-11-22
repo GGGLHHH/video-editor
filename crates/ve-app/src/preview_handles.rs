@@ -331,8 +331,8 @@ pub fn drag_scale(
     }
 }
 
-/// 拖边中点缩放：以整幅画面框的中心为基准等比缩放，缩放比 = 指针在「中心 → 这条边中点」方向上的投影
-/// / 这条边中点原来到中心的距离（沿边拖动不改变大小）。
+/// 拖边中点单向拉伸（剪映）：以整幅画面框的中心为基准，只拉这条边的方向——左右边只改宽、上下边只改高。
+/// 拉伸比 = 指针在「中心 → 这条边中点」方向上的投影 / 这条边中点原来到中心的距离（沿边拖动不变）。
 #[must_use]
 pub fn drag_scale_edge(
     start: &Transform,
@@ -346,9 +346,24 @@ pub fn drag_scale_edge(
     let len2 = n.0.mul_add(n.0, n.1 * n.1);
     let along = (p.0 - c.0).mul_add(n.0, (p.1 - c.1) * n.1);
     let ratio = if len2 > 0.0 { along / len2 } else { 1.0 };
-    Transform {
-        scale: (start.scale * ratio).clamp(Transform::SCALE_RANGE.0, Transform::SCALE_RANGE.1),
-        ..*start
+    let (lo, hi) = Transform::STRETCH_RANGE;
+    match edge {
+        Edge::Left | Edge::Right => {
+            // 宽乘 ratio、高不变：scale 变，stretch 反过来补
+            let height = start.scale * start.stretch;
+            let scale =
+                (start.scale * ratio).clamp(Transform::SCALE_RANGE.0, Transform::SCALE_RANGE.1);
+            let stretch = (height / scale).clamp(lo, hi);
+            Transform {
+                scale,
+                stretch,
+                ..*start
+            }
+        }
+        Edge::Top | Edge::Bottom => Transform {
+            stretch: (start.stretch * ratio).clamp(lo, hi),
+            ..*start
+        },
     }
 }
 
@@ -679,14 +694,19 @@ mod tests {
     }
 
     #[test]
-    fn edge_drag_scales_uniformly_along_its_normal() {
+    fn edge_drag_stretches_one_direction_only() {
         let (t, g) = half();
-        // 右边中点 (750, 250) 拖到 (875, 300)：沿法线方向是中心外 375（原来 250），放大 1.5 倍
+        // 右边中点 (750, 250) 拖到 (875, 300)：沿法线方向是中心外 375（原来 250），宽变 1.5 倍、高不变
         let out = drag_scale_edge(&t, &g, Edge::Right, (875.0, 300.0));
         assert!((out.scale - 0.75).abs() < 1e-6, "{out:?}");
-        // 上边中点 (500, 125) 往下拖到 (520, 187.5)：离中心只剩一半
+        assert!(
+            (out.scale * out.stretch - 0.5).abs() < 1e-6,
+            "高不变 {out:?}"
+        );
+        // 上边中点 (500, 125) 往下拖到 (520, 187.5)：高只剩一半、宽不变
         let out = drag_scale_edge(&t, &g, Edge::Top, (520.0, 187.5));
-        assert!((out.scale - 0.25).abs() < 1e-6, "{out:?}");
+        assert!((out.scale - 0.5).abs() < 1e-6, "{out:?}");
+        assert!((out.stretch - 0.5).abs() < 1e-6, "{out:?}");
         assert_eq!(edge_cursor(&g, Edge::Top), CursorStyle::ResizeUpDown);
         assert_eq!(edge_cursor(&g, Edge::Left), CursorStyle::ResizeLeftRight);
         assert_eq!(
@@ -694,8 +714,8 @@ mod tests {
             CursorStyle::ResizeUpDown
         );
         // 拖过中心：缩到最小，不翻转
-        let flipped = drag_scale_edge(&t, &g, Edge::Right, (100.0, 250.0));
-        assert_eq!(flipped.scale, Transform::SCALE_RANGE.0);
+        let flipped = drag_scale_edge(&t, &g, Edge::Bottom, (500.0, 100.0));
+        assert_eq!(flipped.stretch, Transform::STRETCH_RANGE.0);
     }
 
     #[test]

@@ -106,6 +106,16 @@ pub mod palette {
     pub fn waveform() -> Hsla {
         rgba(0xb8f5_d0cc).into()
     }
+    /// 音频淡入淡出那段压的阴影。
+    #[must_use]
+    pub fn fade_shade() -> Hsla {
+        rgba(0x0000_0066).into()
+    }
+    /// 视频片段底部那条波形的底色（压在缩略图上，波形看得清）。
+    #[must_use]
+    pub fn waveform_strip() -> Hsla {
+        rgba(0x0000_0099).into()
+    }
     /// 选中描边（剪映是白色细描边）。
     #[must_use]
     pub fn selection() -> Hsla {

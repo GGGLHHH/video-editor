@@ -28,6 +28,8 @@ pub struct LayerSource {
     /// 整条调色链（片段自己的，再接上压在它上面的调节片段）；只在用到进阶调色（HSL、曲线、
     /// 色轮、LUT）时才有，没有时按 [`Self::color`] 的矩阵调色。
     pub grades: crate::GradeChain,
+    /// 锐化、颗粒、暗角（片段自己的「调整」）。
+    pub detail: crate::adjust::Detail,
     /// 帧融合：慢放时把 `source_time` 前后两帧按时间混合（[`crate::Clip::blends_frames`]）。
     pub frame_blend: bool,
 }
@@ -130,7 +132,7 @@ pub fn resolve_frame(project: &Project, t: Time) -> Composition {
         }
         if let Some(effect) = clip.effect_at(t - clip.start) {
             #[expect(clippy::cast_possible_truncation, reason = "片段内的秒数")]
-            let seconds = (t - clip.start).as_secs_f64() as f32;
+            let seconds = (t - clip.start).as_secs_f64() as f32 * effect.time_scale();
             effects.push(crate::EffectPass {
                 after: out.len(),
                 effect,
@@ -140,12 +142,15 @@ pub fn resolve_frame(project: &Project, t: Time) -> Composition {
             continue;
         }
         if clip.is_adjustment() {
-            let m = clip.adjust_at(t - clip.start).matrix();
-            if !m.is_identity() || clip.grade.is_some() {
+            let a = clip.adjust_at(t - clip.start);
+            let m = a.matrix();
+            let grade = clip.grade_at(t - clip.start);
+            if !m.is_identity() || grade.is_some() || a.tone().is_some() {
                 let step = crate::GradeStep {
                     input: None,
                     matrix: m,
-                    grade: clip.grade.clone(),
+                    tone: a.tone(),
+                    grade,
                 };
                 background = background.then(&m);
                 background_grades.push(step.clone());
@@ -167,8 +172,11 @@ pub fn resolve_frame(project: &Project, t: Time) -> Composition {
     }
     grade_in_order(&mut out, &layer_parent_grades, &adjustments);
     // 整条链都没用进阶调色：只留矩阵（着色器走快的那条路）
-    let plain =
-        |chain: &crate::GradeChain| chain.iter().all(|s| s.grade.is_none() && s.input.is_none());
+    let plain = |chain: &crate::GradeChain| {
+        chain
+            .iter()
+            .all(|s| s.grade.is_none() && s.input.is_none() && s.tone.is_none())
+    };
     for l in &mut out {
         if plain(&l.grades) {
             l.grades.clear();
@@ -233,15 +241,18 @@ fn parent_grades(clip: &Clip, t: Time) -> Vec<ParentGrade> {
     let mut next = clip.parent.as_deref();
     while let Some(p) = next {
         let at = (t - p.start).clamp(Time::ZERO, p.duration);
-        let m = p.adjust_at(at).matrix();
-        if !m.is_identity() || p.grade.is_some() {
+        let a = p.adjust_at(at);
+        let m = a.matrix();
+        let grade = p.grade_at(at);
+        if !m.is_identity() || grade.is_some() || a.tone().is_some() {
             out.push(ParentGrade {
                 clip: p.id,
                 matrix: m,
                 step: crate::GradeStep {
                     input: None,
                     matrix: m,
-                    grade: p.grade.clone(),
+                    tone: a.tone(),
+                    grade,
                 },
             });
         }
@@ -341,15 +352,25 @@ fn layer_of(
         max_scale: clip
             .animation
             .max_value(crate::Prop::Scale)
-            .map_or(clip.transform.scale, |m| m.max(clip.transform.scale)),
+            .map_or(clip.transform.scale, |m| m.max(clip.transform.scale))
+            * clip.motion.max_scale()
+            * clip.transform.stretch.max(1.0),
         color: clip.adjust_at(offset).matrix(),
         lane: u8::from(index % 2 == 1),
         look: clip.look_at(offset),
         grades: vec![crate::GradeStep {
             input: clip.input_space,
             matrix: clip.adjust_at(offset).matrix(),
-            grade: clip.grade.clone(),
+            tone: clip.adjust_at(offset).tone(),
+            grade: clip.grade_at(offset),
         }],
+        detail: {
+            let a = clip.adjust_at(offset);
+            // 颗粒每 1/24 秒换一次图案
+            #[expect(clippy::cast_possible_truncation, reason = "0–96 的整数")]
+            let seed = ((clip.source_at(offset).as_secs_f64() * 24.0).floor() % 97.0) as f32;
+            crate::adjust::Detail { seed, ..a.detail() }
+        },
         frame_blend: clip.blends_frames(),
     })
 }
@@ -591,6 +612,23 @@ mod tests {
         assert_eq!(before[1].source_time, Time::from_secs(5), "v2 的素材起点");
         assert_eq!(resolve_layers(&p, Time::from_secs(6)).len(), 1, "转场之后");
         assert!(p.timeline.check_invariants(&p.assets).is_ok());
+    }
+
+    #[test]
+    fn tone_items_make_a_chain_and_detail_reaches_the_layer() {
+        use crate::edit::set_adjust;
+        let (mut p, ids) = sample_project();
+        let a = crate::ColorAdjust {
+            shadows: 0.5,
+            vignette: 0.3,
+            ..crate::ColorAdjust::NONE
+        };
+        set_adjust(&mut p, ids.v1, a).unwrap();
+        let f = resolve_frame(&p, Time::from_secs(1));
+        let l = &f.layers[0];
+        assert_eq!(l.grades.len(), 1, "高光阴影光感走查找表");
+        assert!(l.grades[0].tone.is_some());
+        assert!((l.detail.vignette - 0.3).abs() < 1e-6);
     }
 
     #[test]
@@ -864,5 +902,24 @@ mod tests {
         );
         // 组里一层都没画：丢掉
         assert_eq!(GroupPass::remap(&[g], &[true, false, false, true]), []);
+    }
+
+    #[test]
+    fn effect_speed_runs_the_effects_clock_faster_or_slower() {
+        let (mut p, _) = sample_project();
+        let mut fast = crate::Effect::new(crate::EffectKind::Grain);
+        fast.speed = 1.0;
+        let fx = crate::edit::add_effect(&mut p, Time::ZERO, Time::from_secs(4), fast).unwrap();
+        let secs = |proj: &Project| resolve_frame(proj, Time::from_secs(1)).effects[0].seconds;
+        // 速度拉满：4 倍
+        assert!((secs(&p) - 4.0).abs() < 1e-4, "{}", secs(&p));
+        // 默认（中间）：原速
+        let mut normal = fast;
+        normal.speed = crate::Effect::DEFAULT_SPEED;
+        crate::edit::set_effect(&mut p, fx, normal).unwrap();
+        assert!((secs(&p) - 1.0).abs() < 1e-4);
+        // 旧工程文件没有速度这一项：按原速读
+        let old: crate::Effect = serde_json::from_str(r#"{"kind":"Grain","amount":0.5}"#).unwrap();
+        assert!((old.speed - crate::Effect::DEFAULT_SPEED).abs() < 1e-6);
     }
 }

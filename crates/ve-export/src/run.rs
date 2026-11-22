@@ -1,6 +1,8 @@
 //! 执行导出：写临时文件、启动 ffmpeg、逐帧渲染画面写进它的标准输入、取消、NVENC 失败退回 x264。
 
-use crate::{Encoder, ExportError, ExportSettings, build_job, has_subtitles, write_ass};
+use crate::{
+    Encoder, ExportError, ExportSettings, VideoAudio, build_job, has_subtitles, write_ass,
+};
 use std::fmt::Write as _;
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -561,6 +563,7 @@ pub const fn default_settings(project: &Project, path: std::path::PathBuf) -> Ex
         output: crate::Output::Video,
         loudness_lufs: None,
         range: None,
+        video_audio: VideoAudio::DEFAULT,
     }
 }
 
@@ -606,6 +609,7 @@ mod tests {
             output: crate::Output::Video,
             loudness_lufs: None,
             range: None,
+            video_audio: VideoAudio::DEFAULT,
         }
     }
 
@@ -632,6 +636,43 @@ mod tests {
         assert!(r.audio.is_some());
         assert_eq!(progress.last().copied(), Some(1.0));
         assert!(progress.windows(2).all(|w| w[0] <= w[1]), "{progress:?}");
+    }
+
+    #[test]
+    fn av1_mp4_and_pcm_mov_exports_really_encode() {
+        let dir = tempfile::tempdir().unwrap();
+        // AV1：很小的画面（按画质编）和正常一点的画面（按码率编）
+        let tiny = ExportSettings {
+            codec: crate::Codec::Av1,
+            path: dir.path().join("av1-tiny.mp4"),
+            ..settings(dir.path(), Encoder::X264)
+        };
+        let av1 = ExportSettings {
+            width: 160,
+            height: 90,
+            path: dir.path().join("av1.mp4"),
+            ..tiny
+        };
+        let mov = ExportSettings {
+            path: dir.path().join("pcm.mov"),
+            video_audio: VideoAudio {
+                codec: crate::AudioCodec::Pcm,
+                sample_rate: 44_100,
+            },
+            ..settings(dir.path(), Encoder::X264)
+        };
+        for s in [tiny, av1, mov] {
+            export(&project(), &s, |_| {}, &AtomicBool::new(false)).unwrap();
+            let r = ve_media::probe(&s.path).unwrap();
+            assert!(r.video.is_some() && r.audio.is_some(), "{:?}", s.path);
+            assert!(
+                (r.duration - Time::from_secs(2)).0.abs()
+                    <= FrameRate::new(30, 1).frame_duration().0 * 2,
+                "{:?} {:?}",
+                s.path,
+                r.duration
+            );
+        }
     }
 
     /// 整段的积分响度（LUFS），用 ffmpeg 的 ebur128 量。
@@ -689,6 +730,7 @@ mod tests {
             denoise: 0.3,
             eq: [0.0; 3],
             compress: 1.0,
+            ..ve_core::AudioFx::NONE
         };
         ve_core::edit::set_audio_fx(&mut p, tone, fx).unwrap();
         let (after, len_after) = plain(&p, "fx.wav");
@@ -697,6 +739,23 @@ mod tests {
             (len_after - len_before).0.abs() <= Time::from_millis(30).0,
             "{len_before:?} vs {len_after:?}"
         );
+        // 变声（变音高不变长度）：长度也不变
+        for voice in [ve_core::Voice::Uncle, ve_core::Voice::Robot] {
+            ve_core::edit::set_audio_fx(
+                &mut p,
+                tone,
+                ve_core::AudioFx {
+                    voice,
+                    ..ve_core::AudioFx::NONE
+                },
+            )
+            .unwrap();
+            let (_, len_voice) = plain(&p, &format!("{voice:?}.wav"));
+            assert!(
+                (len_voice - len_before).0.abs() <= Time::from_millis(30).0,
+                "{voice:?}: {len_before:?} vs {len_voice:?}"
+            );
+        }
     }
 
     #[test]

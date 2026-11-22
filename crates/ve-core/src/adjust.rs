@@ -16,6 +16,150 @@ pub struct ColorAdjust {
     pub temperature: f32,
     /// 色调（正数偏品红、负数偏绿）。
     pub tint: f32,
+    /// 高光：亮部提亮 / 压暗（-1–1）。
+    pub highlights: f32,
+    /// 阴影：暗部提亮 / 压暗（-1–1）。
+    pub shadows: f32,
+    /// 光感：中间调提亮 / 压暗，黑白两头不动（-1–1）。
+    pub light: f32,
+    /// 锐化（0–1）。
+    pub sharpen: f32,
+    /// 颗粒（0–1）。
+    pub grain: f32,
+    /// 暗角（-1–1；负数是四角变亮的白边）。
+    pub vignette: f32,
+}
+
+/// 「调整 › 基础」里另外六项（剪映）：不做关键帧。高光、阴影、光感是逐像素的明暗曲线，走调色链的
+/// 查找表；锐化、颗粒、暗角要看邻近像素或位置，在合成器着色器里做（[`Detail`]）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AdjustExtra {
+    /// 高光。
+    Highlights,
+    /// 阴影。
+    Shadows,
+    /// 光感。
+    Light,
+    /// 锐化。
+    Sharpen,
+    /// 颗粒。
+    Grain,
+    /// 暗角。
+    Vignette,
+}
+
+impl AdjustExtra {
+    /// 全部（界面上的顺序）。
+    pub const ALL: [Self; 6] = [
+        Self::Highlights,
+        Self::Shadows,
+        Self::Light,
+        Self::Sharpen,
+        Self::Grain,
+        Self::Vignette,
+    ];
+
+    /// 名字。
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Highlights => "高光",
+            Self::Shadows => "阴影",
+            Self::Light => "光感",
+            Self::Sharpen => "锐化",
+            Self::Grain => "颗粒",
+            Self::Vignette => "暗角",
+        }
+    }
+
+    /// 取值范围。
+    #[must_use]
+    pub const fn range(self) -> (f32, f32) {
+        match self {
+            Self::Sharpen | Self::Grain => (0.0, 1.0),
+            _ => (-1.0, 1.0),
+        }
+    }
+
+    /// 读这一项。
+    #[must_use]
+    pub const fn get(self, a: &ColorAdjust) -> f32 {
+        match self {
+            Self::Highlights => a.highlights,
+            Self::Shadows => a.shadows,
+            Self::Light => a.light,
+            Self::Sharpen => a.sharpen,
+            Self::Grain => a.grain,
+            Self::Vignette => a.vignette,
+        }
+    }
+
+    /// 写这一项（夹到范围里）。
+    pub const fn set(self, a: &mut ColorAdjust, value: f32) {
+        let (lo, hi) = self.range();
+        let v = value.clamp(lo, hi);
+        match self {
+            Self::Highlights => a.highlights = v,
+            Self::Shadows => a.shadows = v,
+            Self::Light => a.light = v,
+            Self::Sharpen => a.sharpen = v,
+            Self::Grain => a.grain = v,
+            Self::Vignette => a.vignette = v,
+        }
+    }
+}
+
+/// 明暗曲线（高光、阴影、光感）：按亮度算出一个增量，三个通道一起加。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tone {
+    /// 高光。
+    pub highlights: f32,
+    /// 阴影。
+    pub shadows: f32,
+    /// 光感。
+    pub light: f32,
+}
+
+fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * 2.0f32.mul_add(-t, 3.0)
+}
+
+impl Tone {
+    /// 对一个颜色（sRGB 0–1、不预乘）调明暗。
+    #[must_use]
+    pub fn apply(&self, rgb: [f32; 3]) -> [f32; 3] {
+        let [r, g, b] = rgb.map(|c| c.clamp(0.0, 1.0));
+        let luma = 0.0722f32.mul_add(b, 0.2126f32.mul_add(r, 0.7152 * g));
+        // 高光只管亮度 0.5 以上、阴影只管 0.5 以下，各最多 ±0.25
+        let mut delta = self.highlights * 0.25 * smoothstep(0.5, 1.0, luma);
+        delta += self.shadows * 0.25 * (1.0 - smoothstep(0.0, 0.5, luma));
+        // 光感：亮度做一次幂（0 和 1 不动），光感 1 时中间调约 0.5 → 0.66
+        let gamma = 2f32.powf(-self.light * 0.6);
+        delta += luma.max(0.0).powf(gamma) - luma;
+        [r, g, b].map(|c| (c + delta).clamp(0.0, 1.0))
+    }
+}
+
+/// 锐化、颗粒、暗角（合成器着色器里做）；`seed` 让颗粒每一帧不一样。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Detail {
+    /// 锐化（0–1）。
+    pub sharpen: f32,
+    /// 颗粒（0–1）。
+    pub grain: f32,
+    /// 暗角（-1–1）。
+    pub vignette: f32,
+    /// 颗粒的随机种子（随素材时间变）。
+    pub seed: f32,
+}
+
+impl Detail {
+    /// 都没开。
+    #[must_use]
+    pub fn is_none(&self) -> bool {
+        self.sharpen == 0.0 && self.grain == 0.0 && self.vignette == 0.0
+    }
 }
 
 /// 调色的五项（界面上的顺序）。
@@ -88,6 +232,12 @@ impl ColorAdjust {
         saturation: 0.0,
         temperature: 0.0,
         tint: 0.0,
+        highlights: 0.0,
+        shadows: 0.0,
+        light: 0.0,
+        sharpen: 0.0,
+        grain: 0.0,
+        vignette: 0.0,
     };
 
     /// 是不是没调（不写进工程文件、合成时跳过）。
@@ -102,6 +252,31 @@ impl ColorAdjust {
         AdjustItem::ALL
             .iter()
             .all(|i| (-1.0..=1.0).contains(&i.get(self)))
+            && AdjustExtra::ALL.iter().all(|i| {
+                let (lo, hi) = i.range();
+                (lo..=hi).contains(&i.get(self))
+            })
+    }
+
+    /// 高光、阴影、光感（都是 0 时 `None`）。
+    #[must_use]
+    pub fn tone(&self) -> Option<Tone> {
+        (self.highlights != 0.0 || self.shadows != 0.0 || self.light != 0.0).then_some(Tone {
+            highlights: self.highlights,
+            shadows: self.shadows,
+            light: self.light,
+        })
+    }
+
+    /// 锐化、颗粒、暗角（种子另外给）。
+    #[must_use]
+    pub const fn detail(&self) -> Detail {
+        Detail {
+            sharpen: self.sharpen,
+            grain: self.grain,
+            vignette: self.vignette,
+            seed: 0.0,
+        }
     }
 
     /// 对一个颜色（sRGB 0–1、不预乘）调色；和合成器着色器里的公式一样，供测试和 CPU 端对照。
@@ -222,6 +397,7 @@ const fn filter(
             saturation,
             temperature,
             tint,
+            ..ColorAdjust::NONE
         },
     }
 }
@@ -247,6 +423,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tone_and_detail_items_are_separate_from_the_matrix() {
+        let mut a = ColorAdjust::NONE;
+        // 高光：只提亮亮的地方
+        AdjustExtra::Highlights.set(&mut a, 1.0);
+        let t = a.tone().unwrap();
+        assert!(t.apply([0.9; 3])[0] > 0.95);
+        assert!((t.apply([0.1; 3])[0] - 0.1).abs() < 1e-3, "暗部不动");
+        // 阴影：只提亮暗的地方
+        let mut dark = ColorAdjust::NONE;
+        AdjustExtra::Shadows.set(&mut dark, 1.0);
+        let low = dark.tone().unwrap();
+        assert!(low.apply([0.1; 3])[0] > 0.15);
+        assert!((low.apply([0.9; 3])[0] - 0.9).abs() < 1e-3, "亮部不动");
+        // 光感：中间调亮，黑白两头不动
+        let mut lit = ColorAdjust::NONE;
+        AdjustExtra::Light.set(&mut lit, 1.0);
+        let mid = lit.tone().unwrap();
+        assert!(mid.apply([0.5; 3])[0] > 0.55);
+        assert_eq!(mid.apply([0.0; 3]), [0.0; 3]);
+        assert!((mid.apply([1.0; 3])[0] - 1.0).abs() < 1e-6);
+        // 锐化、颗粒、暗角：不进矩阵
+        let mut detail = ColorAdjust::NONE;
+        AdjustExtra::Sharpen.set(&mut detail, 0.5);
+        AdjustExtra::Grain.set(&mut detail, -3.0);
+        AdjustExtra::Vignette.set(&mut detail, 0.4);
+        assert_eq!(detail.grain, 0.0, "颗粒只有 0–1");
+        assert_eq!(detail.matrix(), ColorAdjust::NONE.matrix());
+        assert!(!detail.detail().is_none() && detail.is_valid());
+        assert_eq!(AdjustExtra::ALL.len(), 6);
+        // 旧工程文件没有这几项
+        let old: ColorAdjust = serde_json::from_str(r#"{"brightness":0.2}"#).unwrap();
+        assert_eq!(old.highlights, 0.0);
+    }
+
+    #[test]
     fn matrix_matches_the_step_by_step_formula() {
         let adjust = ColorAdjust {
             brightness: 0.3,
@@ -254,6 +465,7 @@ mod tests {
             saturation: 0.6,
             temperature: -0.2,
             tint: 0.5,
+            ..ColorAdjust::NONE
         };
         let m = adjust.matrix();
         for rgb in [

@@ -56,7 +56,39 @@ pub struct PreviewState {
     pub(crate) fullscreen: bool,
     /// 正在显示的那一帧的像素（取色器用）。
     pub(crate) last_frame: Option<Arc<VideoFrame>>,
+    /// 预览画面放大倍数（1 = 适应窗口；剪映 Alt+Shift+= / -）。
+    pub(crate) zoom: Zoom,
+    /// 参考线（剪映 Ctrl+;）。
+    pub(crate) guides: Guides,
 }
+
+/// 播放器上的参考线。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Guides {
+    /// 不画。
+    #[default]
+    Off,
+    /// 三分线和中心十字。
+    Thirds,
+}
+
+/// 预览放大倍数，默认 1（适应窗口）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Zoom(pub f32);
+
+impl Default for Zoom {
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
+
+/// 播放器标尺的粗细（像素）。
+const RULER_PX: f32 = 14.0;
+/// 左边标尺的宽度（要放下四位数的像素刻度，不能折行）。
+const RULER_SIDE_PX: f32 = 28.0;
+
+/// 预览放大可选的几档。
+pub const PREVIEW_ZOOMS: [f32; 8] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0];
 
 /// BGRA 帧 → 可直接上传的图片（GPUI 的 `RenderImage` 内部就是 BGRA）。
 #[must_use]
@@ -96,6 +128,17 @@ impl Workspace {
     }
 }
 
+/// `rect` 围着自己的中心放大 `zoom` 倍。
+#[must_use]
+pub fn zoom_rect(rect: Bounds<Pixels>, zoom: f32) -> Bounds<Pixels> {
+    let c = rect.center();
+    let size = gpui_kit::size(rect.size.width * zoom, rect.size.height * zoom);
+    Bounds::new(
+        gpui_kit::point(c.x - size.width / 2.0, c.y - size.height / 2.0),
+        size,
+    )
+}
+
 /// 画面在区域里等比居中的位置。
 #[must_use]
 pub fn fit_rect(area: Bounds<Pixels>, width: u32, height: u32) -> Bounds<Pixels> {
@@ -117,6 +160,200 @@ pub fn fit_rect(area: Bounds<Pixels>, width: u32, height: u32) -> Bounds<Pixels>
 }
 
 impl Workspace {
+    /// 预览画面现在摆在哪（适应窗口再按放大倍数围着中心缩放）：画面、字幕、选中框、拖动都用它。
+    #[must_use]
+    pub fn video_rect(&self) -> Bounds<Pixels> {
+        let s = self.doc.project.settings;
+        zoom_rect(
+            fit_rect(self.preview.bounds, s.width, s.height),
+            self.preview.zoom.0,
+        )
+    }
+
+    /// 预览放大倍数（1 = 适应窗口）。
+    #[must_use]
+    pub const fn preview_zoom(&self) -> f32 {
+        self.preview.zoom.0
+    }
+
+    fn step_preview_zoom(&mut self, up: bool, cx: &mut Context<'_, Self>) {
+        let z = self.preview.zoom.0;
+        let next = if up {
+            PREVIEW_ZOOMS.iter().copied().find(|&v| v > z + 1e-3)
+        } else {
+            PREVIEW_ZOOMS.iter().rev().copied().find(|&v| v < z - 1e-3)
+        };
+        if let Some(v) = next {
+            self.preview.zoom = Zoom(v);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn preview_zoom_in(
+        &mut self,
+        _: &crate::actions::PreviewZoomIn,
+        _: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.step_preview_zoom(true, cx);
+    }
+
+    pub(crate) fn preview_zoom_out(
+        &mut self,
+        _: &crate::actions::PreviewZoomOut,
+        _: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.step_preview_zoom(false, cx);
+    }
+
+    pub(crate) fn preview_zoom_fit(
+        &mut self,
+        _: &crate::actions::PreviewZoomFit,
+        _: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.preview.zoom = Zoom(1.0);
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_guides(
+        &mut self,
+        _: &crate::actions::ToggleGuides,
+        _: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.preview.guides = match self.preview.guides {
+            Guides::Off => Guides::Thirds,
+            Guides::Thirds => Guides::Off,
+        };
+        cx.notify();
+    }
+
+    /// 标尺（和参考线一起开）：画面上边、左边各一条，每 10% 一个刻度，写画布上的像素。
+    fn render_ruler(&self, top: bool, video: Bounds<Pixels>) -> gpui_kit::AnyElement {
+        let s = self.doc.project.settings;
+        let (vx, vy) = (
+            video.origin.x - self.preview.bounds.origin.x,
+            video.origin.y - self.preview.bounds.origin.y,
+        );
+        let (w, h) = (video.size.width, video.size.height);
+        let bar = gpui_kit::black().opacity(0.45);
+        let tick = gpui_kit::white().opacity(0.8);
+        let (id, total) = if top {
+            ("preview-ruler-top", s.width)
+        } else {
+            ("preview-ruler-left", s.height)
+        };
+        let mut ruler = div().id(id).test_support().absolute().bg(bar);
+        ruler = if top {
+            ruler.left(vx).top(vy).w(w).h(px(RULER_PX))
+        } else {
+            ruler.left(vx).top(vy).w(px(RULER_SIDE_PX)).h(h)
+        };
+        ruler
+            .children((1..10).map(|i| {
+                #[expect(clippy::cast_precision_loss, reason = "刻度")]
+                let f = i as f32 / 10.0;
+                let label =
+                    SharedString::from(format!("{}", (f64::from(total) * f64::from(f)).round()));
+                let mark = div().absolute().bg(tick);
+                let text = div()
+                    .whitespace_nowrap()
+                    .absolute()
+                    .text_size(px(9.))
+                    .text_color(tick)
+                    .child(label);
+                if top {
+                    div()
+                        .child(mark.left(w * f).bottom_0().w(px(1.)).h(px(5.)))
+                        .child(text.left(w * f + px(2.)).top_0())
+                } else {
+                    div()
+                        .child(mark.top(h * f).right_0().w(px(5.)).h(px(1.)))
+                        .child(text.top(h * f + px(1.)).left(px(1.)))
+                }
+            }))
+            .into_any_element()
+    }
+
+    /// 参考线：画面上的三分线和中心十字（半透明白线）。
+    fn render_guides(&self, video: Bounds<Pixels>) -> Option<gpui_kit::AnyElement> {
+        if self.preview.guides == Guides::Off {
+            return None;
+        }
+        let (vx, vy) = (
+            video.origin.x - self.preview.bounds.origin.x,
+            video.origin.y - self.preview.bounds.origin.y,
+        );
+        let (w, h) = (video.size.width, video.size.height);
+        let line = gpui_kit::white().opacity(0.45);
+        let v = |x: Pixels| div().absolute().left(x).top(vy).w(px(1.)).h(h).bg(line);
+        let hz = |y: Pixels| div().absolute().left(vx).top(y).w(w).h(px(1.)).bg(line);
+        let cross = gpui_kit::white().opacity(0.7);
+        let (cx0, cy0) = (vx + w / 2.0, vy + h / 2.0);
+        Some(
+            div()
+                .id("preview-guides")
+                .test_support()
+                .absolute()
+                .size_full()
+                .child(v(vx + w / 3.0))
+                .child(v(vx + w * (2.0 / 3.0)))
+                .child(hz(vy + h / 3.0))
+                .child(hz(vy + h * (2.0 / 3.0)))
+                .child(
+                    div()
+                        .absolute()
+                        .left(cx0 - px(8.))
+                        .top(cy0)
+                        .w(px(16.))
+                        .h(px(1.))
+                        .bg(cross),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(cx0)
+                        .top(cy0 - px(8.))
+                        .w(px(1.))
+                        .h(px(16.))
+                        .bg(cross),
+                )
+                .child(self.render_ruler(true, video))
+                .child(self.render_ruler(false, video))
+                .into_any_element(),
+        )
+    }
+
+    /// 放大 / 缩小时左上角显示比例，点一下回到适应窗口。
+    fn render_zoom_badge(&self, cx: &Context<'_, Self>) -> Option<gpui_kit::AnyElement> {
+        ((self.preview.zoom.0 - 1.0).abs() > 1e-3).then(|| {
+            div()
+                .id("preview-zoom")
+                .test_support()
+                .absolute()
+                .top(px(8.))
+                .left(px(8.))
+                .px_2()
+                .py(px(2.))
+                .rounded(px(4.))
+                .bg(gpui_kit::black().opacity(0.6))
+                .text_xs()
+                .text_color(gpui_kit::white())
+                .cursor_pointer()
+                .child(SharedString::from(format!(
+                    "{:.0}%",
+                    self.preview.zoom.0 * 100.0
+                )))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.preview.zoom = Zoom(1.0);
+                    cx.notify();
+                }))
+                .into_any_element()
+        })
+    }
+
     /// 从引擎取新帧（每次渲染调用）。
     /// 播放器上有没有画面（取色器要从这一帧取）。
     #[must_use]
@@ -165,7 +402,7 @@ impl Workspace {
             video.origin.y - self.preview.bounds.origin.y,
         );
         let project = Arc::clone(&self.engine_project);
-        let subtitles = ve_engine::resolve_subtitle_shows(&project, self.playhead);
+        let subtitles = ve_engine::resolve_subtitle_shows(&project, self.player_time());
         let shown_h = f32::from(video.size.height);
         let shown_w = f32::from(video.size.width);
         #[expect(
@@ -226,8 +463,7 @@ impl Workspace {
 
     /// 画面区：画面、字幕、选中框。全屏时只画它（不能拖改画面、没有选中框，和剪映一样）。
     pub(crate) fn render_preview_frame(&self, cx: &Context<'_, Self>) -> impl IntoElement {
-        let settings = self.doc.project.settings;
-        let video = fit_rect(self.preview.bounds, settings.width, settings.height);
+        let video = self.video_rect();
         let local = |b: Bounds<Pixels>| {
             (
                 b.origin.x - self.preview.bounds.origin.x,
@@ -295,6 +531,8 @@ impl Workspace {
                 frame.children(self.render_selection_box(cx))
             })
             .children(self.render_scopes())
+            .children(self.render_guides(video))
+            .children(self.render_zoom_badge(cx))
     }
 
     /// 播放器底栏（剪映式）：左边当前时间（青）/ 总长，中间播放键，右边比例和全屏。
@@ -318,13 +556,16 @@ impl Workspace {
                     .child(
                         div()
                             .text_color(palette::accent())
-                            .child(SharedString::from(format_timecode(self.playhead, rate))),
+                            .child(SharedString::from(format_timecode(
+                                self.player_time(),
+                                rate,
+                            ))),
                     )
                     .child(
                         div()
                             .text_color(cx.theme().muted_foreground)
                             .child(SharedString::from(format_timecode(
-                                self.doc.project.timeline.duration(),
+                                self.player_duration(),
                                 rate,
                             ))),
                     )
@@ -430,6 +671,40 @@ impl Quality {
 /// 比例选项：（元素编号，名字，比例；`None` 是「原始」）。
 pub type RatioOption = (&'static str, &'static str, Option<(u32, u32)>);
 
+/// 比例菜单的分组（剪映：横屏 / 竖屏），每项后面写常用的平台。
+/// 一组比例：（元素编号，组名，[（比例的元素编号，常用平台）]）。
+type RatioGroup = (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+);
+
+const RATIO_GROUPS: [RatioGroup; 3] = [
+    (
+        "ratio-group-landscape",
+        "横屏",
+        &[
+            ("ratio-16-9", "西瓜 / B 站 / YouTube"),
+            ("ratio-4-3", "老电视"),
+            ("ratio-21-9", "宽银幕"),
+            ("ratio-235-100", "电影"),
+        ],
+    ),
+    (
+        "ratio-group-portrait",
+        "竖屏",
+        &[
+            ("ratio-9-16", "抖音 / 快手 / 视频号"),
+            ("ratio-3-4", "小红书"),
+        ],
+    ),
+    (
+        "ratio-group-square",
+        "方形",
+        &[("ratio-1-1", "朋友圈 / Instagram")],
+    ),
+];
+
 /// 比例菜单里的选项。
 pub const RATIOS: [RatioOption; 8] = [
     ("ratio-original", "原始", None),
@@ -518,6 +793,99 @@ impl Workspace {
             }))
     }
 
+    /// 比例菜单的各行：「原始」，再按横屏 / 竖屏 / 方形分组。
+    fn ratio_items(&self, current: &str, cx: &Context<'_, Self>) -> Vec<gpui_kit::AnyElement> {
+        let muted = cx.theme().muted_foreground;
+        // 「原始」：工程比例和第一段视频素材一样
+        let original = self
+            .doc
+            .project
+            .assets
+            .values()
+            .find_map(|a| a.video.map(|v| aspect_label(v.width, v.height)))
+            .is_some_and(|l| l == current);
+        let item = |id: &'static str,
+                    label: &'static str,
+                    ratio: Option<(u32, u32)>,
+                    on: bool,
+                    note: &str| {
+            // 小图标：按比例画一个框
+            let (iw, ih) = ratio.map_or((12.0, 12.0), |(w, h): (u32, u32)| {
+                #[expect(clippy::cast_precision_loss, reason = "比例的数很小")]
+                let r = w as f32 / h as f32;
+                if r >= 1.0 {
+                    (14.0, 14.0 / r)
+                } else {
+                    (14.0 * r, 14.0)
+                }
+            });
+            h_flex()
+                .id(id)
+                .test_support()
+                .h(px(26.))
+                .px_2()
+                .gap_2()
+                .rounded(px(4.))
+                .text_sm()
+                .cursor_pointer()
+                .hover(|st| st.bg(palette::menu_hover()))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.preview.ratio_menu = false;
+                    this.apply(window, cx, |p| ve_core::edit::set_aspect(p, ratio));
+                }))
+                .child(
+                    div()
+                        .w(px(12.))
+                        .text_color(palette::accent())
+                        .children(on.then(|| {
+                            div()
+                                .id(SharedString::from(format!("{id}-on")))
+                                .test_support()
+                                .child("✓")
+                        })),
+                )
+                .child(
+                    div().w(px(16.)).flex().justify_center().child(
+                        div()
+                            .w(px(iw))
+                            .h(px(ih))
+                            .border_1()
+                            .border_color(muted)
+                            .rounded(px(2.)),
+                    ),
+                )
+                .child(div().w(px(44.)).child(label))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(SharedString::from(note.to_owned())),
+                )
+                .into_any_element()
+        };
+        let mut items = vec![item("ratio-original", "原始", None, original, "跟着素材")];
+        for (gid, title, entries) in RATIO_GROUPS {
+            items.push(
+                div()
+                    .id(gid)
+                    .test_support()
+                    .px_2()
+                    .pt_1()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(title)
+                    .into_any_element(),
+            );
+            for &(id, note) in entries {
+                if let Some(&(_, label, ratio)) = RATIOS.iter().find(|r| r.0 == id) {
+                    let on = !original && label == current;
+                    items.push(item(id, label, ratio, on, note));
+                }
+            }
+        }
+        items
+    }
+
     /// 底栏的「比例」按钮和向上弹出的菜单（剪映：横竖屏一键切换，画面自动适配）。
     fn render_ratio_button(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let s = self.doc.project.settings;
@@ -536,29 +904,7 @@ impl Workspace {
                     })),
             )
             .children(self.preview.ratio_menu.then(|| {
-                let items = RATIOS.iter().map(|&(id, label, ratio)| {
-                    let on = ratio.is_some() && label == current;
-                    h_flex()
-                        .id(id)
-                        .test_support()
-                        .h(px(26.))
-                        .px_2()
-                        .gap_2()
-                        .rounded(px(4.))
-                        .text_sm()
-                        .cursor_pointer()
-                        .hover(|st| st.bg(palette::menu_hover()))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.preview.ratio_menu = false;
-                            this.apply(window, cx, |p| ve_core::edit::set_aspect(p, ratio));
-                        }))
-                        .child(div().w(px(12.)).text_color(palette::accent()).child(if on {
-                            "✓"
-                        } else {
-                            ""
-                        }))
-                        .child(label)
-                });
+                let items = self.ratio_items(&current, cx);
                 gpui_kit::deferred(
                     v_flex()
                         .id("ratio-menu")
@@ -568,7 +914,7 @@ impl Workspace {
                         .absolute()
                         .bottom(px(30.))
                         .right_0()
-                        .w(px(120.))
+                        .w(px(240.))
                         .p_1()
                         .bg(palette::menu_bg())
                         .border_1()

@@ -90,7 +90,8 @@ pub fn resolve_audio(project: &Project, from: Time, len: Time) -> Vec<AudioSegme
                 break;
             }
             past_end = clip.start >= to;
-            if !clip.enabled() {
+            // 音频已分离的视频片段：声音从音频轨上分离出来的那段出
+            if !clip.enabled() || clip.audio_split {
                 continue;
             }
             let Some(asset) = clip.asset() else { continue };
@@ -459,5 +460,23 @@ mod tests {
         assert_eq!(shows.len(), 2);
         assert_eq!(shows[0].text, "你好", "下面的先画");
         assert_eq!(shows[1].text, "标题", "上面的后画、盖在上面");
+    }
+
+    #[test]
+    fn separated_audio_plays_from_the_audio_track_not_the_video() {
+        let (mut p, ids) = sample_project();
+        let clips = |proj: &Project| {
+            let mut v: Vec<ClipId> = resolve_audio(proj, Time::ZERO, Time::from_secs(1))
+                .iter()
+                .map(|s| s.clip)
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        assert!(clips(&p).contains(&ids.v1));
+        let sound = ve_core::edit::separate_audio(&mut p, &[ids.v1]).unwrap();
+        let now = clips(&p);
+        assert!(!now.contains(&ids.v1), "视频片段不再出原声");
+        assert!(now.contains(&sound[0]), "声音从分离出来的那段出");
     }
 }

@@ -32,10 +32,8 @@ pub struct Inspector {
     pub(crate) adjust: crate::inspector_adjust::AdjustFields,
     /// 用户点选的一级标签（当前片段没有这个标签时显示第一个）。
     pub(crate) tab: InspectorTab,
-    /// 「动画」标签：在看出场（否则入场）。
-    pub(crate) anim_out: bool,
-    /// 「动画」标签：预设时长（秒）。
-    pub(crate) anim_secs: f64,
+    /// 「动画」标签：入场 / 出场 / 组合、时长滑条。
+    pub(crate) motion: crate::inspector_motion::MotionFields,
     /// 折叠起来的属性组（按组编号）。
     pub(crate) collapsed: std::collections::HashSet<&'static str>,
     /// 外观（混合模式、描边、阴影、抠像、蒙版）的滑条和二级分段。
@@ -105,9 +103,12 @@ impl InspectorTab {
 
     /// 某类片段有哪些标签（和剪映一致）。
     #[must_use]
-    pub const fn for_clip(video: bool, subtitle: bool) -> &'static [Self] {
+    pub const fn for_clip(video: bool, subtitle: bool, sound: bool) -> &'static [Self] {
         if subtitle {
             &[Self::Subtitles, Self::Text, Self::Animation]
+        } else if video && !sound {
+            // 没声音的视频（图片、静音素材、声音已经分离出去）没有「音频」标签（剪映）
+            &[Self::Picture, Self::Speed, Self::Animation, Self::Adjust]
         } else if video {
             &[
                 Self::Picture,
@@ -162,6 +163,7 @@ impl Inspector {
         let (adjust, adjust_subs) = crate::inspector_adjust::AdjustFields::new(window, cx);
         let (look, look_subs) = crate::inspector_look::LookFields::new(window, cx);
         let (speed, speed_subs) = crate::inspector_speed::SpeedFields::new(window, cx);
+        let (motion, motion_subs) = crate::inspector_motion::MotionFields::new(window, cx);
         let (grade, grade_subs) = crate::inspector_grade::GradeFields::new(window, cx);
         let (effect, effect_subs) = crate::inspector_effect::EffectFields::new(window, cx);
         let (audio_fx, audio_fx_subs) = crate::inspector_audio_fx::AudioFxFields::new(window, cx);
@@ -214,6 +216,7 @@ impl Inspector {
         subs.extend(adjust_subs);
         subs.extend(look_subs);
         subs.extend(speed_subs);
+        subs.extend(motion_subs);
         subs.extend(grade_subs);
         subs.extend(effect_subs);
         subs.extend(audio_fx_subs);
@@ -227,8 +230,7 @@ impl Inspector {
                 bound: None,
                 gain_gesture: false,
                 tab: InspectorTab::default(),
-                anim_out: false,
-                anim_secs: 0.5,
+                motion,
                 collapsed: std::collections::HashSet::new(),
                 look,
                 speed,
@@ -289,25 +291,25 @@ impl Workspace {
         cx: &Context<'_, Self>,
     ) -> gpui_kit::AnyElement {
         let muted = cx.theme().muted_foreground;
-        let row = |label: &'static str, value: String| {
-            h_flex()
-                .justify_between()
-                .text_sm()
-                .child(div().text_color(muted).child(label))
-                .child(SharedString::from(value))
-        };
         let body = v_flex()
             .gap_2()
             .child(
                 h_flex()
                     .gap_2()
-                    .child(div().flex_1().child(row(
-                        "音量",
-                        format!(
-                            "{:+.1} dB",
-                            c.gain_db_at((self.playhead - c.start).clamp(Time::ZERO, c.duration))
-                        ),
-                    )))
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .justify_between()
+                            .text_sm()
+                            .child(div().text_color(muted).child("音量"))
+                            .child(self.value_box(
+                                "gain",
+                                &self.inspector.gain,
+                                format!("{:+.1} dB", c.gain_db_at(self.key_offset(c))),
+                                64.0,
+                                cx,
+                            )),
+                    )
                     .child(self.render_group_keys(ve_core::KeyGroup::Volume, cx)),
             )
             .child(Slider::new(&self.inspector.gain))
@@ -570,7 +572,11 @@ impl Workspace {
         } else if c.effect().is_some() {
             &[InspectorTab::Effect][..]
         } else {
-            InspectorTab::for_clip(video, subtitle)
+            let sound = !c.audio_split
+                && c.asset()
+                    .and_then(|a| self.doc.project.assets.get(&a))
+                    .is_some_and(|a| a.audio.is_some());
+            InspectorTab::for_clip(video, subtitle, sound)
         };
         let current = self.inspector.tab.effective(available);
         let tabs = h_flex().children(available.iter().map(|&tab| {
@@ -698,13 +704,14 @@ mod tests {
 
     #[test]
     fn tabs_depend_on_clip_kind_and_fall_back_to_first() {
-        let video = InspectorTab::for_clip(true, false);
+        let video = InspectorTab::for_clip(true, false, true);
+        assert!(!InspectorTab::for_clip(true, false, false).contains(&InspectorTab::Audio));
         assert_eq!(video[0], InspectorTab::Picture);
         assert_eq!(
-            InspectorTab::for_clip(false, false),
+            InspectorTab::for_clip(false, false, true),
             [InspectorTab::Audio, InspectorTab::Speed]
         );
-        let sub = InspectorTab::for_clip(false, true);
+        let sub = InspectorTab::for_clip(false, true, false);
         assert_eq!(
             sub,
             [

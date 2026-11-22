@@ -60,14 +60,11 @@ impl Workspace {
                     .justify_center()
                     .rounded(px(4.))
                     .bg(cx.theme().muted)
+                    .overflow_hidden()
                     .border_2()
                     .border_color(gpui_kit::transparent_black())
                     .group_hover("effect-tile", |s| s.border_color(palette::accent()))
-                    .child(
-                        Icon::new(Lucide::Sparkles)
-                            .size(px(20.))
-                            .text_color(palette::effect_clip()),
-                    ),
+                    .child(crate::effect_preview::effect_preview(i, k)),
             )
             .child(div().text_xs().text_color(muted).child(k.label()))
         });

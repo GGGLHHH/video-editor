@@ -119,17 +119,27 @@ pub struct Workspace {
     pub(crate) importing: usize,
     /// 最近打开的工程，及其存放文件。
     pub(crate) recent: crate::recent::RecentList,
+    /// 正在导出静帧。
+    pub(crate) still_task: Option<Task<()>>,
+    /// 顶栏草稿名正在改名。
+    pub(crate) rename: Option<crate::rename_ui::Rename>,
+    /// 草稿首页开着（盖住编辑器）。
+    pub(crate) home: Option<crate::home::Home>,
     pub(crate) recent_file: std::path::PathBuf,
     /// 「转场」标签里选的时长（秒）。
     pub(crate) transition_secs: f64,
     /// 布局模式。
     pub(crate) layout: crate::layout::LayoutMode,
+    /// 重置过几次布局（分隔条编号带上它）。
+    pub(crate) layout_generation: u32,
     /// 找不到文件的素材（[`Self::refresh_missing`]）。
     pub(crate) missing: std::collections::BTreeSet<AssetId>,
     /// 快捷键一览里正在改的键位（等用户按新键）。
     pub(crate) recording_key: Option<String>,
     /// 改键后的提示（比如新键原来用于别的操作，已经从那里去掉）。
     pub(crate) shortcut_note: Option<String>,
+    /// 改键冲突：等用户确认替换的（键位，新键）。
+    pub(crate) shortcut_conflict: Option<(String, String)>,
     /// 片段 / 属性剪贴板。
     pub(crate) clipboard: crate::clip_ops::ClipBoard,
     /// 自动保存（正式启动的程序才打开）。
@@ -146,8 +156,20 @@ pub struct Workspace {
     pub(crate) recovery: Option<crate::recovery::Live>,
     /// 素材面板当前的一级标签。
     pub(crate) bin_tab: crate::media_bin::BinTab,
+    /// 素材面板的搜索框（按文件名筛）。
+    pub(crate) bin_search: Entity<gpui_kit::component::input::InputState>,
+    /// 字幕列表的搜索框。
+    pub(crate) sub_search: Entity<gpui_kit::component::input::InputState>,
+    /// 素材面板的排序。
+    pub(crate) bin_order: crate::media_bin::AssetOrder,
     /// 顶栏展开着的弹出框（菜单、布局、快捷键），同时只开一个。
     pub(crate) popup: Option<Popup>,
+    /// 属性面板里正在输入的数值（[`crate::value_edit`]）。
+    pub(crate) value_edit: Option<crate::value_edit::ValueEdit>,
+    /// 单击素材卡片后正在单独预览的素材（[`crate::asset_preview`]）。
+    pub(crate) asset_preview: Option<crate::asset_preview::AssetPreview>,
+    /// 右键素材卡片弹出的菜单：（素材，弹在哪）。
+    pub(crate) asset_menu: Option<(AssetId, gpui_kit::Point<gpui_kit::Pixels>)>,
     /// 刚被「点到外面」关掉的弹出框和按下的位置。
     pub(crate) popup_dismissed: Option<(Popup, gpui_kit::Point<gpui_kit::Pixels>)>,
     title: String,
@@ -216,6 +238,14 @@ impl Workspace {
             }
         });
         let (inspector, mut subscriptions) = Inspector::new(window, cx);
+        let bin_search = cx.new(|cx| {
+            gpui_kit::component::input::InputState::new(window, cx).placeholder("搜索文件名")
+        });
+        subscriptions.push(cx.observe(&bin_search, |_, _, cx| cx.notify()));
+        let sub_search = cx.new(|cx| {
+            gpui_kit::component::input::InputState::new(window, cx).placeholder("搜索字幕")
+        });
+        subscriptions.push(cx.observe(&sub_search, |_, _, cx| cx.notify()));
         let zoom_slider = cx.new(|_| {
             gpui_kit::component::slider::SliderState::new()
                 .min(0.0)
@@ -271,14 +301,23 @@ impl Workspace {
             export_dir: None,
             export_title: None,
             compound_stack: Vec::new(),
+            value_edit: None,
+            asset_preview: None,
+            asset_menu: None,
             settings: crate::settings::AppSettings::default(),
             settings_file: None,
             importing: 0,
             recent: crate::recent::RecentList::load(&crate::recent::default_file()),
+            home: None,
+            rename: None,
+            still_task: None,
             recent_file: crate::recent::default_file(),
             popup: None,
             popup_dismissed: None,
             bin_tab: crate::media_bin::BinTab::default(),
+            bin_search,
+            sub_search,
+            bin_order: crate::media_bin::AssetOrder::default(),
             autosave: None,
             proxies: crate::proxy::Proxies::new(),
             scopes: crate::scopes::ScopeState::default(),
@@ -287,9 +326,11 @@ impl Workspace {
             recovery: None,
             clipboard: crate::clip_ops::ClipBoard::default(),
             layout: crate::layout::LayoutMode::default(),
+            layout_generation: 0,
             missing: std::collections::BTreeSet::new(),
             recording_key: None,
             shortcut_note: None,
+            shortcut_conflict: None,
             transition_secs: 1.0,
             title: String::new(),
             tasks: vec![listen],
@@ -327,6 +368,13 @@ impl Workspace {
 
     /// 工程变了就推给引擎。
     pub(crate) fn sync_engine(&mut self) {
+        // 单独预览素材时播放器放的是那个素材（文档一改就结束预览，见 keep_asset_preview）
+        if self
+            .asset_preview
+            .is_some_and(|p| p.revision_is(self.doc.revision()))
+        {
+            return;
+        }
         if self.engine_revision != Some(self.doc.revision()) {
             self.project = Arc::new(self.doc.project.clone());
             // 复合片段摊开再给播放引擎（时间轴上还是一段）
@@ -455,6 +503,40 @@ impl Workspace {
         cx.notify();
     }
 
+    /// 拖动播放头：开着「时间轴声音」时在那里放一小段声音（播放头不动）。
+    pub(crate) fn scrub_to(&mut self, t: Time, cx: &mut Context<'_, Self>) {
+        if self.timeline.scrub_sound == crate::timeline::view::ScrubSound::On {
+            self.timeline.axis_anchor = None;
+            self.engine.scrub(t);
+            self.playhead = self.engine.position();
+            cx.notify();
+        } else {
+            self.seek(t, cx);
+        }
+    }
+
+    /// 时间轴声音开着没有。
+    #[must_use]
+    pub const fn scrub_audio(&self) -> bool {
+        matches!(
+            self.timeline.scrub_sound,
+            crate::timeline::view::ScrubSound::On
+        )
+    }
+
+    fn toggle_scrub_audio(
+        &mut self,
+        _: &act::ToggleScrubAudio,
+        _: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.timeline.scrub_sound = match self.timeline.scrub_sound {
+            crate::timeline::view::ScrubSound::On => crate::timeline::view::ScrubSound::Off,
+            crate::timeline::view::ScrubSound::Off => crate::timeline::view::ScrubSound::On,
+        };
+        cx.notify();
+    }
+
     // ---- 播放控制 ----
 
     fn play_pause(&mut self, _: &act::PlayPause, _: &mut Window, cx: &mut Context<'_, Self>) {
@@ -493,7 +575,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn step(&mut self, frames: i64, cx: &mut Context<'_, Self>) {
+    pub(crate) fn step(&mut self, frames: i64, cx: &mut Context<'_, Self>) {
         self.engine.pause();
         let rate = self.doc.project.settings.frame_rate;
         let current = rate.frame_of(rate.snap(self.engine.position()));
@@ -635,8 +717,12 @@ impl Workspace {
     /// Esc：开着弹出框（菜单、布局、快捷键）时先关掉它；正在拖动（时间轴或预览）时取消这次拖动、
     /// 回到按下前，不记撤销；正在框选时回到框之前的选择；否则取消选择。
     fn cancel(&mut self, _: &act::Cancel, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if self.popup.take().is_some() {
+        if self.popup.take().is_some() || self.asset_menu.take().is_some() {
             cx.notify();
+            return;
+        }
+        // 单独预览素材时：Esc 回到时间轴
+        if self.end_asset_preview(cx) {
             return;
         }
         // 全屏时 Esc 先退出全屏
@@ -868,6 +954,35 @@ impl Workspace {
             .on_action(cx.listener(Self::play_forward))
             .on_action(cx.listener(Self::play_backward))
             .on_action(cx.listener(Self::step_forward))
+            .on_action(cx.listener(Self::next_edit_point))
+            .on_action(cx.listener(Self::prev_edit_point))
+            .on_action(cx.listener(Self::big_step_forward))
+            .on_action(cx.listener(Self::big_step_back))
+            .on_action(cx.listener(Self::add_keyframe_here))
+            .on_action(cx.listener(Self::show_speed))
+            .on_action(cx.listener(Self::volume_up))
+            .on_action(cx.listener(Self::volume_down))
+            .on_action(cx.listener(Self::next_bin_tab))
+            .on_action(cx.listener(Self::quit))
+            .on_action(cx.listener(Self::show_shortcuts))
+            .on_action(cx.listener(Self::about))
+            .on_action(cx.listener(Self::track_taller))
+            .on_action(cx.listener(Self::track_shorter))
+            .on_action(cx.listener(Self::separate_audio))
+            .on_action(cx.listener(Self::preview_zoom_in))
+            .on_action(cx.listener(Self::preview_zoom_out))
+            .on_action(cx.listener(Self::preview_zoom_fit))
+            .on_action(cx.listener(Self::toggle_scrub_audio))
+            .on_action(cx.listener(Self::show_home_action))
+            .on_action(cx.listener(Self::import_script))
+            .on_action(cx.listener(Self::export_still))
+            .on_action(cx.listener(Self::marker_color))
+            .on_action(cx.listener(Self::toggle_guides))
+            .on_action(cx.listener(Self::export_selection))
+            .on_action(cx.listener(Self::reveal_in_folder))
+            .on_action(cx.listener(Self::group_clips))
+            .on_action(cx.listener(Self::open_crop))
+            .on_action(cx.listener(Self::save_adjust_preset))
             .on_action(cx.listener(Self::step_back))
             .on_action(cx.listener(Self::go_start))
             .on_action(cx.listener(Self::go_end))
@@ -912,20 +1027,28 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let previewing = self.keep_asset_preview(cx);
         self.sync_engine();
         self.pull_frame(window, cx);
         self.measure_subtitle_font(window);
         self.stop_at_range_end(cx);
-        // 预览轴在预览别处时，播放头还是原来的位置
-        self.playhead = self
-            .timeline
-            .axis_anchor
-            .unwrap_or_else(|| self.engine.position());
+        // 预览轴在预览别处时，播放头还是原来的位置；单独预览素材时时间轴的播放头不动
+        self.playhead = match self.asset_preview.filter(|_| previewing) {
+            Some(p) => p.back_to(),
+            None => self
+                .timeline
+                .axis_anchor
+                .unwrap_or_else(|| self.engine.position()),
+        };
         self.follow_playhead_in_inspector(window, cx);
+        // 文字轨、特效轨矮一些：每帧按时间轴重算哪几行矮
+        let timeline = &self.doc.project.timeline;
+        self.timeline.geometry.sync_rows(timeline);
         self.auto_scroll_timeline(window, cx);
         self.refresh_animated_sliders(false, window, cx);
         self.refresh_look_sliders(window, cx);
         self.refresh_curve_sliders(window, cx);
+        self.refresh_motion_slider(window, cx);
         self.refresh_grade_sliders(window, cx);
         self.refresh_effect_slider(window, cx);
         self.refresh_audio_fx_sliders(window, cx);
@@ -953,13 +1076,15 @@ impl Render for Workspace {
                 this.import_paths(paths.0.to_vec(), window, cx);
             }))
             .relative()
-            .when(self.preview.fullscreen, |root| {
+            .when(self.home.is_some(), |root| root.child(self.render_home(cx)))
+            .when(self.home.is_none() && self.preview.fullscreen, |root| {
                 root.bg(palette::preview_bg())
                     .child(self.render_preview_frame(cx))
             })
-            .when(!self.preview.fullscreen, |root| {
+            .when(self.home.is_none() && !self.preview.fullscreen, |root| {
                 root.children(self.render_context_menu(window, cx))
                     .children(self.render_blank_menu(window, cx))
+                    .children(self.render_asset_menu(cx))
                     .child(self.render_topbar(cx))
                     .child(
                         div()

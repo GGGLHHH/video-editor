@@ -4,10 +4,10 @@
 use crate::inspector_group::Group;
 use crate::workspace::Workspace;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
-use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement as _,
-    ParentElement as _, SharedString, Styled as _, Subscription, Window, div,
+    ParentElement as _, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
 };
 use ve_core::audio_fx::{EQ_LABELS, EQ_RANGE_DB};
 use ve_core::{AudioFx, ClipId};
@@ -184,12 +184,45 @@ impl Workspace {
         self.refresh_audio_fx_sliders(window, cx);
     }
 
-    /// 「音频降噪」「均衡」「压缩」三个组。
+    fn pick_voice(
+        &mut self,
+        voice: ve_core::Voice,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.edit_audio_fx(|fx| fx.voice = voice, window, cx);
+    }
+
+    /// 「变声」：一排预设，点一下换（都不改声音长度）。
+    fn render_voice(&self, fx: AudioFx, cx: &Context<'_, Self>) -> AnyElement {
+        let chips = ve_core::Voice::ALL.map(|v| {
+            crate::chrome::chip(format!("fx-voice-{v:?}"), v.label(), fx.voice == v, cx)
+                .on_click(cx.listener(move |w, _, window, cx| w.pick_voice(v, window, cx)))
+                .into_any_element()
+        });
+        let body = h_flex()
+            .gap_1()
+            .flex_wrap()
+            .children(chips)
+            .into_any_element();
+        self.render_group(
+            Group {
+                id: "fx-voice",
+                title: "变声",
+                check: None,
+                reset: None,
+                extra: None,
+            },
+            body,
+            cx,
+        )
+    }
+
+    /// 「音频降噪」「均衡」「压缩」「变声」四个组。
     pub(crate) fn render_audio_fx(&self, cx: &Context<'_, Self>) -> Vec<AnyElement> {
         let Some((_, fx)) = self.bound_audio_fx() else {
             return Vec::new();
         };
-        let muted = cx.theme().muted_foreground;
         let f = &self.inspector.audio_fx;
         let row =
             |id: &'static str, label: &'static str, s: &Entity<SliderState>, value: String| {
@@ -198,13 +231,7 @@ impl Workspace {
                     .items_center()
                     .child(div().w_10().text_xs().child(label))
                     .child(div().id(id).flex_1().child(Slider::new(s)))
-                    .child(
-                        div()
-                            .w_12()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(SharedString::from(value)),
-                    )
+                    .child(self.value_box(id, s, value, 48.0, cx))
             };
         let denoise = v_flex()
             .child(row(
@@ -265,6 +292,7 @@ impl Workspace {
                 compress,
                 cx,
             ),
+            self.render_voice(fx, cx),
         ]
     }
 }

@@ -57,6 +57,10 @@ pub enum ClipContent {
 
 /// 时间轴上的一个片段。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "停用、保持音调、帧融合、音频已分离是互不相关的开关，合成一个枚举反而难懂"
+)]
 pub struct Clip {
     /// id。
     pub id: ClipId,
@@ -78,6 +82,12 @@ pub struct Clip {
     /// 画面属性的关键帧动画（时间相对片段起点）；为空时不写进文件。第 4 版工程文件加的。
     #[serde(default, skip_serializing_if = "crate::Animation::is_empty")]
     pub animation: crate::Animation,
+    /// 组合（剪映 Ctrl+G）：同一个编号的片段一起选中、一起挪；没有组合时不写进文件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<u32>,
+    /// 入场 / 出场 / 组合动画（叠加在关键帧上）；没有时不写进文件。
+    #[serde(default, skip_serializing_if = "crate::motion::ClipMotion::is_none")]
+    pub motion: crate::motion::ClipMotion,
     /// 调色（只对视频轨上的媒体片段起作用）；没调时不写进文件。第 5 版工程文件加的。
     #[serde(default, skip_serializing_if = "crate::ColorAdjust::is_identity")]
     pub adjust: crate::ColorAdjust,
@@ -123,6 +133,10 @@ pub struct Clip {
     /// 素材的色彩空间（HDR / Log）；`None` 是 Rec.709。没有时不写进文件。第 8 版加的。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_space: Option<crate::color_space::InputSpace>,
+    /// 音频已分离（剪映「分离音频」）：视频片段的原声不再播放，声音放到了音频轨上的一段里。
+    /// 没分离时不写进文件。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub audio_split: bool,
     /// 摊开的复合片段里的片段：外面那段复合片段（[`crate::compound::flatten`] 填，不存进文件）。
     /// 合成时它的画面属性、调色套在这一段上面（[`crate::compose`]）。
     #[serde(skip)]
@@ -161,10 +175,21 @@ fn is_normal_speed(s: &f32) -> bool {
 }
 
 impl Clip {
-    /// 片段内 `offset` 时刻（相对片段起点）的画面属性：有关键帧的属性按动画求值，其余用固定值。
+    /// 片段内 `offset` 时刻（相对片段起点）不算入场 / 出场 / 组合动画的画面属性：有关键帧的按
+    /// 关键帧求值，其余用固定值。改画面属性（拖动、面板、打关键帧）读写的都是它，动画不会被写进去。
+    #[must_use]
+    pub fn keyed_transform_at(&self, offset: Time) -> Transform {
+        self.animation.apply(&self.transform, offset)
+    }
+
+    /// 片段内 `offset` 时刻（相对片段起点）看到的画面属性：关键帧求值后再叠加入场 / 出场 / 组合动画。
     #[must_use]
     pub fn transform_at(&self, offset: Time) -> Transform {
-        self.animation.apply(&self.transform, offset)
+        self.motion.apply(
+            self.animation.apply(&self.transform, offset),
+            offset,
+            self.duration,
+        )
     }
 
     /// 片段内 `offset` 时刻的调色：有关键帧的项按动画求值，其余用固定值。
@@ -206,9 +231,33 @@ impl Clip {
             .unwrap_or(self.gain_db)
     }
 
+    /// 片段内 `offset` 时刻的进阶调色：HSL 有关键帧的项按动画求值。
+    #[must_use]
+    pub fn grade_at(&self, offset: Time) -> Option<Arc<crate::Grade>> {
+        let keyed: Vec<(crate::Prop, f32)> = crate::Prop::HSL
+            .iter()
+            .filter_map(|&p| self.animation.value_at(p, offset).map(|v| (p, v)))
+            .collect();
+        if keyed.is_empty() {
+            return self.grade.clone();
+        }
+        let mut g = self.grade.as_deref().cloned().unwrap_or_default();
+        for (p, v) in keyed {
+            if let Some((band, ch)) = p.hsl_target() {
+                ch.set(&mut g.hsl[band.index()], v);
+            }
+        }
+        Some(Arc::new(g))
+    }
+
     /// 片段内 `offset` 时刻某个可打关键帧属性的值。
     #[must_use]
     pub fn value_at(&self, prop: crate::Prop, offset: Time) -> f32 {
+        if let Some((band, ch)) = prop.hsl_target() {
+            return self
+                .grade_at(offset)
+                .map_or(0.0, |g| ch.get(&g.hsl[band.index()]));
+        }
         if prop.is_transform() {
             prop.get(&self.transform_at(offset))
         } else if let Some(item) = prop.adjust_item() {
@@ -224,6 +273,12 @@ impl Clip {
 
     /// 改某个属性的固定值（没有关键帧时用的值）。
     pub fn set_base(&mut self, prop: crate::Prop, value: f32) {
+        if let Some((band, ch)) = prop.hsl_target() {
+            let mut g = self.grade.as_deref().cloned().unwrap_or_default();
+            ch.set(&mut g.hsl[band.index()], value);
+            self.grade = Some(Arc::new(g));
+            return;
+        }
         if prop.is_transform() {
             prop.set(&mut self.transform, value);
         } else if let Some(item) = prop.adjust_item() {
@@ -392,6 +447,11 @@ impl Clip {
     }
 }
 
+/// 标记可选的颜色（0xRRGGBB）：青（默认）、红、橙、黄、绿、蓝、紫。
+pub const MARKER_COLORS: [u32; 7] = [
+    0x00_C8D2, 0xE5_484D, 0xF7_6B15, 0xFF_C53D, 0x46_A758, 0x3E_63DD, 0x8E_4EC6,
+];
+
 /// 一条轨道：片段按 `start` 升序、互不重叠。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Track {
@@ -483,6 +543,9 @@ pub struct Timeline {
     /// 标记（剪映的 M），按时间排好、不重复；没有时不写进文件。第 5 版工程文件加的。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub markers: Vec<Time>,
+    /// 标记的颜色（[`MARKER_COLORS`] 的下标）：只记不是默认（0）的，没有时不写进文件。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub marker_colors: Vec<(Time, u8)>,
     /// 入出点区域（剪映 I / O）：`(入点, 出点)`，入点 < 出点；没有时不写进文件。第 7 版工程文件加的。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range: Option<(Time, Time)>,
@@ -579,6 +642,7 @@ impl Timeline {
                 Track::new(a, TrackKind::Audio),
             ],
             markers: Vec::new(),
+            marker_colors: Vec::new(),
             range: None,
             cover: None,
         }
@@ -596,11 +660,58 @@ impl Timeline {
         self.markers.iter().rev().copied().find(|m| *m < at)
     }
 
+    /// `at` 处标记的颜色（[`MARKER_COLORS`] 的下标；没设过是 0）。
+    #[must_use]
+    pub fn marker_color(&self, at: Time) -> u8 {
+        self.marker_colors
+            .iter()
+            .find(|(t, _)| *t == at)
+            .map_or(0, |(_, c)| *c)
+    }
+
+    fn set_marker_color(&mut self, at: Time, color: u8) {
+        self.marker_colors.retain(|(t, _)| *t != at);
+        if color != 0 {
+            self.marker_colors.push((at, color));
+            self.marker_colors.sort_unstable();
+        }
+    }
+
+    /// 把 `at` 处标记换成下一个颜色（剪映的标记有颜色）；那里没有标记时 `None`。
+    pub fn cycle_marker_color(&mut self, at: Time) -> Option<u8> {
+        self.markers.binary_search(&at).ok()?;
+        let next = (usize::from(self.marker_color(at)) + 1) % MARKER_COLORS.len();
+        let next = u8::try_from(next).unwrap_or(0);
+        self.set_marker_color(at, next);
+        Some(next)
+    }
+
+    /// 把 `from` 处的标记挪到 `to`（颜色跟着走）；`from` 没有标记或 `to` 已经有了时不挪。
+    pub fn move_marker(&mut self, from: Time, to: Time) -> bool {
+        if from == to {
+            return true;
+        }
+        let Ok(i) = self.markers.binary_search(&from) else {
+            return false;
+        };
+        if to < Time::ZERO || self.markers.binary_search(&to).is_ok() {
+            return false;
+        }
+        let color = self.marker_color(from);
+        self.markers.remove(i);
+        let j = self.markers.binary_search(&to).unwrap_or_else(|j| j);
+        self.markers.insert(j, to);
+        self.set_marker_color(from, 0);
+        self.set_marker_color(to, color);
+        true
+    }
+
     /// 在 `at` 打标记；那里已经有就去掉。返回现在那里有没有标记。
     pub fn toggle_marker(&mut self, at: Time) -> bool {
         match self.markers.binary_search(&at) {
             Ok(i) => {
                 self.markers.remove(i);
+                self.set_marker_color(at, 0);
                 false
             }
             Err(i) => {
@@ -788,6 +899,7 @@ fn check_clip(
             Timeline {
                 tracks: inner.tracks.clone(),
                 markers: Vec::new(),
+                marker_colors: Vec::new(),
                 range: None,
                 cover: None,
             }
@@ -817,6 +929,36 @@ fn check_clip(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markers_have_colors_and_can_be_moved() {
+        let mut ids = IdGen::default();
+        let mut tl = Timeline::mvp(&mut ids);
+        let (a, b) = (Time::from_secs(1), Time::from_secs(4));
+        tl.toggle_marker(a);
+        tl.toggle_marker(b);
+        assert_eq!(tl.marker_color(a), 0, "默认颜色");
+        assert_eq!(tl.cycle_marker_color(a), Some(1));
+        assert_eq!(tl.marker_color(a), 1);
+        assert_eq!(
+            tl.cycle_marker_color(Time::from_secs(2)),
+            None,
+            "那里没有标记"
+        );
+        // 挪：颜色跟着走，顺序重排；挪到已有标记上不行
+        assert!(tl.move_marker(a, Time::from_secs(6)));
+        assert_eq!(tl.markers, [b, Time::from_secs(6)]);
+        assert_eq!(tl.marker_color(Time::from_secs(6)), 1);
+        assert_eq!(tl.marker_color(a), 0);
+        assert!(!tl.move_marker(b, Time::from_secs(6)));
+        // 删掉标记：颜色也去掉；转一圈回到默认不写进文件
+        tl.toggle_marker(Time::from_secs(6));
+        assert_eq!(tl.marker_colors, []);
+        for _ in 0..MARKER_COLORS.len() {
+            tl.cycle_marker_color(b);
+        }
+        assert_eq!(tl.marker_colors, [], "回到默认颜色就不记");
+    }
     use crate::testing::{media_clip, sample_project};
     use crate::{Project, Time, VideoInfo};
     use std::sync::Arc;
@@ -1089,6 +1231,7 @@ mod tests {
         let (v2, v1, a1, s1) = (ids.track(), ids.track(), ids.track(), ids.track());
         let mut tl = Timeline {
             markers: Vec::new(),
+            marker_colors: Vec::new(),
             range: None,
             cover: None,
             tracks: vec![

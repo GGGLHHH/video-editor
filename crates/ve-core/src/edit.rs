@@ -44,6 +44,9 @@ pub enum EditError {
     /// 换上的素材不够长。
     #[error("素材时长不足，换不上这个片段")]
     SourceTooShort,
+    /// 要删的素材在复合片段里用着。
+    #[error("复合片段里用到了这个素材，先解除复合片段")]
+    AssetInCompound,
 }
 
 /// 增益范围（dB）。
@@ -160,6 +163,9 @@ fn new_media_clip(
         stabilized: None,
         input_space: None,
         parent: None,
+        audio_split: false,
+        motion: crate::motion::ClipMotion::NONE,
+        group: None,
     })
 }
 
@@ -450,6 +456,9 @@ pub(crate) fn split_in(
     let cut_source = original.source_at(at - original.start);
     left.duration = at - left.start;
     left.fade_out = Time::ZERO;
+    // 入场留在左半段、出场留在右半段
+    left.motion.outro = None;
+    right.motion.intro = None;
     clamp_fades(&mut left);
     right.id = right_id;
     // 切开的地方是硬切：右半段不带原来的入场转场
@@ -492,6 +501,81 @@ pub(crate) fn split_in(
     Ok(right_id)
 }
 
+/// 组合（剪映 Ctrl+G）：这些片段编进同一组（新编号），之后一起选中、一起挪。返回组号。
+///
+/// # Errors
+/// 不到两段，或有片段不存在。
+pub fn group_clips(project: &mut Project, clips: &[ClipId]) -> Result<u32, EditError> {
+    if clips.len() < 2 {
+        return Err(EditError::InvalidValue);
+    }
+    let next = project
+        .timeline
+        .tracks
+        .iter()
+        .flat_map(|t| t.clips.iter())
+        .filter_map(|c| c.group)
+        .max()
+        .map_or(1, |g| g + 1);
+    for &id in clips {
+        update_clip(project, id, |c| {
+            c.group = Some(next);
+            Ok(())
+        })?;
+    }
+    Ok(next)
+}
+
+/// 取消组合：这些片段（和它们组里的其余片段）不再成组。
+///
+/// # Errors
+/// 有片段不存在。
+pub fn ungroup_clips(project: &mut Project, clips: &[ClipId]) -> Result<(), EditError> {
+    let groups: Vec<u32> = clips
+        .iter()
+        .filter_map(|&id| project.timeline.find_clip(id).and_then(|(_, c)| c.group))
+        .collect();
+    let members: Vec<ClipId> = project
+        .timeline
+        .tracks
+        .iter()
+        .flat_map(|t| t.clips.iter())
+        .filter(|c| c.group.is_some_and(|g| groups.contains(&g)))
+        .map(|c| c.id)
+        .collect();
+    for id in members {
+        update_clip(project, id, |c| {
+            c.group = None;
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+/// 设片段的入场 / 出场 / 组合动画（视频轨片段）。
+///
+/// # Errors
+/// 片段不存在、不在视频轨上，或动画时长不是正数。
+pub fn set_clip_motion(
+    project: &mut Project,
+    clip: ClipId,
+    motion: crate::motion::ClipMotion,
+) -> Result<(), EditError> {
+    if !motion.is_valid() {
+        return Err(EditError::ZeroLength);
+    }
+    let (track, c) = project
+        .timeline
+        .find_clip(clip)
+        .ok_or(EditError::ClipNotFound(clip))?;
+    if project.timeline.track(track).map(|t| t.kind) != Some(TrackKind::Video) {
+        return Err(EditError::WrongTrackKind);
+    }
+    let mut next = (**c).clone();
+    next.motion = motion;
+    replace_clip(project, next)
+}
+
 /// 在 `at` 处切开所有轨道上跨过它的片段，返回新片段 id。
 pub fn split_all_at(project: &mut Project, at: Time) -> Vec<ClipId> {
     #[expect(
@@ -527,6 +611,172 @@ pub fn delete_clips(project: &mut Project, clips: &[ClipId]) -> Result<(), EditE
         }
         Ok(())
     })
+}
+
+/// 分离音频（剪映 Ctrl+Shift+S）：这些视频片段的声音放到音频轨上同一时刻的一段里（音量、淡入淡出、
+/// 声音处理、变速都跟过去），视频片段不再出原声。没有声音的、已经分离过的跳过。返回新的音频片段。
+///
+/// # Errors
+/// 片段不存在、轨道锁着。
+pub fn separate_audio(project: &mut Project, clips: &[ClipId]) -> Result<Vec<ClipId>, EditError> {
+    let mut next = project.clone();
+    let mut made = Vec::new();
+    for &id in clips {
+        let (track, c) = next
+            .timeline
+            .find_clip(id)
+            .ok_or(EditError::ClipNotFound(id))?;
+        let on_video = next
+            .timeline
+            .track(track)
+            .is_some_and(|t| t.kind == TrackKind::Video);
+        let sounds = c
+            .asset()
+            .and_then(|a| next.assets.get(&a))
+            .is_some_and(|a| a.audio.is_some());
+        if !on_video || !sounds || c.audio_split {
+            continue;
+        }
+        if next.timeline.track(track).is_some_and(|t| t.locked) {
+            return Err(EditError::TrackLocked);
+        }
+        let mut sound = (**c).clone();
+        sound.id = next.ids.clip();
+        sound.transform = Transform::default();
+        sound.look = crate::Look::NONE;
+        sound.adjust = crate::ColorAdjust::NONE;
+        sound.grade = None;
+        sound.transition_in = None;
+        sound.input_space = None;
+        // 只留音量关键帧
+        let volume = c.animation.keys(crate::Prop::Volume).to_vec();
+        sound.animation = crate::Animation::default();
+        sound.animation.set_keys(crate::Prop::Volume, volume);
+        let (from, to) = (sound.start, sound.end());
+        let target = match next
+            .timeline
+            .tracks
+            .iter()
+            .find(|t| t.kind == TrackKind::Audio && !t.locked && t.is_free(from, to, &[]))
+        {
+            Some(t) => t.id,
+            None => add_track(&mut next, TrackKind::Audio)?,
+        };
+        let new = sound.id;
+        next.timeline
+            .track_mut(target)
+            .ok_or(EditError::TrackNotFound(target))?
+            .insert_sorted(Arc::new(sound));
+        update_clip(&mut next, id, |v| {
+            v.audio_split = true;
+            Ok(())
+        })?;
+        made.push(new);
+    }
+    *project = next;
+    Ok(made)
+}
+
+/// 还原音频：视频片段的原声回来，分离出来的那段（音频轨上同一素材、同一时刻、同一段的）删掉。
+///
+/// # Errors
+/// 片段不存在。
+pub fn restore_audio(project: &mut Project, clips: &[ClipId]) -> Result<(), EditError> {
+    let mut next = project.clone();
+    for &id in clips {
+        let (_, c) = next
+            .timeline
+            .find_clip(id)
+            .ok_or(EditError::ClipNotFound(id))?;
+        if !c.audio_split {
+            continue;
+        }
+        let key = (c.asset(), c.start, c.duration, c.source_in());
+        let twin: Vec<ClipId> = next
+            .timeline
+            .tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Audio && !t.locked)
+            .flat_map(|t| t.clips.iter())
+            .filter(|a| (a.asset(), a.start, a.duration, a.source_in()) == key)
+            .map(|a| a.id)
+            .take(1)
+            .collect();
+        if !twin.is_empty() {
+            delete_clips(&mut next, &twin)?;
+        }
+        update_clip(&mut next, id, |v| {
+            v.audio_split = false;
+            Ok(())
+        })?;
+    }
+    *project = next;
+    Ok(())
+}
+
+/// 片段用着素材 `asset`（正在用的，或倒放 / 防抖前原来的那个）。
+fn uses_asset(c: &Clip, asset: AssetId) -> bool {
+    c.asset() == Some(asset)
+        || c.reversed.is_some_and(|(a, _)| a == asset)
+        || c.stabilized.is_some_and(|(a, ..)| a == asset)
+}
+
+/// 复合片段 `inner` 里面（套几层都算）有没有用到 `asset`。
+fn compound_uses(inner: &crate::compound::Compound, asset: AssetId) -> bool {
+    inner
+        .tracks
+        .iter()
+        .flat_map(|t| t.clips.iter())
+        .any(|c| uses_asset(c, asset) || c.compound().is_some_and(|(i, _)| compound_uses(i, asset)))
+}
+
+/// 从素材面板删掉素材（剪映）：时间轴上用到它的片段一起删，返回删了几段。
+///
+/// # Errors
+/// 素材不存在；用到它的片段在锁着的轨道上；复合片段里用到了它。
+pub fn remove_asset(project: &mut Project, asset: AssetId) -> Result<usize, EditError> {
+    if !project.assets.contains_key(&asset) {
+        return Err(EditError::AssetNotFound(asset));
+    }
+    let tl = &project.timeline;
+    let all = || {
+        tl.tracks
+            .iter()
+            .flat_map(|t| t.clips.iter().map(move |c| (t, c)))
+    };
+    if all().any(|(_, c)| c.compound().is_some_and(|(i, _)| compound_uses(i, asset))) {
+        return Err(EditError::AssetInCompound);
+    }
+    let using: Vec<(bool, ClipId)> = all()
+        .filter(|(_, c)| uses_asset(c, asset))
+        .map(|(t, c)| (t.locked, c.id))
+        .collect();
+    if using.iter().any(|(locked, _)| *locked) {
+        return Err(EditError::TrackLocked);
+    }
+    let clips: Vec<ClipId> = using.into_iter().map(|(_, id)| id).collect();
+    let mut next = project.clone();
+    if !clips.is_empty() {
+        delete_clips(&mut next, &clips)?;
+    }
+    next.assets.remove(&asset);
+    *project = next;
+    Ok(clips.len())
+}
+
+/// 单独预览一个素材用的工程（剪映单击素材卡片，播放器里先看这个素材）：画布设置同 `project`，
+/// 只有这一个素材从头放到尾。素材不存在时 `None`。
+#[must_use]
+pub fn preview_project(project: &Project, asset: AssetId) -> Option<Project> {
+    let a = project.assets.get(&asset)?.clone();
+    let mut p = Project {
+        settings: project.settings,
+        ..Project::new()
+    };
+    p.settings.main_magnet = false;
+    p.assets.insert(asset, a);
+    append_asset(&mut p, asset).ok()?;
+    Some(p)
 }
 
 /// 波纹删除：删掉片段，同轨后面的片段左移补上被删的长度。
@@ -1052,6 +1302,49 @@ pub fn apply_adjust_at(
                 c.animation.upsert(prop, at, value);
             }
         }
+        // 高光、阴影、光感、锐化、颗粒、暗角不做关键帧，直接改
+        for extra in crate::AdjustExtra::ALL {
+            extra.set(&mut c.adjust, extra.get(&adjust));
+        }
+        Ok(())
+    })
+}
+
+/// 界面拖 HSL 滑条走这里：某个颜色的三项，有关键帧的那项在 `at`（相对片段起点）新建或更新关键帧，
+/// 没有的改固定值。
+///
+/// # Errors
+/// 片段不存在、不是视频轨上的片段，或数值不在 -1–1。
+pub fn apply_hsl_at(
+    project: &mut Project,
+    clip: ClipId,
+    at: Time,
+    band: crate::HslBand,
+    hsl: crate::grade::HslAdjust,
+) -> Result<(), EditError> {
+    use crate::HslChannel;
+    let channels = [
+        HslChannel::Hue,
+        HslChannel::Saturation,
+        HslChannel::Lightness,
+    ];
+    if channels
+        .iter()
+        .any(|ch| !(-1.0..=1.0).contains(&ch.get(&hsl)))
+    {
+        return Err(EditError::InvalidValue);
+    }
+    ensure_video(project, clip)?;
+    update_clip(project, clip, |c| {
+        for ch in channels {
+            let prop = crate::Prop::hsl(band, ch);
+            let value = ch.get(&hsl);
+            if c.animation.keys(prop).is_empty() {
+                c.set_base(prop, value);
+            } else if moved(c.value_at(prop, at), value) {
+                c.animation.upsert(prop, at, value);
+            }
+        }
         Ok(())
     })
 }
@@ -1542,7 +1835,7 @@ pub fn rotate_quarter(project: &mut Project, clip: ClipId, at: Time) -> Result<(
         .timeline
         .find_clip(clip)
         .ok_or(EditError::ClipNotFound(clip))?;
-    let mut t = c.transform_at(at);
+    let mut t = c.keyed_transform_at(at);
     // 和属性面板一样落在 (-180°, 180°]；先取整到 0.001° 免得累积误差
     t.rotation = crate::wrap_degrees(((t.rotation + 90.0) * 1000.0).round() / 1000.0);
     apply_transform_at(project, clip, at, t)
@@ -1588,7 +1881,7 @@ pub fn reset_transform(project: &mut Project, clip: ClipId) -> Result<(), EditEr
 pub fn add_keyframe(project: &mut Project, clip: ClipId, at: Time) -> Result<(), EditError> {
     ensure_visual(project, clip)?;
     update_clip(project, clip, |c| {
-        let now = c.transform_at(at);
+        let now = c.keyed_transform_at(at);
         for prop in crate::Prop::TRANSFORM {
             c.animation.upsert(prop, at, prop.get(&now));
         }
@@ -1675,7 +1968,9 @@ pub fn apply_transform_at(
     }
     ensure_visual(project, clip)?;
     update_clip(project, clip, |c| {
-        let now = c.transform_at(at);
+        let now = c.keyed_transform_at(at);
+        // 横竖比例不做关键帧，直接改
+        c.transform.stretch = t.stretch;
         for prop in crate::Prop::TRANSFORM {
             let value = prop.get(&t);
             if c.animation.keys(prop).is_empty() {
@@ -1701,6 +1996,31 @@ fn moved(now: f32, next: f32) -> bool {
 /// 片段不存在、那一刻没有画面属性的关键帧。
 pub fn remove_keyframe(project: &mut Project, clip: ClipId, at: Time) -> Result<(), EditError> {
     remove_keyframe_props(project, clip, at, &crate::Prop::TRANSFORM)
+}
+
+/// 把片段在 `from`（相对片段起点）处的关键帧（所有属性）挪到 `to`（时间轴上拖小菱形）。
+///
+/// # Errors
+/// 片段不存在；`to` 不在片段里；`from` 处没有关键帧。
+pub fn move_keyframes(
+    project: &mut Project,
+    clip: ClipId,
+    from: Time,
+    to: Time,
+) -> Result<(), EditError> {
+    update_clip(project, clip, |c| {
+        if to < Time::ZERO || to >= c.duration {
+            return Err(EditError::InvalidValue);
+        }
+        if from == to {
+            return Ok(());
+        }
+        if c.animation.move_keys(from, to) {
+            Ok(())
+        } else {
+            Err(EditError::NoKeyframe)
+        }
+    })
 }
 
 /// 设置片段内 `at` 时刻关键帧的缓动（作用在它到下一个关键帧这一段）。
@@ -2129,6 +2449,13 @@ pub fn extract_range(project: &Project, from: Time, to: Time) -> Result<Project,
         .filter(|m| **m >= from && **m < to)
         .map(|m| *m - from)
         .collect();
+    out.timeline.marker_colors = out
+        .timeline
+        .marker_colors
+        .iter()
+        .filter(|(m, _)| *m >= from && *m < to)
+        .map(|&(m, c)| (m - from, c))
+        .collect();
     out.timeline.range = None;
     // 封面帧跟着挪；落在区域外面就不要了
     if let Some(crate::Cover::Frame(t)) = out.timeline.cover {
@@ -2307,6 +2634,9 @@ fn overlay_clip(id: ClipId, start: Time, duration: Time, content: ClipContent) -
         stabilized: None,
         input_space: None,
         parent: None,
+        audio_split: false,
+        motion: crate::motion::ClipMotion::NONE,
+        group: None,
     }
 }
 
@@ -2472,6 +2802,9 @@ fn text_clip(id: ClipId, start: Time, duration: Time, text: String, on_top: bool
         stabilized: None,
         input_space: None,
         parent: None,
+        audio_split: false,
+        motion: crate::motion::ClipMotion::NONE,
+        group: None,
     }
 }
 
@@ -3816,6 +4149,7 @@ mod tests {
             denoise: 0.4,
             eq: [2.0, 0.0, -3.0],
             compress: 0.5,
+            ..crate::AudioFx::NONE
         };
         set_audio_fx(&mut p, ids.a1, fx).unwrap();
         assert_eq!(clip(&p, ids.a1).audio_fx, fx);
@@ -4632,5 +4966,108 @@ mod tests {
             crate::srt::import_srt(&mut p, &cues).map(|r| r.added.len()),
             Err(EditError::TrackLocked)
         );
+    }
+
+    #[test]
+    fn keyframes_move_together_and_keep_their_easing() {
+        let (mut p, ids) = sample_project();
+        add_keyframe(&mut p, ids.v1, secs(1)).unwrap();
+        add_keyframe(&mut p, ids.v1, secs(3)).unwrap();
+        set_keyframe_easing(
+            &mut p,
+            ids.v1,
+            secs(1),
+            &crate::Prop::TRANSFORM,
+            crate::Easing::Linear,
+        )
+        .unwrap();
+        move_keyframes(&mut p, ids.v1, secs(1), secs(2)).unwrap();
+        let c = Arc::clone(p.timeline.find_clip(ids.v1).unwrap().1);
+        assert_eq!(c.animation.times(), [secs(2), secs(3)]);
+        assert_eq!(
+            c.animation.keys(crate::Prop::X)[0].easing,
+            crate::Easing::Linear
+        );
+        // 挪到别的关键帧上：合成一个（挪过去的那个盖掉原来的）
+        move_keyframes(&mut p, ids.v1, secs(2), secs(3)).unwrap();
+        let merged = Arc::clone(p.timeline.find_clip(ids.v1).unwrap().1);
+        assert_eq!(merged.animation.times(), [secs(3)]);
+        // 片段外面不行；那一刻没有关键帧也不行
+        assert_eq!(
+            move_keyframes(&mut p, ids.v1, secs(3), secs(9)),
+            Err(EditError::InvalidValue)
+        );
+        assert_eq!(
+            move_keyframes(&mut p, ids.v1, secs(1), secs(2)),
+            Err(EditError::NoKeyframe)
+        );
+    }
+
+    #[test]
+    fn removing_an_asset_takes_its_clips_with_it() {
+        let (mut p, ids) = sample_project();
+        // 视频素材用在 v1、v2 上
+        assert_eq!(remove_asset(&mut p, ids.video_asset), Ok(2));
+        assert!(!p.assets.contains_key(&ids.video_asset));
+        assert!(p.timeline.find_clip(ids.v1).is_none() && p.timeline.find_clip(ids.v2).is_none());
+        // 片段在锁着的轨道上：不删
+        let (mut locked, held) = sample_project();
+        let (track, _) = locked.timeline.find_clip(held.a1).unwrap();
+        locked.timeline.track_mut(track).unwrap().locked = true;
+        assert_eq!(
+            remove_asset(&mut locked, held.audio_asset),
+            Err(EditError::TrackLocked)
+        );
+        assert!(locked.assets.contains_key(&held.audio_asset));
+        // 复合片段里用到了：不删
+        let (mut grouped, more) = sample_project();
+        crate::compound::make_compound(&mut grouped, &[more.v1, more.v2]).unwrap();
+        assert_eq!(
+            remove_asset(&mut grouped, more.video_asset),
+            Err(EditError::AssetInCompound)
+        );
+    }
+
+    #[test]
+    fn previewing_an_asset_plays_just_that_asset() {
+        let (p, ids) = sample_project();
+        let preview = preview_project(&p, ids.video_asset).unwrap();
+        let clips: Vec<_> = preview
+            .timeline
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .collect();
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0].asset(), Some(ids.video_asset));
+        assert_eq!(preview.timeline.duration(), secs(10));
+        assert_eq!(preview.settings.width, p.settings.width);
+        assert!(preview_project(&p, AssetId(999)).is_none());
+    }
+
+    #[test]
+    fn separating_audio_moves_the_sound_to_an_audio_track_and_back() {
+        let (mut p, ids) = sample_project();
+        set_gain(&mut p, ids.v1, -3.0).unwrap();
+        let sound = separate_audio(&mut p, &[ids.v1]).unwrap();
+        assert_eq!(sound.len(), 1);
+        let video = Arc::clone(p.timeline.find_clip(ids.v1).unwrap().1);
+        assert!(video.audio_split, "视频片段不再出原声");
+        let (track, audio) = p.timeline.find_clip(sound[0]).unwrap();
+        assert_eq!(p.timeline.track(track).unwrap().kind, TrackKind::Audio);
+        assert_eq!(
+            (audio.start, audio.duration, audio.asset()),
+            (video.start, video.duration, video.asset())
+        );
+        assert!((audio.gain_db + 3.0).abs() < 1e-6, "音量跟过去");
+        // 已经分离过的再分离：什么都不做
+        assert_eq!(separate_audio(&mut p, &[ids.v1]).unwrap(), []);
+        // 还原：分离出来的那段删掉，原声回来
+        restore_audio(&mut p, &[ids.v1]).unwrap();
+        assert!(!p.timeline.find_clip(ids.v1).unwrap().1.audio_split);
+        assert!(p.timeline.find_clip(sound[0]).is_none());
+        // 旧工程文件没有这一项：没分离
+        let json = serde_json::to_string(p.timeline.find_clip(ids.v1).unwrap().1.as_ref()).unwrap();
+        assert!(!json.contains("audio_split"));
     }
 }
