@@ -33,7 +33,7 @@ static SOURCES: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
 /// 插件拼上内置着色器以后的完整源码。
 #[must_use]
 pub fn full_source(plugin: &str) -> String {
-    format!("{}\n{plugin}\n{ENTRY}", include_str!("shader.wgsl"))
+    format!("{}\n{plugin}\n{ENTRY}", crate::LAYER_SHADER)
 }
 
 /// 检查插件能不能编译（语法、类型、有没有 `plugin_effect`）。

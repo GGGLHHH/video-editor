@@ -107,7 +107,9 @@ pub(crate) fn source_end_limit(project: &Project, clip: &Clip) -> Time {
             || clip.end(),
             |a| clip.start + (a.source_limit() - *source_in).scaled(1.0 / f64::from(clip.speed)),
         ),
-        ClipContent::Compound { inner, source_in } => clip.start + (inner.duration() - *source_in),
+        ClipContent::Compound { inner, source_in } => {
+            clip.start + (inner.duration() - *source_in).scaled(1.0 / f64::from(clip.speed))
+        }
         ClipContent::Subtitle { .. } | ClipContent::Adjustment | ClipContent::Effect(_) => {
             Time(i64::MAX / 4)
         }
@@ -321,10 +323,9 @@ pub fn trim_start(project: &mut Project, clip: ClipId, new_start: Time) -> Resul
             .checked_sub(1)
             .map_or(Time::ZERO, |i| track.clips[i].end());
         let source_floor = match &c.content {
-            ClipContent::Media { source_in, .. } => {
+            ClipContent::Media { source_in, .. } | ClipContent::Compound { source_in, .. } => {
                 c.start - source_in.scaled(1.0 / f64::from(c.speed))
             }
-            ClipContent::Compound { source_in, .. } => c.start - *source_in,
             ClipContent::Subtitle { .. } | ClipContent::Adjustment | ClipContent::Effect(_) => {
                 Time::ZERO
             }
@@ -340,8 +341,9 @@ pub fn trim_start(project: &mut Project, clip: ClipId, new_start: Time) -> Resul
         let start = new_start.clamp(lower, upper);
         let speed = f64::from(c.speed);
         match &mut c.content {
-            ClipContent::Media { source_in, .. } => *source_in += (start - c.start).scaled(speed),
-            ClipContent::Compound { source_in, .. } => *source_in += start - c.start,
+            ClipContent::Media { source_in, .. } | ClipContent::Compound { source_in, .. } => {
+                *source_in += (start - c.start).scaled(speed);
+            }
             _ => {}
         }
         // 关键帧时间相对片段起点：起点后移多少，关键帧就前移多少，仍对着原来的内容
@@ -1626,9 +1628,13 @@ fn set_speed_with(
     with_timeline(project, |_, tl| {
         let (ti, ci) = locate(tl, clip)?;
         let mut c = (*tl.tracks[ti].clips[ci]).clone();
-        // 只有素材片段能变速
-        if c.asset().is_none() {
+        // 素材片段能变速；复合片段能常规变速（不能曲线变速），里面每段乘上去都要还在范围里
+        let compound = c.compound().is_some();
+        if c.asset().is_none() && !(compound && curve.is_none()) {
             return Err(EditError::WrongTrackKind);
+        }
+        if !crate::compound::speed_fits(&c, speed) {
+            return Err(EditError::InvalidValue);
         }
         let span = c.source_span();
         let old = (c.duration, c.speed);
@@ -1670,7 +1676,7 @@ fn set_speed_with(
 /// 片段不存在、是字幕。
 pub fn set_keep_pitch(project: &mut Project, clip: ClipId, keep: bool) -> Result<(), EditError> {
     update_clip(project, clip, |c| {
-        if c.asset().is_none() {
+        if c.asset().is_none() && c.compound().is_none() {
             return Err(EditError::WrongTrackKind);
         }
         c.keep_pitch = keep;
@@ -2100,7 +2106,8 @@ pub fn set_look(project: &mut Project, clip: ClipId, look: crate::Look) -> Resul
     }
     ensure_video(project, clip)?;
     update_clip(project, clip, |c| {
-        if c.asset().is_none() {
+        // 复合片段只用得上蒙版和圆角（整组裁），别的外观对它不生效
+        if c.asset().is_none() && c.compound().is_none() {
             return Err(EditError::WrongTrackKind);
         }
         c.look = look;
@@ -2125,7 +2132,8 @@ pub fn apply_look_at(
     }
     ensure_video(project, clip)?;
     update_clip(project, clip, |c| {
-        if c.asset().is_none() {
+        // 复合片段只用得上蒙版和圆角（整组裁），别的外观对它不生效
+        if c.asset().is_none() && c.compound().is_none() {
             return Err(EditError::WrongTrackKind);
         }
         // 换了蒙版形状 = 一个新蒙版：旧形状的关键帧（包括新形状用不上的宽高、圆角）不留

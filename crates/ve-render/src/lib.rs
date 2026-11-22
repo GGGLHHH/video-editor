@@ -11,3 +11,28 @@ pub mod plugin;
 
 pub use compositor::{Compositor, FramePixels, Layer, MappedNv12, Nv12, RenderConfig};
 pub use error::RenderError;
+
+/// 图层着色器的完整源码：共用的形状函数（`shapes.wgsl`）拼上 `shader.wgsl`。
+const LAYER_SHADER: &str = concat!(include_str!("shapes.wgsl"), include_str!("shader.wgsl"));
+
+/// 复合片段分组的着色器：共用的形状函数拼上 `group.wgsl`。
+const GROUP_SHADER: &str = concat!(include_str!("shapes.wgsl"), include_str!("group.wgsl"));
+
+#[cfg(test)]
+mod tests {
+    use wgpu::naga;
+
+    #[test]
+    fn the_built_in_shaders_compile() {
+        for source in [super::LAYER_SHADER, super::GROUP_SHADER] {
+            let module = naga::front::wgsl::parse_str(source)
+                .unwrap_or_else(|e| panic!("{}", e.emit_to_string(source)));
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(source)));
+        }
+    }
+}

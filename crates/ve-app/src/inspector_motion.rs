@@ -165,11 +165,14 @@ fn card(
 }
 
 impl Workspace {
-    /// 选中的视频片段的（id，动画，长度）。
+    /// 选中的视频片段（或视频轨上的复合片段）的（id，动画，长度）。
     fn bound_motion(&self) -> Option<(ClipId, ClipMotion, Time)> {
-        let (id, _, _) = self.bound_video_clip()?;
+        let (id, _, _) = self.bound_visual_clip()?;
         let (_, c) = self.doc.project.timeline.find_clip(id)?;
-        Some((id, c.motion, c.duration))
+        // 字幕的动画是文字动画，另走一套
+        c.subtitle_text()
+            .is_none()
+            .then_some((id, c.motion, c.duration))
     }
 
     /// 现在这一组选了的那个动画的时长。

@@ -277,9 +277,18 @@ impl Workspace {
             .map(|(clip, look, at)| (clip, view_mask(look, self.inspector.look.mask_index), at))
     }
 
+    /// 选中的视频轨媒体片段，或视频轨上的复合片段（整组的蒙版、圆角）。
+    fn bound_look_clip(&self) -> Option<ClipId> {
+        self.bound_video_clip().map(|(c, ..)| c).or_else(|| {
+            let (c, ..) = self.bound_visual_clip()?;
+            let (_, clip) = self.doc.project.timeline.find_clip(c)?;
+            clip.compound().map(|_| c)
+        })
+    }
+
     /// 选中片段这一刻真正的外观（不换蒙版）。
     fn bound_look_real(&self) -> Option<(ClipId, Look, Time)> {
-        let (clip, ..) = self.bound_video_clip()?;
+        let clip = self.bound_look_clip()?;
         let (_, c) = self.doc.project.timeline.find_clip(clip)?;
         let offset = self.key_offset(c);
         Some((clip, c.look_at(offset), offset))
@@ -596,9 +605,10 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// 二级分段「基础 / 抠像 / 蒙版」（剪映），点了就切换。
+    /// 二级分段「基础 / 抠像 / 蒙版」（剪映），点了就切换。复合片段没有「抠像」。
     pub(crate) fn render_picture_segments(&self, cx: &Context<'_, Self>) -> AnyElement {
         let current = self.inspector.look.seg;
+        let keyable = self.bound_video_clip().is_some();
         h_flex()
             .p(px(2.))
             .gap(px(2.))
@@ -610,6 +620,8 @@ impl Workspace {
                     ("seg-key", "抠像", PictureSeg::Key),
                     ("seg-mask", "蒙版", PictureSeg::Mask),
                 ]
+                .into_iter()
+                .filter(|&(_, _, seg)| keyable || seg != PictureSeg::Key)
                 .map(|(id, label, seg)| {
                     let on = seg == current;
                     div()

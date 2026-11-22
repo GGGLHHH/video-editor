@@ -460,7 +460,9 @@ impl Workspace {
         clip: &ve_core::Clip,
         cx: &Context<'_, Self>,
     ) -> impl IntoElement {
-        let body = if self.inspector.speed.curve_seg {
+        // 复合片段只有常规变速（曲线变速要把里面每段的曲线叠起来，不做）
+        let compound = clip.compound().is_some();
+        let body = if self.inspector.speed.curve_seg && !compound {
             self.render_curve_speed(clip, cx)
         } else {
             self.render_normal_speed(clip, cx)
@@ -469,7 +471,7 @@ impl Workspace {
             .id("insp-speed")
             .test_support()
             .gap_3()
-            .child(self.render_speed_segments(cx))
+            .children((!compound).then(|| self.render_speed_segments(cx)))
             .child(body)
             .children(self.render_frame_blend(clip, cx))
     }

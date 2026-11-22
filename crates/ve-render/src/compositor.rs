@@ -101,6 +101,33 @@ fn mask_params(m: &ve_core::Mask, w: f32, h: f32) -> (f32, [f32; 4], [f32; 4]) {
     )
 }
 
+/// 分组那一道的参数（`group.wgsl` 的 `Amount`）：不透明度；有形状时整组按画布大小的图层放在
+/// 输出（`size`）上，算出转之前的显示框、旋转、圆角和蒙版（和图层的蒙版同一套换算）。
+fn group_params(g: &ve_core::compose::GroupPass, size: (u32, u32)) -> [[f32; 4]; 15] {
+    let mut v = [[0.0; 4]; 15];
+    v[0][0] = g.opacity.clamp(0.0, 1.0);
+    v[2][2] = -1.0;
+    let Some(shape) = g.shape else {
+        return v;
+    };
+    let geo = ve_core::layer_geometry(size, size, &shape.transform);
+    let (w, h) = (geo.shown.w, geo.shown.h);
+    let look = &shape.look;
+    v[0] = [v[0][0], 1.0, geo.angle, look.radius * w.min(h) / 2.0];
+    v[1] = [geo.center.0, geo.center.1, geo.shown.x, geo.shown.y];
+    if let Some(m) = look.mask {
+        let (code, center, more) = mask_params(&m, w, h);
+        v[2] = [w, h, code, 0.0];
+        v[3] = center;
+        v[4] = more;
+    } else {
+        v[2] = [w, h, -1.0, 0.0];
+    }
+    let extras = extra_masks(look, w, h);
+    v[5..].copy_from_slice(&extras.v);
+    v
+}
+
 /// 一层另外几个蒙版的记录。
 fn extra_masks(look: &ve_core::Look, w: f32, h: f32) -> ExtraMasks {
     let mut out = ExtraMasks::zeroed();
@@ -826,7 +853,7 @@ fn compose_pipeline(
     pipeline_from(
         device,
         layouts,
-        include_str!("shader.wgsl"),
+        crate::LAYER_SHADER,
         entry,
         pass == Pass::Normal,
     )
@@ -881,7 +908,7 @@ fn pipeline_from(
     })
 }
 
-/// 分组那一道的不透明度：一个 uniform（`vec4`，x 是不透明度）。
+/// 分组那一道的参数：一个 uniform（[`group_params`]）。
 fn group_bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("group"),
@@ -906,7 +933,7 @@ fn group_pipeline(
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("group"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("group.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(crate::GROUP_SHADER.into()),
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("group"),
@@ -1351,13 +1378,13 @@ impl Compositor {
             .groups
             .iter()
             .map(|g| {
+                let v = group_params(g, target.size);
                 let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("group amount"),
-                    size: 16,
+                    size: size_of_val(&v) as u64,
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
-                let v = [g.opacity.clamp(0.0, 1.0), 0.0, 0.0, 0.0];
                 self.queue
                     .write_buffer(&buffer, 0, bytemuck::cast_slice(&v));
                 self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2854,6 +2881,7 @@ mod tests {
             end,
             effects_end: 0,
             opacity,
+            shape: None,
         };
         // 红、绿完全重叠，整组 50%：黑底上一半的绿，红一点都透不出来
         c.set_groups(&[group(0, 2, 0.5)]);
@@ -2892,6 +2920,95 @@ mod tests {
             near(px(&out, 20, 20), [0, 64, 0], 3),
             "{:?}",
             px(&out, 20, 20)
+        );
+        c.set_groups(&[]);
+    }
+
+    #[test]
+    fn a_masked_group_shows_whats_below_outside_the_mask() {
+        let mut c = compositor();
+        let blue = solid(2, 2, [255, 0, 0, 255]);
+        let green = solid(2, 2, [0, 255, 0, 255]);
+        let mut out = Vec::new();
+        let shaped =
+            |look: ve_core::Look, transform: ve_core::Transform| ve_core::compose::GroupPass {
+                start: 1,
+                end: 2,
+                effects_end: 0,
+                opacity: 1.0,
+                shape: Some(ve_core::compose::GroupShape { transform, look }),
+            };
+        let layers = [
+            layer(&blue, 2, 2, FULL, 1.0),
+            layer(&green, 2, 2, FULL, 1.0),
+        ];
+        // 矩形蒙版留左半边：左边是组里的绿，右边露出下面的蓝
+        let mut left = ve_core::Mask::new(ve_core::MaskShape::Rectangle);
+        (left.x, left.y, left.width, left.height) = (-0.25, 0.0, 0.5, 1.0);
+        let look = ve_core::Look {
+            mask: Some(left),
+            ..ve_core::Look::NONE
+        };
+        c.set_groups(&[shaped(look, ve_core::Transform::DEFAULT)]);
+        c.compose_bgra(SIZE, &layers, &mut out).unwrap();
+        assert!(
+            near(px(&out, 8, 18), [0, 255, 0], 3),
+            "{:?}",
+            px(&out, 8, 18)
+        );
+        assert!(
+            near(px(&out, 56, 18), [255, 0, 0], 3),
+            "{:?}",
+            px(&out, 56, 18)
+        );
+        // 再加一个蒙版留最右边一条：两块都留（并集），中间偏右还是下面的蓝
+        let mut right = left;
+        (right.x, right.width) = (0.375, 0.25);
+        let two = ve_core::Look {
+            extra_masks: [Some(right), None, None],
+            ..look
+        };
+        c.set_groups(&[shaped(two, ve_core::Transform::DEFAULT)]);
+        c.compose_bgra(SIZE, &layers, &mut out).unwrap();
+        assert!(
+            near(px(&out, 60, 18), [0, 255, 0], 3),
+            "{:?}",
+            px(&out, 60, 18)
+        );
+        assert!(
+            near(px(&out, 40, 18), [255, 0, 0], 3),
+            "{:?}",
+            px(&out, 40, 18)
+        );
+        // 整组往右挪半个画面：蒙版跟着走，留下的是画面中间那一条
+        let moved = ve_core::Transform {
+            x: 0.5,
+            ..ve_core::Transform::DEFAULT
+        };
+        c.set_groups(&[shaped(look, moved)]);
+        c.compose_bgra(SIZE, &layers, &mut out).unwrap();
+        assert!(
+            near(px(&out, 8, 18), [255, 0, 0], 3),
+            "{:?}",
+            px(&out, 8, 18)
+        );
+        assert!(
+            near(px(&out, 40, 18), [0, 255, 0], 3),
+            "{:?}",
+            px(&out, 40, 18)
+        );
+        // 圆角（胶囊）：角上露出下面，中间是组里的
+        let round = ve_core::Look {
+            radius: 1.0,
+            ..ve_core::Look::NONE
+        };
+        c.set_groups(&[shaped(round, ve_core::Transform::DEFAULT)]);
+        c.compose_bgra(SIZE, &layers, &mut out).unwrap();
+        assert!(near(px(&out, 1, 1), [255, 0, 0], 3), "{:?}", px(&out, 1, 1));
+        assert!(
+            near(px(&out, 32, 18), [0, 255, 0], 3),
+            "{:?}",
+            px(&out, 32, 18)
         );
         c.set_groups(&[]);
     }

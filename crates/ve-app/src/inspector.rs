@@ -101,6 +101,10 @@ impl InspectorTab {
         }
     }
 
+    /// 视频轨上的复合片段（剪映：和普通视频一样能调画面、变速、动画、调色）。
+    pub const COMPOUND: &'static [Self] =
+        &[Self::Picture, Self::Speed, Self::Animation, Self::Adjust];
+
     /// 某类片段有哪些标签（和剪映一致）。
     #[must_use]
     pub const fn for_clip(video: bool, subtitle: bool, sound: bool) -> &'static [Self] {
@@ -453,9 +457,11 @@ impl Workspace {
             ClipContent::Adjustment => self.fill_adjust(&clip.adjust, window, cx),
             ClipContent::Effect(_) => self.refresh_effect_slider(window, cx),
             ClipContent::Compound { .. } => {
-                // 视频轨上的复合片段：整组的位置大小
+                // 视频轨上的复合片段：整组的位置大小、调色
                 if let Some((_, t, _)) = self.bound_visual_clip() {
                     self.fill_transform(&t, window, cx);
+                    let offset = self.key_offset(&clip);
+                    self.fill_adjust(&clip.adjust_at(offset), window, cx);
                 }
             }
         }
@@ -562,12 +568,15 @@ impl Workspace {
         let Some(c) = clip else {
             return self.render_draft_params(cx);
         };
-        if c.compound().is_some() {
-            return inspector_frame(div(), self.render_compound_panel(&c, cx));
-        }
         let video = self.bound_video_clip().is_some();
         let subtitle = matches!(c.content, ClipContent::Subtitle { .. });
-        let available = if c.is_adjustment() {
+        let available = if c.compound().is_some() {
+            if self.bound_visual_clip().is_some() {
+                InspectorTab::COMPOUND
+            } else {
+                &[InspectorTab::Picture][..]
+            }
+        } else if c.is_adjustment() {
             &[InspectorTab::Adjust][..]
         } else if c.effect().is_some() {
             &[InspectorTab::Effect][..]
@@ -622,6 +631,26 @@ impl Workspace {
                     .child(seg)
                     .into_any_element()
             }
+            (Some(InspectorTab::Picture), ClipContent::Compound { .. }) => {
+                // 复合片段：「基础」是它自己的面板（进入、解除、位置大小、圆角），「蒙版」整组裁
+                let seg = match self.inspector.look.seg {
+                    crate::inspector_look::PictureSeg::Mask => self
+                        .render_mask_seg(cx)
+                        .unwrap_or_else(|| div().into_any_element()),
+                    _ => self.render_compound_panel(&c, cx),
+                };
+                v_flex()
+                    .gap_3()
+                    .children(
+                        self.bound_visual_clip()
+                            .map(|_| self.render_picture_segments(cx)),
+                    )
+                    .child(seg)
+                    .into_any_element()
+            }
+            (Some(InspectorTab::Animation), ClipContent::Compound { .. }) => {
+                self.render_motion_tab(cx).into_any_element()
+            }
             (Some(InspectorTab::Audio), ClipContent::Media { .. }) => {
                 self.render_audio_props(&c, cx)
             }
@@ -635,9 +664,10 @@ impl Workspace {
                 // 剪映文字也有「位置大小」，能打关键帧
                 .children(self.render_transform_section(cx))
                 .into_any_element(),
-            (Some(InspectorTab::Speed), ClipContent::Media { .. }) => {
-                self.render_speed_tab(&c, cx).into_any_element()
-            }
+            (
+                Some(InspectorTab::Speed),
+                ClipContent::Media { .. } | ClipContent::Compound { .. },
+            ) => self.render_speed_tab(&c, cx).into_any_element(),
             (Some(InspectorTab::Animation), ClipContent::Media { .. }) if video => {
                 self.render_motion_tab(cx).into_any_element()
             }

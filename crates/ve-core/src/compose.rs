@@ -63,6 +63,18 @@ pub struct GroupPass {
     pub effects_end: usize,
     /// 整组的不透明度。
     pub opacity: f32,
+    /// 复合片段的蒙版、圆角（有的话）：组外面的部分露出下面（[`GroupShape`]）。
+    pub shape: Option<GroupShape>,
+}
+
+/// 复合片段整组的形状：它是一个画布大小的图层，按 `transform`（已经和外面几层复合片段叠好）
+/// 放在画布上，`look` 里的蒙版、圆角裁这一层（描边、阴影、混合模式、抠图对整组不生效）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GroupShape {
+    /// 整组在画布上的位置大小（不透明度另算）。
+    pub transform: Transform,
+    /// 外观（只用蒙版和圆角）。
+    pub look: crate::Look,
 }
 
 impl GroupPass {
@@ -99,9 +111,9 @@ pub fn resolve_frame(project: &Project, t: Time) -> Composition {
     let mut background = crate::ColorMatrix::IDENTITY;
     let mut background_grades: crate::GradeChain = Vec::new();
     let mut effects = Vec::new();
-    // 每层、每道特效外面套着哪些复合片段（从外到里，带这一刻的不透明度）
-    let mut layer_chains: Vec<Vec<(ClipId, f32)>> = Vec::new();
-    let mut effect_chains: Vec<Vec<(ClipId, f32)>> = Vec::new();
+    // 每层、每道特效外面套着哪些复合片段（从外到里，带这一刻的不透明度和形状）
+    let mut layer_chains: Vec<Vec<Outer>> = Vec::new();
+    let mut effect_chains: Vec<Vec<Outer>> = Vec::new();
     // 每层外面各层复合片段自己的调色（从里到外），和调节片段（压在哪几层上、在哪些复合片段里面）：
     // 最后按「里面的调节片段 → 复合片段自己 → 外面的调节片段」的顺序接到每层后面
     let mut layer_parent_grades: Vec<Vec<ParentGrade>> = Vec::new();
@@ -117,7 +129,7 @@ pub fn resolve_frame(project: &Project, t: Time) -> Composition {
                 if let Some(clip) = clip {
                     under_parents(layer, clip, t, canvas);
                 }
-                layer_chains.push(clip.map(|c| parents_of(c, t)).unwrap_or_default());
+                layer_chains.push(clip.map(|c| parents_of(c, t, canvas)).unwrap_or_default());
                 layer_parent_grades.push(clip.map(|c| parent_grades(c, t)).unwrap_or_default());
             }
             out.extend(pair);
@@ -138,7 +150,7 @@ pub fn resolve_frame(project: &Project, t: Time) -> Composition {
                 effect,
                 seconds,
             });
-            effect_chains.push(parents_of(clip, t));
+            effect_chains.push(parents_of(clip, t, canvas));
             continue;
         }
         if clip.is_adjustment() {
@@ -156,7 +168,10 @@ pub fn resolve_frame(project: &Project, t: Time) -> Composition {
                 background_grades.push(step.clone());
                 adjustments.push(Adjustment {
                     below: out.len(),
-                    inside: parents_of(clip, t).into_iter().map(|(id, _)| id).collect(),
+                    inside: parents_of(clip, t, canvas)
+                        .into_iter()
+                        .map(|o| o.id)
+                        .collect(),
                     matrix: m,
                     step,
                 });
@@ -166,7 +181,7 @@ pub fn resolve_frame(project: &Project, t: Time) -> Composition {
         if let Some(mut layer) = layer_of(tr.id, clip, i, t - clip.start, None) {
             under_parents(&mut layer, clip, t, canvas);
             out.push(layer);
-            layer_chains.push(parents_of(clip, t));
+            layer_chains.push(parents_of(clip, t, canvas));
             layer_parent_grades.push(parent_grades(clip, t));
         }
     }
@@ -261,41 +276,64 @@ fn parent_grades(clip: &Clip, t: Time) -> Vec<ParentGrade> {
     out
 }
 
-/// 片段外面套着的复合片段（从外到里），带这一刻的不透明度。
-fn parents_of(clip: &Clip, t: Time) -> Vec<(ClipId, f32)> {
+/// 外面一层复合片段在这一刻：编号、不透明度、整组的形状（有蒙版或圆角时）。
+#[derive(Debug, Clone, Copy)]
+struct Outer {
+    id: ClipId,
+    opacity: f32,
+    shape: Option<GroupShape>,
+}
+
+/// 片段外面套着的复合片段（从外到里）。形状的位置是外面几层叠起来的（画布 `w`×`h`）。
+fn parents_of(clip: &Clip, t: Time, (w, h): (u32, u32)) -> Vec<Outer> {
     let mut chain = Vec::new();
     let mut next = clip.parent.as_deref();
     while let Some(p) = next {
         let at = (t - p.start).clamp(Time::ZERO, p.duration);
-        chain.push((p.id, p.transform_at(at).opacity));
+        chain.push((p.id, p.transform_at(at), p.look_at(at)));
         next = p.parent.as_deref();
     }
     chain.reverse();
+    let mut placed: Option<Transform> = None;
     chain
+        .into_iter()
+        .map(|(id, mut own, look)| {
+            let opacity = own.opacity;
+            own.opacity = 1.0;
+            let transform = placed.map_or(own, |outer| outer.compose(&own, w, h));
+            placed = Some(transform);
+            let shaped = look.mask.is_some() || look.radius > 0.0;
+            Outer {
+                id,
+                opacity,
+                shape: shaped.then_some(GroupShape { transform, look }),
+            }
+        })
+        .collect()
 }
 
 /// 半透明复合片段的分组：每一层嵌套里，套着同一个复合片段的连续几层是一组（摊开时里面的
 /// 轨道挨着放，同一个复合片段的层一定连着）。完全不透明的不用分组。
 fn groups_of(
-    layers: &[Vec<(ClipId, f32)>],
+    layers: &[Vec<Outer>],
     effects: &[crate::EffectPass],
-    effect_chains: &[Vec<(ClipId, f32)>],
+    effect_chains: &[Vec<Outer>],
 ) -> Vec<GroupPass> {
     let depth = layers.iter().map(Vec::len).max().unwrap_or(0);
     let mut groups = Vec::new();
     for d in 0..depth {
         let mut i = 0;
         while i < layers.len() {
-            let Some(&(id, opacity)) = layers[i].get(d) else {
+            let Some(&Outer { id, opacity, shape }) = layers[i].get(d) else {
                 i += 1;
                 continue;
             };
             let end = (i + 1..layers.len())
-                .find(|&j| layers[j].get(d).map(|x| x.0) != Some(id))
+                .find(|&j| layers[j].get(d).map(|x| x.id) != Some(id))
                 .unwrap_or(layers.len());
-            if opacity < 1.0 - 1e-6 {
+            if opacity < 1.0 - 1e-6 || shape.is_some() {
                 // 组里的特效：压在组里最后一层上、又在这个复合片段里面的那几道
-                let inside = |k: usize| effect_chains[k].get(d).map(|x| x.0) == Some(id);
+                let inside = |k: usize| effect_chains[k].get(d).map(|x| x.id) == Some(id);
                 let effects_end = effects
                     .iter()
                     .enumerate()
@@ -306,6 +344,7 @@ fn groups_of(
                     end,
                     effects_end,
                     opacity,
+                    shape,
                 });
             }
             i = end;
@@ -890,6 +929,7 @@ mod tests {
             end: 3,
             effects_end: 0,
             opacity: 0.5,
+            shape: None,
         };
         // 第 0 层没画：组往前挪一层
         assert_eq!(

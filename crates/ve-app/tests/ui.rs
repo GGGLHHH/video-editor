@@ -407,6 +407,132 @@ fn the_default_frame_rate_does_not_change_an_opened_project(cx: &mut TestAppCont
     assert_eq!(rate, ve_core::FrameRate::new(25, 1), "打开的工程不改帧率");
 }
 
+/// 选中的复合片段（克隆一份）。
+fn selected_compound(cx: &TestAppContext, ui: &Ui) -> ve_core::Clip {
+    ui.view.read_with(cx, |w, _| {
+        let doc = w.document();
+        let c = doc
+            .project
+            .timeline
+            .find_clip(doc.selection()[0])
+            .unwrap()
+            .1;
+        assert!(c.compound().is_some());
+        (**c).clone()
+    })
+}
+
+#[gpui_kit::test]
+fn a_compound_has_animation_and_adjust_tabs_like_a_video(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    magnet_off(cx, &ui);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    press(cx, &ui, "ctrl-a");
+    press(cx, &ui, "alt-g");
+    // 「画面」标签：原来的复合片段面板（进入、解除、位置大小）
+    click(cx, &ui, "insp-tab-picture");
+    assert!(exists(cx, &ui, "insp-enter-compound") && exists(cx, &ui, "tf-scale"));
+    // 「动画」：整组渐显
+    click(cx, &ui, "insp-tab-animation");
+    click(cx, &ui, "anim-in-fade");
+    let faded = selected_compound(cx, &ui);
+    assert_eq!(faded.transform_at(Time::ZERO).opacity, 0.0);
+    // 「调整」：整组降饱和度
+    click(cx, &ui, "insp-tab-adjust");
+    type_into(cx, &ui, "adj-saturation-value", "-40");
+    let c = selected_compound(cx, &ui);
+    assert!(
+        (c.adjust.saturation + 0.4).abs() < 1e-4,
+        "{}",
+        c.adjust.saturation
+    );
+    // 合成时里面每一层都套上了整组的调色
+    let flat = ui.view.read_with(cx, |w, _| {
+        ve_core::compound::flatten(&w.document().project).unwrap()
+    });
+    let comp = ve_core::compose::resolve_frame(&flat, Time::from_secs(1));
+    assert_ne!(comp.layers.len(), 0);
+    assert!(comp.layers.iter().all(|l| !l.color.is_identity()));
+}
+
+#[gpui_kit::test]
+fn a_compound_takes_a_mask_and_round_corners_as_a_whole(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    magnet_off(cx, &ui);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    press(cx, &ui, "ctrl-a");
+    press(cx, &ui, "alt-g");
+    click(cx, &ui, "insp-tab-picture");
+    // 复合片段的画面分页没有「抠像」
+    assert!(exists(cx, &ui, "seg-mask") && !exists(cx, &ui, "seg-key"));
+    // 圆角在位置大小下面，要往下滚才看得到
+    cx.update_window(ui.win, |_, window, wcx| {
+        window.scroll(
+            "inspector-body",
+            ScrollDelta::Pixels(point(px(0.), px(-300.))),
+            wcx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    frame(cx, &ui);
+    type_into(cx, &ui, "look-radius-value", "40");
+    assert!(selected_compound(cx, &ui).look.radius > 0.3);
+    cx.update_window(ui.win, |_, window, wcx| {
+        window.scroll(
+            "inspector-body",
+            ScrollDelta::Pixels(point(px(0.), px(300.))),
+            wcx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    frame(cx, &ui);
+    click(cx, &ui, "seg-mask");
+    click(cx, &ui, "mask-2");
+    let c = selected_compound(cx, &ui);
+    assert_eq!(
+        c.look.mask.map(|m| m.shape),
+        Some(ve_core::MaskShape::Circle)
+    );
+    // 合成时整组按它裁
+    let flat = ui.view.read_with(cx, |w, _| {
+        ve_core::compound::flatten(&w.document().project).unwrap()
+    });
+    let frame = ve_core::compose::resolve_frame(&flat, Time::from_secs(1));
+    assert!(frame.groups.iter().any(|g| g.shape.is_some()));
+    // 回到「基础」还是复合片段的面板
+    click(cx, &ui, "seg-basic");
+    assert!(exists(cx, &ui, "insp-enter-compound"));
+}
+
+#[gpui_kit::test]
+fn a_compound_can_be_sped_up_as_a_whole(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    magnet_off(cx, &ui);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    press(cx, &ui, "ctrl-a");
+    press(cx, &ui, "alt-g");
+    let before = selected_compound(cx, &ui).duration;
+    click(cx, &ui, "insp-tab-speed");
+    // 复合片段只有常规变速
+    assert!(!exists(cx, &ui, "speed-seg-curve"));
+    click(cx, &ui, "speed-2");
+    let c = selected_compound(cx, &ui);
+    assert!((c.speed - 2.0).abs() < 1e-4);
+    assert_eq!(c.duration, Time(before.0 / 2));
+    // 「声音变调」管整组
+    click(cx, &ui, "speed-pitch");
+    assert!(!selected_compound(cx, &ui).keep_pitch);
+    // 一步撤销回到原速
+    click(cx, &ui, "tb-undo");
+    click(cx, &ui, "tb-undo");
+    assert_eq!(selected_compound(cx, &ui).duration, before);
+}
+
 #[gpui_kit::test]
 fn entering_a_compound_edits_whats_inside_and_writes_it_back(cx: &mut TestAppContext) {
     let ui = open(cx);

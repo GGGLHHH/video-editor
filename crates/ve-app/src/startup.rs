@@ -93,7 +93,7 @@ impl Workspace {
             .iter()
             .filter(|t| t.kind == ve_core::TrackKind::Video)
             .flat_map(|t| t.clips.iter())
-            .find(|c| c.asset().is_some())
+            .find(|c| c.asset().is_some() || c.compound().is_some())
             .map(|c| c.id);
         if let Some(id) = first {
             self.doc.select(id, false);

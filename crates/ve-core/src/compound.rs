@@ -217,13 +217,98 @@ fn index_or_add(
         .ok_or(EditError::TrackNotFound(id))
 }
 
-/// 一条轨道上落在 `[from, to)` 里的部分（跨边界的片段在边界处切开），起点平移 `shift`；
-/// 留下的每段的 id 由 `id_of(原 id, 第几段)` 给。
+/// 复合片段里面的时间换到外面：里面 `from` 对着外面 `origin`，里面走 `speed` 秒外面走 1 秒
+/// （复合片段变速）。
+#[derive(Clone, Copy, Debug)]
+struct Retime {
+    from: Time,
+    origin: Time,
+    speed: f32,
+    /// 复合片段变了速时，它自己的「保持音调」管里面所有的声音（两层快慢乘在一起，分不开）。
+    keep_pitch: Option<bool>,
+}
+
+impl Retime {
+    /// 复合片段 `c`（里面从 `source_in` 开始用）的换算。
+    fn of(c: &Clip, source_in: Time) -> Self {
+        #[expect(clippy::float_cmp, reason = "和 1 倍精确比较")]
+        let sped = c.speed != 1.0;
+        Self {
+            from: source_in,
+            origin: c.start,
+            speed: c.speed,
+            keep_pitch: sped.then_some(c.keep_pitch),
+        }
+    }
+
+    fn at(self, t: Time) -> Time {
+        self.origin + (t - self.from).scaled(1.0 / f64::from(self.speed))
+    }
+
+    /// 一段片段换到外面：位置、长度、变速倍数、淡入淡出、关键帧、转场和入场 / 出场动画的时长；
+    /// 外面套着的几层复合片段（[`Clip::parent`]）一样换。
+    fn clip(self, c: &mut Clip) {
+        let k = 1.0 / f64::from(self.speed);
+        let (start, end) = (self.at(c.start), self.at(c.end()));
+        c.start = start;
+        c.duration = end - start;
+        if c.asset().is_some() || c.compound().is_some() {
+            c.speed *= self.speed;
+            if let Some(keep) = self.keep_pitch {
+                c.keep_pitch = keep;
+            }
+        }
+        c.fade_in = c.fade_in.scaled(k);
+        c.fade_out = c.fade_out.scaled(k);
+        c.animation.scale_times(k);
+        if let Some(t) = &mut c.transition_in {
+            t.duration = t.duration.scaled(k);
+        }
+        for m in [&mut c.motion.intro, &mut c.motion.outro]
+            .into_iter()
+            .flatten()
+        {
+            m.duration = m.duration.scaled(k);
+        }
+        if let Some(p) = &c.parent {
+            let mut p = (**p).clone();
+            self.clip(&mut p);
+            c.parent = Some(Arc::new(p));
+        }
+    }
+}
+
+/// 复合片段里面所有素材片段和复合片段（摊开后）的变速倍数的范围；里面什么都没有时 `None`。
+fn inner_speeds(inner: &Compound) -> Option<(f32, f32)> {
+    let direct = inner.tracks.iter().flat_map(|t| t.clips.iter());
+    let flat = flatten_tracks(&inner.tracks);
+    let deep = flat.iter().flat_map(|t| t.clips.iter());
+    direct
+        .chain(deep)
+        .filter(|c| c.asset().is_some() || c.compound().is_some())
+        .map(|c| c.speed)
+        .fold(None, |acc, s| {
+            Some(acc.map_or((s, s), |(lo, hi): (f32, f32)| (lo.min(s), hi.max(s))))
+        })
+}
+
+/// 复合片段 `c` 能不能变成 `speed` 倍速：里面每段乘上去都还在变速范围里。
+pub(crate) fn speed_fits(c: &Clip, speed: f32) -> bool {
+    let Some((inner, _)) = c.compound() else {
+        return true;
+    };
+    let (lo, hi) = crate::timeline::SPEED_RANGE;
+    let eps = 1e-4;
+    inner_speeds(inner).is_none_or(|(a, b)| a * speed >= lo - eps && b * speed <= hi + eps)
+}
+
+/// 一条轨道上落在 `[from, to)`（里面的时间）里的部分（跨边界的片段在边界处切开），按 `retime`
+/// 换到外面；留下的每段的 id 由 `id_of(原 id, 第几段)` 给。
 fn window(
     track: &Track,
     from: Time,
     to: Time,
-    shift: Time,
+    retime: Retime,
     id_of: &mut dyn FnMut(ClipId, usize) -> ClipId,
 ) -> Vec<Arc<Clip>> {
     let mut tl = crate::Timeline {
@@ -266,7 +351,7 @@ fn window(
         };
         let mut piece = (**c).clone();
         piece.id = id_of(original, i);
-        piece.start = c.start + shift;
+        retime.clip(&mut piece);
         out.push(Arc::new(piece));
     }
     out
@@ -286,7 +371,7 @@ pub fn break_compound(project: &mut Project, clip: ClipId) -> Result<Vec<ClipId>
         return Err(EditError::WrongTrackKind);
     };
     let inner = Arc::clone(inner);
-    let (start, duration) = (c.start, c.duration);
+    let (retime, span) = (Retime::of(c, source_in), c.source_span());
     if project.timeline.track(track_id).is_some_and(|t| t.locked) {
         return Err(EditError::TrackLocked);
     }
@@ -303,13 +388,9 @@ pub fn break_compound(project: &mut Project, clip: ClipId) -> Result<Vec<ClipId>
     let mut below: Vec<(TrackKind, TrackId)> = Vec::new();
     for it in inner.tracks.iter().rev() {
         let mut ids = next.ids.clone();
-        let pieces = window(
-            it,
-            source_in,
-            source_in + duration,
-            start - source_in,
-            &mut |_, _| ids.clip(),
-        );
+        let pieces = window(it, source_in, source_in + span, retime, &mut |_, _| {
+            ids.clip()
+        });
         next.ids = ids;
         if pieces.is_empty() {
             continue;
@@ -377,9 +458,10 @@ pub fn set_inner(project: &mut Project, clip: ClipId, tracks: Vec<Track>) -> Res
         return Err(EditError::TrackLocked);
     }
     let name = inner.name.clone();
+    let speed = f64::from(c.speed);
     let tracks: Vec<Track> = tracks.into_iter().filter(|t| !t.clips.is_empty()).collect();
     let next = Arc::new(Compound { name, tracks });
-    let room = next.duration() - source_in;
+    let room = (next.duration() - source_in).scaled(1.0 / speed);
     if room <= Time::ZERO {
         return crate::edit::delete_clips(project, &[clip]);
     }
@@ -431,14 +513,13 @@ fn stack_gain(piece: &mut Clip, db: f32) {
 }
 
 /// 摊开的片段记下外面那段复合片段 `parent`（合成时套上它的画面属性）；里面本来就有外层
-/// （复合片段套复合片段）时，接到最外面，原来那几层的起点跟着片段一起挪 `shift`。
-fn adopt(piece: &mut Clip, parent: &Arc<Clip>, shift: Time) {
+/// （复合片段套复合片段）时，接到最外面（那几层已经跟着片段一起换到了外面的时间）。
+fn adopt(piece: &mut Clip, parent: &Arc<Clip>) {
     piece.parent = Some(piece.parent.take().map_or_else(
         || Arc::clone(parent),
         |inner| {
             let mut inner = (*inner).clone();
-            inner.start += shift;
-            adopt(&mut inner, parent, shift);
+            adopt(&mut inner, parent);
             Arc::new(inner)
         },
     ));
@@ -458,20 +539,20 @@ fn flatten_tracks(tracks: &[Track]) -> Vec<Track> {
                 continue;
             };
             let outer = c.id.0;
-            let shift = c.start - source_in;
+            let retime = Retime::of(c, source_in);
             let parent = Arc::clone(c);
             for it in flatten_tracks(&inner.tracks) {
                 let mut pieces = window(
                     &it,
                     source_in,
-                    source_in + c.duration,
-                    shift,
+                    source_in + c.source_span(),
+                    retime,
                     // 一段原片段在范围里只留一块：按原 id 合成，裁剪时 id 不变
                     &mut |id, _| ClipId(synth(outer, id.0)),
                 );
                 for piece in &mut pieces {
                     let piece = Arc::make_mut(piece);
-                    adopt(piece, &parent, shift);
+                    adopt(piece, &parent);
                     // 复合片段的音量叠到里面的声音上（音频轨和视频的原声都算；有音量关键帧的，
                     // 每个关键帧也一起挪）
                     if it.kind != TrackKind::Subtitle && parent.gain_db != 0.0 {
@@ -584,6 +665,93 @@ mod tests {
             Err(EditError::WrongTrackKind)
         );
         assert!(break_compound(&mut p, cc).is_ok());
+    }
+
+    #[test]
+    fn a_sped_up_compound_plays_everything_inside_faster() {
+        let (mut p, ids) = sample_project();
+        let half = |t: Time| Time(t.0 / 2);
+        // 0–8 秒打包，两倍速 → 4 秒
+        let cc = make_compound(&mut p, &[ids.v1, ids.v2, ids.a1, ids.s1]).unwrap();
+        crate::edit::set_speed(&mut p, cc, 2.0).unwrap();
+        assert_eq!(p.timeline.find_clip(cc).unwrap().1.duration, secs(4));
+        let flat = flatten(&p).unwrap();
+        // 1 秒 = 里面 2 秒（v1 素材 2 秒）；3 秒 = 里面 6 秒（v2 素材 6 秒）
+        let at = |t| crate::compose::resolve_layers(&flat, t)[0].source_time;
+        assert_eq!((at(secs(1)), at(secs(3))), (secs(2), secs(6)));
+        let pieces: Vec<(Time, Time, f32)> = flat
+            .timeline
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .map(|c| (c.start, c.duration, c.speed))
+            .collect();
+        // 字幕 1–3 秒 → 0.5–1.5 秒；声音 0–8 → 0–4 两倍速；v2 5–8 → 2.5–4
+        assert!(
+            pieces.contains(&(half(secs(1)), secs(1), 1.0)),
+            "{pieces:?}"
+        );
+        assert!(pieces.contains(&(Time::ZERO, secs(4), 2.0)), "{pieces:?}");
+        assert!(
+            pieces.contains(&(half(secs(5)), half(secs(3)), 2.0)),
+            "{pieces:?}"
+        );
+        // 剪掉开头 1 秒（= 里面 2 秒）：1 秒处是里面 2 秒
+        let mut trimmed = p.clone();
+        crate::edit::trim_start(&mut trimmed, cc, secs(1)).unwrap();
+        let trimmed_flat = flatten(&trimmed).unwrap();
+        assert_eq!(
+            crate::compose::resolve_layers(&trimmed_flat, secs(1))[0].source_time,
+            secs(2)
+        );
+        // 不能再往前拖：里面开头就是 0
+        crate::edit::trim_start(&mut trimmed, cc, Time::ZERO).unwrap();
+        assert_eq!(trimmed.timeline.find_clip(cc).unwrap().1.start, Time::ZERO);
+        // 解除：放回去的片段保持现在的快慢和位置
+        let mut broken = p.clone();
+        break_compound(&mut broken, cc).unwrap();
+        let back: Vec<(Time, Time, f32)> = broken
+            .timeline
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .map(|c| (c.start, c.duration, c.speed))
+            .collect();
+        assert!(
+            back.contains(&(half(secs(5)), half(secs(3)), 2.0)),
+            "{back:?}"
+        );
+        // 写回里面：里面 8 秒，两倍速最多 4 秒
+        let inner = p
+            .timeline
+            .find_clip(cc)
+            .unwrap()
+            .1
+            .compound()
+            .unwrap()
+            .0
+            .tracks
+            .clone();
+        set_inner(&mut p, cc, inner).unwrap();
+        assert_eq!(p.timeline.find_clip(cc).unwrap().1.duration, secs(4));
+    }
+
+    #[test]
+    fn compound_speed_keeps_every_inner_speed_in_range() {
+        let (mut p, ids) = sample_project();
+        crate::edit::set_speed(&mut p, ids.v1, 8.0).unwrap();
+        let cc = make_compound(&mut p, &[ids.v1]).unwrap();
+        // 里面 8 倍速再两倍就是 16 倍，超出 0.1–10
+        assert_eq!(
+            crate::edit::set_speed(&mut p, cc, 2.0),
+            Err(EditError::InvalidValue)
+        );
+        assert!(crate::edit::set_speed(&mut p, cc, 1.2).is_ok());
+        // 复合片段不能曲线变速
+        assert_eq!(
+            crate::edit::set_speed_curve(&mut p, cc, Some(crate::CurvePreset::Hero.curve())),
+            Err(EditError::WrongTrackKind)
+        );
     }
 
     #[test]
@@ -833,7 +1001,47 @@ mod tests {
                 end: 2,
                 effects_end: 0,
                 opacity: 0.5,
+                shape: None,
             }]
+        );
+    }
+
+    #[test]
+    fn a_compounds_mask_and_corners_cut_the_whole_group() {
+        let (mut p, ids) = sample_project();
+        let cc = make_compound(&mut p, &[ids.v1, ids.v2]).unwrap();
+        // 没有外观、完全不透明：不用分组
+        let plain = flatten(&p).unwrap();
+        assert_eq!(crate::compose::resolve_frame(&plain, secs(1)).groups, []);
+        let moved = crate::Transform {
+            x: 0.2,
+            ..crate::Transform::default()
+        };
+        crate::edit::set_transform(&mut p, cc, moved).unwrap();
+        let look = crate::Look {
+            mask: Some(crate::Mask::new(crate::MaskShape::Circle)),
+            radius: 0.3,
+            ..crate::Look::NONE
+        };
+        crate::edit::set_look(&mut p, cc, look).unwrap();
+        let flat = flatten(&p).unwrap();
+        let frame = crate::compose::resolve_frame(&flat, secs(1));
+        assert_eq!(frame.groups.len(), 1);
+        let pass = frame.groups[0];
+        assert!((pass.opacity - 1.0).abs() < 1e-6);
+        let shape = pass.shape.expect("有蒙版的复合片段整组裁");
+        assert_eq!(shape.look, look);
+        assert!((shape.transform.x - 0.2).abs() < 1e-6);
+        // 套在外面一层的复合片段里：形状的位置是两层叠起来的
+        let outer = make_compound(&mut p, &[cc]).unwrap();
+        crate::edit::set_transform(&mut p, outer, moved).unwrap();
+        let nested = flatten(&p).unwrap();
+        let nested_frame = crate::compose::resolve_frame(&nested, secs(1));
+        let inner = nested_frame.groups.iter().find_map(|g| g.shape).unwrap();
+        assert!(
+            (inner.transform.x - 0.4).abs() < 1e-5,
+            "{}",
+            inner.transform.x
         );
     }
 

@@ -87,7 +87,6 @@ impl Workspace {
                 .child(SharedString::from(value))
         };
         v_flex()
-            .p_3()
             .gap_2()
             .child(
                 div()
@@ -100,12 +99,6 @@ impl Workspace {
                 "里面",
                 format!("{} 条轨道、{clips} 段", inner.tracks.len()),
             ))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child("复合片段可以整段移动、裁剪、分割，下面的位置大小、不透明度对里面所有画面一起生效；要改里面的片段点「进入」或先解除"),
-            )
             .child(
                 h_flex()
                     .gap_2()
