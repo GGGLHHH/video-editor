@@ -145,16 +145,6 @@ fn masks_alpha(local: vec2<f32>, v: VOut) -> f32 {
     return a;
 }
 
-// BT.709 色度（Cb、Cr），和 ve_core::ChromaKey 一样
-fn chroma(c: vec3<f32>) -> vec2<f32> {
-    let y = dot(c, vec3(0.2126, 0.7152, 0.0722));
-    return vec2((c.b - y) / 1.8556, (c.r - y) / 1.5748);
-}
-
-fn premul_over(top: vec4<f32>, under: vec4<f32>) -> vec4<f32> {
-    return top + under * (1.0 - top.a);
-}
-
 // 这一层在这个像素上的颜色（预乘透明，已乘不透明度）
 fn layer_color(v: VOut) -> vec4<f32> {
     let size = max(v.sizes.xy, vec2(1.0));
@@ -238,76 +228,25 @@ fn fs(v: VOut) -> @location(0) vec4<f32> {
     return layer_color(v);
 }
 
-fn hard_light(b: f32, s: f32) -> f32 {
-    if s <= 0.5 {
-        return b * 2.0 * s;
-    }
-    let s2 = 2.0 * s - 1.0;
-    return b + s2 - b * s2;
-}
-
-// 一个通道的混合 B(底色, 图层色)，和 ve_core::BlendMode::channel 一样
-fn blend_channel(mode: f32, cb: f32, cs: f32) -> f32 {
-    if mode < 1.5 {
-        return min(cb, cs);                      // 1 变暗
-    } else if mode < 2.5 {
-        return cb + cs - cb * cs;                // 2 滤色
-    } else if mode < 3.5 {
-        return hard_light(cs, cb);               // 3 叠加
-    } else if mode < 4.5 {
-        return cb * cs;                          // 4 正片叠底
-    } else if mode < 5.5 {
-        return max(cb, cs);                      // 5 变亮
-    } else if mode < 6.5 {
-        return hard_light(cb, cs);               // 6 强光
-    } else if mode < 7.5 {                       // 7 柔光
-        if cs <= 0.5 {
-            return cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb);
-        }
-        var dd = sqrt(cb);
-        if cb <= 0.25 {
-            dd = ((16.0 * cb - 12.0) * cb + 4.0) * cb;
-        }
-        return cb + (2.0 * cs - 1.0) * (dd - cb);
-    } else if mode < 8.5 {
-        return max(cb + cs - 1.0, 0.0);          // 8 线性加深
-    } else if mode < 9.5 {                       // 9 颜色加深
-        if cb >= 1.0 {
-            return 1.0;
-        }
-        if cs <= 0.0 {
-            return 0.0;
-        }
-        return 1.0 - min((1.0 - cb) / cs, 1.0);
-    }
-    if cb <= 0.0 {                               // 10 颜色减淡
-        return 0.0;
-    }
-    if cs >= 1.0 {
-        return 1.0;
-    }
-    return min(cb / (1.0 - cs), 1.0);
-}
-
 @fragment
 fn fs_blend(v: VOut) -> @location(0) vec4<f32> {
     let c = layer_color(v);
-    let cb = textureLoad(backdrop, vec2<i32>(v.pos.xy), 0).rgb;
-    if c.a <= 0.0 {
-        return vec4(cb, 1.0);
-    }
-    let cs = clamp(c.rgb / c.a, vec3(0.0), vec3(1.0));
-    let m = v.p0.z;
-    let mixed = vec3(blend_channel(m, cb.r, cs.r), blend_channel(m, cb.g, cs.g), blend_channel(m, cb.b, cs.b));
-    return vec4(cb * (1.0 - c.a) + mixed * c.a, 1.0);
+    let b = textureLoad(backdrop, vec2<i32>(v.pos.xy), 0);
+    return blend_over(b, c, v.p0.z);
 }
 
 // ---- 画面特效（ve_core::EffectKind）：读底图（已经合成好的画面），整个画面重画 ----
 // p0 = （种类编号、强度 0–1、特效片段里过了几秒、0）
 
+// 底图（预乘透明；最外层处处不透明，复合片段的组里可能是透明的）
 fn bd(p: vec2<i32>) -> vec3<f32> {
     let d = vec2<i32>(textureDimensions(backdrop));
     return textureLoad(backdrop, clamp(p, vec2(0), d - vec2(1)), 0).rgb;
+}
+
+fn bd_alpha(p: vec2<i32>) -> f32 {
+    let d = vec2<i32>(textureDimensions(backdrop));
+    return textureLoad(backdrop, clamp(p, vec2(0), d - vec2(1)), 0).a;
 }
 
 // 黄金角螺旋上 32 个点的平均（半径 r 像素）；bright 为真时只取亮部（发光用）
@@ -379,5 +318,7 @@ fn fs_effect(v: VOut) -> @location(0) vec4<f32> {
         // 发光：亮部模糊后加回去
         out = c + spiral_avg(p, short * 0.02, true) * amount * 1.5;
     }
-    return vec4(clamp(out, vec3(0.0), vec3(1.0)), 1.0);
+    // 透明度照底图（预乘：颜色不超过透明度）
+    let a = bd_alpha(pi);
+    return vec4(clamp(out, vec3(0.0), vec3(a)), a);
 }

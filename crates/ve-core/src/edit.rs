@@ -1636,12 +1636,16 @@ fn set_speed_with(
     with_timeline(project, |_, tl| {
         let (ti, ci) = locate(tl, clip)?;
         let mut c = (*tl.tracks[ti].clips[ci]).clone();
-        // 素材片段能变速；复合片段能常规变速（不能曲线变速），里面每段乘上去都要还在范围里
-        let compound = c.compound().is_some();
-        if c.asset().is_none() && !(compound && curve.is_none()) {
+        // 素材片段、复合片段能变速；复合片段里面每段乘上去都要还在范围里，曲线变速时里面不能
+        // 已经有曲线变速的片段
+        if c.asset().is_none() && c.compound().is_none() {
             return Err(EditError::WrongTrackKind);
         }
-        if !crate::compound::speed_fits(&c, speed) {
+        let fits = curve.as_ref().map_or_else(
+            || crate::compound::speed_fits(&c, speed),
+            |k| crate::compound::curve_fits(&c, speed, k),
+        );
+        if !fits {
             return Err(EditError::InvalidValue);
         }
         let span = c.source_span();
@@ -2112,7 +2116,7 @@ pub fn set_look(project: &mut Project, clip: ClipId, look: crate::Look) -> Resul
     }
     ensure_video(project, clip)?;
     update_clip(project, clip, |c| {
-        // 复合片段只用得上蒙版和圆角（整组裁），别的外观对它不生效
+        // 复合片段的外观整组生效（隔离组，见 compose::GroupPass）
         if c.asset().is_none() && c.compound().is_none() {
             return Err(EditError::WrongTrackKind);
         }
@@ -2172,7 +2176,7 @@ pub fn apply_look_at(
     }
     ensure_video(project, clip)?;
     update_clip(project, clip, |c| {
-        // 复合片段只用得上蒙版和圆角（整组裁），别的外观对它不生效
+        // 复合片段的外观整组生效（隔离组，见 compose::GroupPass）
         if c.asset().is_none() && c.compound().is_none() {
             return Err(EditError::WrongTrackKind);
         }

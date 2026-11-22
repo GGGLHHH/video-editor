@@ -292,7 +292,7 @@ impl Workspace {
     }
 
     /// 选中的视频轨媒体片段，或视频轨上的复合片段（整组的蒙版、圆角）。
-    fn bound_look_clip(&self) -> Option<ClipId> {
+    pub(crate) fn bound_look_clip(&self) -> Option<ClipId> {
         self.bound_video_clip().map(|(c, ..)| c).or_else(|| {
             let (c, ..) = self.bound_visual_clip()?;
             let (_, clip) = self.doc.project.timeline.find_clip(c)?;
@@ -659,10 +659,10 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// 二级分段「基础 / 抠像 / 蒙版」（剪映），点了就切换。复合片段没有「抠像」。
+    /// 二级分段「基础 / 抠像 / 蒙版」（剪映），点了就切换。视频轨上的复合片段也有（整组生效）。
     pub(crate) fn render_picture_segments(&self, cx: &Context<'_, Self>) -> AnyElement {
         let current = self.inspector.look.seg;
-        let keyable = self.bound_video_clip().is_some();
+        let keyable = self.bound_look_clip().is_some();
         h_flex()
             .p(px(2.))
             .gap(px(2.))

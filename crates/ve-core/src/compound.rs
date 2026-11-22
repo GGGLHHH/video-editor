@@ -5,7 +5,9 @@
 //! 位置和裁剪范围摊开（画面轨插在它所在的那条视频轨上面，声音轨放到最后，字幕轨放到最前面），
 //! 合成、混音、字幕都照常算。
 //!
-//! 第一版：复合片段自己的画面属性、调色、音量这些不生效（属性面板也不给改），只按时间放里面的东西。
+//! 复合片段自己的变速（常规、曲线）摊开时换算到里面每一段上；画面属性、调色、音量叠到里面每一段上；
+//! 外观（抠图、蒙版、描边、阴影、混合模式）和里面的特效、调节片段按隔离组整组合成
+//! （[`crate::compose::GroupPass`]）。
 
 use crate::edit::EditError;
 use crate::{Clip, ClipContent, ClipId, Project, Time, Track, TrackId, TrackKind};
@@ -219,14 +221,16 @@ fn index_or_add(
 }
 
 /// 复合片段里面的时间换到外面：里面 `from` 对着外面 `origin`，里面走 `speed` 秒外面走 1 秒
-/// （复合片段变速）。
-#[derive(Clone, Copy, Debug)]
+/// （复合片段变速）；曲线变速时按曲线的积分换算（[`Self::at`]）。
+#[derive(Clone, Debug)]
 struct Retime {
     from: Time,
     origin: Time,
     speed: f32,
     /// 复合片段变了速时，它自己的「保持音调」管里面所有的声音（两层快慢乘在一起，分不开）。
     keep_pitch: Option<bool>,
+    /// 曲线变速：复合片段的曲线、它在外面的长度、里面用掉的长度。
+    curve: Option<(crate::SpeedCurve, Time, Time)>,
 }
 
 impl Retime {
@@ -238,17 +242,48 @@ impl Retime {
             from: source_in,
             origin: c.start,
             speed: c.speed,
-            keep_pitch: sped.then_some(c.keep_pitch),
+            keep_pitch: (sped || c.curve.is_some()).then_some(c.keep_pitch),
+            curve: c.curve.clone().map(|k| (k, c.duration, c.source_span())),
         }
     }
 
-    fn at(self, t: Time) -> Time {
-        self.origin + (t - self.from).scaled(1.0 / f64::from(self.speed))
+    /// 里面的时刻 `t` 在外面的时刻。曲线变速时：里面走到总长的几分之几 = 曲线从 0 积到外面
+    /// 那个位置的几分之几（和 [`Clip::source_at`] 同一个式子），二分反解出位置；里面范围外面
+    /// 按两头的倍数接着走。
+    fn at(&self, t: Time) -> Time {
+        let Some((curve, len, span)) = &self.curve else {
+            return self.origin + (t - self.from).scaled(1.0 / f64::from(self.speed));
+        };
+        let x = t - self.from;
+        let mean = f64::from(curve.mean().max(1e-3));
+        let edge = |u: f32| f64::from(self.speed) * f64::from(curve.speed_at(u)) / mean;
+        if x <= Time::ZERO || span.0 <= 0 {
+            return self.origin + x.scaled(1.0 / edge(0.0));
+        }
+        if x >= *span {
+            return self.origin + *len + (x - *span).scaled(1.0 / edge(1.0));
+        }
+        #[expect(clippy::cast_precision_loss, reason = "时长远小于 2^53")]
+        let p = x.0 as f64 / span.0 as f64;
+        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        for _ in 0..40 {
+            let mid = f32::midpoint(lo, hi);
+            if curve.progress(mid) < p {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        self.origin + len.scaled(f64::from(f32::midpoint(lo, hi)))
     }
 
     /// 一段片段换到外面：位置、长度、变速倍数、淡入淡出、关键帧、转场和入场 / 出场动画的时长；
     /// 外面套着的几层复合片段（[`Clip::parent`]）一样换。
-    fn clip(self, c: &mut Clip) {
+    fn clip(&self, c: &mut Clip) {
+        if self.curve.is_some() {
+            self.clip_curved(c);
+            return;
+        }
         let k = 1.0 / f64::from(self.speed);
         let (start, end) = (self.at(c.start), self.at(c.end()));
         c.start = start;
@@ -277,6 +312,84 @@ impl Retime {
             c.parent = Some(Arc::new(p));
         }
     }
+
+    /// 曲线变速时的 [`Self::clip`]：每个时刻各自换算（快慢处处不一样，不能整体乘一个数）。
+    /// 素材片段（和里面的复合片段）拿到外面曲线落在它那一截的切片，平均倍数 = 原来的倍数 ×
+    /// 里面的长度 ÷ 外面的长度。
+    fn clip_curved(&self, c: &mut Clip) {
+        let Some((curve, len, _)) = &self.curve else {
+            return;
+        };
+        let (s_in, e_in) = (c.start, c.end());
+        let (start, end) = (self.at(s_in), self.at(e_in));
+        c.start = start;
+        c.duration = (end - start).max(Time(1));
+        if c.asset().is_some() || c.compound().is_some() {
+            #[expect(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                reason = "倍数只要 f32 精度"
+            )]
+            let ratio = ((e_in - s_in).0 as f64 / c.duration.0 as f64) as f32;
+            c.speed *= ratio;
+            #[expect(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                reason = "曲线位置只要 f32 精度"
+            )]
+            let pos = |t: Time| ((t - self.origin).0 as f64 / len.0.max(1) as f64) as f32;
+            c.curve = Some(curve_slice(curve, pos(start), pos(end)));
+            if let Some(keep) = self.keep_pitch {
+                c.keep_pitch = keep;
+            }
+        }
+        let fade_out = c.fade_out;
+        c.fade_in = (self.at(s_in + c.fade_in) - start).min(c.duration);
+        c.fade_out = (end - self.at(e_in - fade_out)).min(c.duration);
+        c.animation.map_times(|k| self.at(s_in + k) - start);
+        if let Some(t) = &mut c.transition_in {
+            t.duration = self.at(s_in + t.duration) - start;
+        }
+        if let Some(m) = &mut c.motion.intro {
+            m.duration = self.at(s_in + m.duration) - start;
+        }
+        if let Some(m) = &mut c.motion.outro {
+            m.duration = end - self.at(e_in - m.duration);
+        }
+        if let Some(p) = &c.parent {
+            let mut p = (**p).clone();
+            self.clip(&mut p);
+            c.parent = Some(Arc::new(p));
+        }
+    }
+}
+
+/// 曲线在 `[from, to]`（0–1）那一截，换算回 0–1；太短时取中间的倍数当一条平线。
+fn curve_slice(curve: &crate::SpeedCurve, from: f32, to: f32) -> crate::SpeedCurve {
+    let (from, to) = (from.clamp(0.0, 1.0), to.clamp(0.0, 1.0));
+    let flat = || {
+        let speed = curve.speed_at(f32::midpoint(from, to));
+        crate::SpeedCurve::new(vec![
+            crate::SpeedPoint { at: 0.0, speed },
+            crate::SpeedPoint { at: 1.0, speed },
+        ])
+        .unwrap_or_else(|| curve.clone())
+    };
+    if to - from < 1e-4 {
+        return flat();
+    }
+    let tail = if from > 1e-6 {
+        curve.split(from).1
+    } else {
+        curve.clone()
+    };
+    let rel = (to - from) / (1.0 - from).max(1e-6);
+    let part = if rel < 1.0 - 1e-6 {
+        tail.split(rel).0
+    } else {
+        tail
+    };
+    if part.is_valid() { part } else { flat() }
 }
 
 /// 复合片段里面所有素材片段和复合片段（摊开后）的变速倍数的范围；里面什么都没有时 `None`。
@@ -291,6 +404,33 @@ fn inner_speeds(inner: &Compound) -> Option<(f32, f32)> {
         .fold(None, |acc, s| {
             Some(acc.map_or((s, s), |(lo, hi): (f32, f32)| (lo.min(s), hi.max(s))))
         })
+}
+
+/// 复合片段里面（摊开到底）有没有曲线变速的片段。
+fn has_curves(inner: &Compound) -> bool {
+    let direct = inner.tracks.iter().flat_map(|t| t.clips.iter());
+    let flat = flatten_tracks(&inner.tracks);
+    let deep = flat.iter().flat_map(|t| t.clips.iter());
+    direct.chain(deep).any(|c| c.curve.is_some())
+}
+
+/// 复合片段 `c` 能不能按曲线 `curve`（平均 `speed` 倍）变速：里面不能已经有曲线变速的片段
+/// （两条曲线叠不成一条），而且曲线最快、最慢处乘上去，里面每段都还在变速范围里。
+pub(crate) fn curve_fits(c: &Clip, speed: f32, curve: &crate::SpeedCurve) -> bool {
+    let Some((inner, _)) = c.compound() else {
+        return true;
+    };
+    if has_curves(inner) {
+        return false;
+    }
+    let mean = curve.mean().max(1e-3);
+    let (lo, hi) = curve
+        .points()
+        .iter()
+        .fold((f32::MAX, f32::MIN), |(a, b), q| {
+            (a.min(q.speed), b.max(q.speed))
+        });
+    speed_fits(c, speed * lo / mean) && speed_fits(c, speed * hi / mean)
 }
 
 /// 复合片段 `c` 能不能变成 `speed` 倍速：里面每段乘上去都还在变速范围里。
@@ -309,7 +449,7 @@ fn window(
     track: &Track,
     from: Time,
     to: Time,
-    retime: Retime,
+    retime: &Retime,
     id_of: &mut dyn FnMut(ClipId, usize) -> ClipId,
 ) -> Vec<Arc<Clip>> {
     let mut tl = crate::Timeline {
@@ -389,7 +529,7 @@ pub fn break_compound(project: &mut Project, clip: ClipId) -> Result<Vec<ClipId>
     let mut below: Vec<(TrackKind, TrackId)> = Vec::new();
     for it in inner.tracks.iter().rev() {
         let mut ids = next.ids.clone();
-        let pieces = window(it, source_in, source_in + span, retime, &mut |_, _| {
+        let pieces = window(it, source_in, source_in + span, &retime, &mut |_, _| {
             ids.clip()
         });
         next.ids = ids;
@@ -547,7 +687,7 @@ fn flatten_tracks(tracks: &[Track]) -> Vec<Track> {
                     &it,
                     source_in,
                     source_in + c.source_span(),
-                    retime,
+                    &retime,
                     // 一段原片段在范围里只留一块：按原 id 合成，裁剪时 id 不变
                     &mut |id, _| ClipId(synth(outer, id.0)),
                 );
@@ -738,6 +878,55 @@ mod tests {
     }
 
     #[test]
+    fn a_compound_can_take_a_speed_curve() {
+        let (mut p, ids) = sample_project();
+        p.settings.main_magnet = false;
+        // v1（素材 0–5 秒）、v2（素材 5–8 秒）打包，整组蒙太奇曲线
+        let cc = make_compound(&mut p, &[ids.v1, ids.v2]).unwrap();
+        let curve = crate::CurvePreset::Montage.curve();
+        crate::edit::set_speed_curve(&mut p, cc, Some(curve)).unwrap();
+        let comp = Arc::clone(p.timeline.find_clip(cc).unwrap().1);
+        assert!(comp.curve.is_some());
+        let flat = flatten(&p).unwrap();
+        // 摊开后每一刻放到的素材位置 = 复合片段按曲线算出的里面的时间（里面就是素材时间）
+        let n = 40;
+        for i in 0..n {
+            let t = comp.start + comp.duration.scaled(f64::from(i) / f64::from(n));
+            let want = comp.source_at(t - comp.start);
+            let layers = crate::compose::resolve_layers(&flat, t);
+            let got = layers[0].source_time;
+            assert!(
+                (got - want).0.abs() <= Time::from_millis(2).0,
+                "{t:?}: {got:?} vs {want:?}"
+            );
+        }
+        // 解除：里面两段各自带着曲线的一截，时间也对得上
+        let before = crate::compose::resolve_layers(&flat, comp.start + secs(1))[0].source_time;
+        break_compound(&mut p, cc).unwrap();
+        let back = crate::compose::resolve_layers(&p, comp.start + secs(1))[0].source_time;
+        assert!((back - before).0.abs() <= Time::from_millis(2).0);
+        assert!(
+            p.timeline
+                .tracks
+                .iter()
+                .flat_map(|t| t.clips.iter())
+                .any(|c| c.curve.is_some())
+        );
+    }
+
+    #[test]
+    fn a_compound_with_curved_clips_inside_cannot_take_a_curve() {
+        let (mut p, ids) = sample_project();
+        crate::edit::set_speed_curve(&mut p, ids.v1, Some(crate::CurvePreset::Hero.curve()))
+            .unwrap();
+        let cc = make_compound(&mut p, &[ids.v1, ids.v2]).unwrap();
+        assert_eq!(
+            crate::edit::set_speed_curve(&mut p, cc, Some(crate::CurvePreset::Montage.curve())),
+            Err(EditError::InvalidValue)
+        );
+    }
+
+    #[test]
     fn compound_speed_keeps_every_inner_speed_in_range() {
         let (mut p, ids) = sample_project();
         crate::edit::set_speed(&mut p, ids.v1, 8.0).unwrap();
@@ -748,10 +937,14 @@ mod tests {
             Err(EditError::InvalidValue)
         );
         assert!(crate::edit::set_speed(&mut p, cc, 1.2).is_ok());
-        // 复合片段不能曲线变速
+        // 曲线最快处（蒙太奇两头 3 倍）乘上里面的 8 倍超出范围；英雄时刻最快 1 倍，可以
         assert_eq!(
-            crate::edit::set_speed_curve(&mut p, cc, Some(crate::CurvePreset::Hero.curve())),
-            Err(EditError::WrongTrackKind)
+            crate::edit::set_speed_curve(&mut p, cc, Some(crate::CurvePreset::Montage.curve())),
+            Err(EditError::InvalidValue)
+        );
+        assert!(
+            crate::edit::set_speed_curve(&mut p, cc, Some(crate::CurvePreset::Hero.curve()))
+                .is_ok()
         );
     }
 
@@ -1044,6 +1237,99 @@ mod tests {
             "{}",
             inner.transform.x
         );
+    }
+
+    /// 主轨 v1（0–5 秒）上面一条轨放一段同样的素材，再上面一条轨放 `top`（调节或特效片段），
+    /// 把中间那段和 `top` 打包成复合片段：返回（复合片段，里面那段素材）。
+    fn compound_over_v1(
+        p: &mut Project,
+        ids: &crate::testing::SampleIds,
+        top: impl FnOnce(&mut Project, TrackId) -> ClipId,
+    ) -> (ClipId, ClipId) {
+        let middle = crate::edit::add_track(p, TrackKind::Video).unwrap();
+        let inner = crate::edit::insert_asset_at(p, ids.video_asset, middle, secs(0)).unwrap();
+        crate::edit::trim_end(p, inner, secs(5)).unwrap();
+        let upper = crate::edit::add_track(p, TrackKind::Video).unwrap();
+        let tool = top(p, upper);
+        let cc = make_compound(p, &[inner, tool]).unwrap();
+        (cc, inner)
+    }
+
+    #[test]
+    fn an_adjustment_inside_a_compound_only_grades_whats_inside() {
+        let (mut p, ids) = sample_project();
+        let bright = crate::ColorAdjust {
+            brightness: 0.3,
+            ..crate::ColorAdjust::default()
+        };
+        let (_, inner) = compound_over_v1(&mut p, &ids, |proj, track| {
+            let adj = crate::edit::add_adjustment_on(proj, track, secs(0), secs(5)).unwrap();
+            crate::edit::set_adjust(proj, adj, bright).unwrap();
+            adj
+        });
+        let flat = flatten(&p).unwrap();
+        let frame = crate::compose::resolve_frame(&flat, secs(1));
+        assert_eq!(frame.layers.len(), 2);
+        let below = &frame.layers[0];
+        assert_eq!(below.clip, ids.v1);
+        assert!(below.color.is_identity(), "复合片段下面的不调");
+        assert!(frame.background.is_identity(), "黑底也不调");
+        let got = frame.layers[1].color.apply([0.2, 0.2, 0.2]);
+        let want = bright.matrix().apply([0.2, 0.2, 0.2]);
+        assert!((got[0] - want[0]).abs() < 1e-4, "里面的调了：{got:?}");
+        assert_ne!(frame.layers[1].clip, ids.v1);
+        let _ = inner;
+    }
+
+    #[test]
+    fn an_effect_inside_a_compound_isolates_it_as_a_group() {
+        let (mut p, ids) = sample_project();
+        let (_, _) = compound_over_v1(&mut p, &ids, |proj, track| {
+            let blur = crate::Effect::new(crate::EffectKind::Blur);
+            crate::edit::add_effect_on(proj, track, secs(0), secs(5), blur).unwrap()
+        });
+        let flat = flatten(&p).unwrap();
+        let frame = crate::compose::resolve_frame(&flat, secs(1));
+        assert_eq!(frame.effects.len(), 1);
+        assert_eq!(
+            frame.groups.len(),
+            1,
+            "完全不透明也要分组，特效只作用在组里"
+        );
+        let g = frame.groups[0];
+        assert_eq!((g.start, g.end, g.effects_end), (1, 2, 1));
+    }
+
+    #[test]
+    fn a_compounds_stroke_shadow_blend_and_key_go_with_its_group() {
+        let (mut p, ids) = sample_project();
+        let cc = make_compound(&mut p, &[ids.v1, ids.v2]).unwrap();
+        for look in [
+            crate::Look {
+                stroke: Some(crate::Stroke::default()),
+                ..crate::Look::NONE
+            },
+            crate::Look {
+                shadow: Some(crate::Shadow::default()),
+                ..crate::Look::NONE
+            },
+            crate::Look {
+                blend: crate::BlendMode::Screen,
+                ..crate::Look::NONE
+            },
+            crate::Look {
+                chroma: Some(crate::ChromaKey::default()),
+                ..crate::Look::NONE
+            },
+        ] {
+            crate::edit::set_look(&mut p, cc, look).unwrap();
+            let flat = flatten(&p).unwrap();
+            let frame = crate::compose::resolve_frame(&flat, secs(1));
+            assert_eq!(frame.groups.len(), 1, "{look:?}");
+            assert_eq!(frame.groups[0].shape.map(|s| s.look), Some(look));
+            // 外观是整组的，里面的层不带
+            assert!(frame.layers.iter().all(|l| l.look == crate::Look::NONE));
+        }
     }
 
     #[test]

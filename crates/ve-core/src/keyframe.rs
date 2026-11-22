@@ -849,6 +849,15 @@ impl Animation {
         removed
     }
 
+    /// 所有关键帧的时间按 `f` 换算（`f` 单调递增；曲线变速的复合片段摊开时用）。
+    pub fn map_times(&mut self, f: impl Fn(Time) -> Time) {
+        for keys in self.tracks.values_mut() {
+            for k in keys.iter_mut() {
+                k.at = f(k.at);
+            }
+        }
+    }
+
     /// 所有关键帧的时间乘 `factor`（变速时动画跟着内容伸缩）。
     pub fn scale_times(&mut self, factor: f64) {
         for keys in self.tracks.values_mut() {

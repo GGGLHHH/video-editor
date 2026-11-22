@@ -103,10 +103,11 @@ fn mask_params(m: &ve_core::Mask, w: f32, h: f32) -> (f32, [f32; 4], [f32; 4]) {
     )
 }
 
-/// 分组那一道的参数（`group.wgsl` 的 `Amount`）：不透明度；有形状时整组按画布大小的图层放在
-/// 输出（`size`）上，算出转之前的显示框、旋转、圆角和蒙版（和图层的蒙版同一套换算）。
-fn group_params(g: &ve_core::compose::GroupPass, size: (u32, u32)) -> [[f32; 4]; 15] {
-    let mut v = [[0.0; 4]; 15];
+/// 分组那一道的参数（`group.wgsl` 的 `Amount`，20 个 `vec4`）：不透明度；有整组外观时整组按
+/// 画布大小的图层放在输出（`size`）上，算出转之前的显示框、旋转、圆角、蒙版、混合模式、描边、
+/// 阴影、抠图（和图层同一套换算，[`look_params`]）。
+fn group_params(g: &ve_core::compose::GroupPass, size: (u32, u32)) -> [[f32; 4]; 20] {
+    let mut v = [[0.0; 4]; 20];
     v[0][0] = g.opacity.clamp(0.0, 1.0);
     v[2][2] = -1.0;
     let Some(shape) = g.shape else {
@@ -115,18 +116,22 @@ fn group_params(g: &ve_core::compose::GroupPass, size: (u32, u32)) -> [[f32; 4];
     let geo = ve_core::layer_geometry(size, size, &shape.transform);
     let (w, h) = (geo.shown.w, geo.shown.h);
     let look = &shape.look;
-    v[0] = [v[0][0], 1.0, geo.angle, look.radius * w.min(h) / 2.0];
+    let short = to_f32(f64::from(size.0.min(size.1)));
+    let lp = look_params(look, (w, h), short, geo.angle);
+    #[expect(clippy::cast_precision_loss, reason = "混合模式编号很小")]
+    let blend = look.blend.code() as f32;
+    v[0] = [v[0][0], 1.0, geo.angle, lp.radius];
     v[1] = [geo.center.0, geo.center.1, geo.shown.x, geo.shown.y];
-    if let Some(m) = look.mask {
-        let (code, center, more) = mask_params(&m, w, h);
-        v[2] = [w, h, code, 0.0];
-        v[3] = center;
-        v[4] = more;
-    } else {
-        v[2] = [w, h, -1.0, 0.0];
-    }
+    v[2] = [w, h, lp.shadow2[3], blend];
+    v[3] = lp.mask;
+    v[4] = lp.mask2;
     let extras = extra_masks(look, w, h);
-    v[5..].copy_from_slice(&extras.v);
+    v[5..15].copy_from_slice(&extras.v);
+    v[15] = [lp.stroke[0], lp.stroke[1], lp.stroke[2], lp.sizes[3]];
+    v[16] = lp.shadow;
+    v[17] = [lp.shadow2[0], lp.shadow2[1], lp.shadow2[2], 0.0];
+    v[18] = lp.key;
+    v[19] = lp.key2;
     v
 }
 
@@ -1557,7 +1562,7 @@ impl Compositor {
     /// 把各层画到输出纹理上（底色见 [`Self::set_background`]）。普通图层连着画在一个通道里；
     /// 混合模式图层先把画到这里的结果拷成底图，再单独画它（读底图、直接写回）；
     /// 画面特效在它压着的那几层画完后做：同样拷成底图，再整个画面重画。
-    /// 半透明复合片段（分组）：开始前拍一张快照，组里画完后和快照按整组不透明度混合。
+    /// 复合片段（分组）：开始前拍一张快照、把画布清成透明，组里画完后按整组外观叠回快照上。
     fn draw(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, count: usize) {
         let (Some((instances, _)), Some(target)) = (&self.instances, &self.target) else {
             drop(self.begin_pass(encoder, view, true));
@@ -1608,6 +1613,8 @@ impl Compositor {
                     target.snapshots[next_group].0.as_image_copy(),
                     extent(target.size),
                 );
+                // 组里的东西画在透明画布上（隔离）：组里的特效、混合模式只作用在组里
+                clear_transparent(encoder, view);
                 open.push(next_group);
                 next_group += 1;
             }
@@ -2167,6 +2174,23 @@ fn nv12_pipelines(device: &wgpu::Device) -> Nv12Pipelines {
         uv: make("fs_uv", wgpu::TextureFormat::Rg8Unorm),
         layout,
     }
+}
+
+/// 把画布清成全透明（复合片段的组开始时）。
+fn clear_transparent(encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
+    drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("group start"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        ..Default::default()
+    }));
 }
 
 /// 把纹理拷到读回缓冲（每行按 256 字节对齐）。
@@ -3072,6 +3096,143 @@ mod tests {
             near(px(&out, 20, 20), [0, 64, 0], 3),
             "{:?}",
             px(&out, 20, 20)
+        );
+        c.set_groups(&[]);
+    }
+
+    #[test]
+    fn a_group_is_drawn_on_its_own_and_then_laid_on_as_a_whole() {
+        use ve_core::compose::{GroupPass, GroupShape};
+        use ve_core::{ChromaKey, EffectKind as K, Look, Transform};
+        let mut c = compositor();
+        let red = solid(2, 2, [0, 0, 255, 255]);
+        let green = solid(2, 2, [0, 255, 0, 255]);
+        let mut out = Vec::new();
+        let left = geom(0.0, 0.0, 32.0, 36.0);
+        let group = |shape: Option<GroupShape>, effects_end| GroupPass {
+            start: 1,
+            end: 2,
+            effects_end,
+            opacity: 1.0,
+            shape,
+        };
+        let whole = |look: Look, transform: Transform| Some(GroupShape { transform, look });
+        // 组里的闪白只作用在组里：左半边（组里的绿）变白，右半边下面的红不变
+        c.set_effects(&[pass(2, K::Flash, 1.0, 0.0)]);
+        c.set_groups(&[group(None, 1)]);
+        c.compose_bgra(
+            SIZE,
+            &[layer(&red, 2, 2, FULL, 1.0), layer(&green, 2, 2, left, 1.0)],
+            &mut out,
+        )
+        .unwrap();
+        assert!(
+            near(px(&out, 8, 18), [255, 255, 255], 3),
+            "{:?}",
+            px(&out, 8, 18)
+        );
+        assert!(
+            near(px(&out, 56, 18), [0, 0, 255], 3),
+            "{:?}",
+            px(&out, 56, 18)
+        );
+        c.set_effects(&[]);
+        // 抠图：组里的绿抠掉，露出下面的红
+        let key = Look {
+            chroma: Some(ChromaKey {
+                color: 0x00_FF00,
+                ..ChromaKey::default()
+            }),
+            ..Look::NONE
+        };
+        c.set_groups(&[group(whole(key, Transform::DEFAULT), 0)]);
+        c.compose_bgra(
+            SIZE,
+            &[layer(&red, 2, 2, FULL, 1.0), layer(&green, 2, 2, left, 1.0)],
+            &mut out,
+        )
+        .unwrap();
+        assert!(
+            near(px(&out, 8, 18), [0, 0, 255], 3),
+            "{:?}",
+            px(&out, 8, 18)
+        );
+        c.set_groups(&[]);
+    }
+
+    #[test]
+    fn a_group_takes_blend_and_stroke_as_a_whole() {
+        use ve_core::compose::{GroupPass, GroupShape};
+        use ve_core::{BlendMode, Look, Stroke, Transform};
+        let mut c = compositor();
+        let green = solid(2, 2, [0, 255, 0, 255]);
+        let gray = solid(2, 2, [128, 128, 128, 255]);
+        let white = solid(2, 2, [255, 255, 255, 255]);
+        let mut out = Vec::new();
+        let group = |shape: Option<GroupShape>| GroupPass {
+            start: 1,
+            end: 2,
+            effects_end: 0,
+            opacity: 1.0,
+            shape,
+        };
+        let whole = |look: Look, transform: Transform| Some(GroupShape { transform, look });
+        // 正片叠底：白 × 灰 = 灰
+        let multiply = Look {
+            blend: BlendMode::Multiply,
+            ..Look::NONE
+        };
+        c.set_groups(&[group(whole(multiply, Transform::DEFAULT))]);
+        c.compose_bgra(
+            SIZE,
+            &[
+                layer(&gray, 2, 2, FULL, 1.0),
+                layer(&white, 2, 2, FULL, 1.0),
+            ],
+            &mut out,
+        )
+        .unwrap();
+        assert!(
+            near(px(&out, 32, 18), [128, 128, 128], 3),
+            "{:?}",
+            px(&out, 32, 18)
+        );
+        // 描边：整组缩到一半（16–48 × 9–27），框外一圈红，再外面是下面的灰
+        let stroke = Look {
+            stroke: Some(Stroke {
+                color: 0xFF_0000,
+                width: 0.1,
+            }),
+            ..Look::NONE
+        };
+        let half = Transform {
+            scale: 0.5,
+            ..Transform::DEFAULT
+        };
+        c.set_groups(&[group(whole(stroke, half))]);
+        c.compose_bgra(
+            SIZE,
+            &[
+                layer(&gray, 2, 2, FULL, 1.0),
+                layer(&green, 2, 2, FULL, 1.0),
+            ],
+            &mut out,
+        )
+        .unwrap();
+        assert!(
+            near(px(&out, 32, 18), [0, 255, 0], 3),
+            "{:?}",
+            px(&out, 32, 18)
+        );
+        assert!(
+            near(px(&out, 14, 18), [0, 0, 255], 3),
+            "{:?}",
+            px(&out, 14, 18)
+        );
+        assert!(
+            near(px(&out, 4, 18), [128, 128, 128], 3),
+            "{:?}",
+            px(&out, 4, 18)
         );
         c.set_groups(&[]);
     }

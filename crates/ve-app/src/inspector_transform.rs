@@ -936,8 +936,8 @@ impl Workspace {
     fn render_blend_group(&self, t: &Transform, cx: &Context<'_, Self>) -> gpui_kit::AnyElement {
         let opacity = self.opacity_row(t.opacity, cx);
         let blended = self
-            .bound_video_clip()
-            .and_then(|(clip, ..)| self.doc.project.timeline.find_clip(clip))
+            .bound_look_clip()
+            .and_then(|clip| self.doc.project.timeline.find_clip(clip))
             .is_some_and(|(_, c)| c.look.blend != ve_core::BlendMode::Normal);
         let body = v_flex()
             .gap_2()

@@ -457,6 +457,43 @@ fn a_compound_has_animation_and_adjust_tabs_like_a_video(cx: &mut TestAppContext
 }
 
 #[gpui_kit::test]
+fn a_compound_takes_blend_stroke_and_key_as_a_whole(cx: &mut TestAppContext) {
+    let ui = open(cx);
+    magnet_off(cx, &ui);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    import(cx, &ui, vec![fixture(Fixture::FrameIndexed30)], true);
+    press(cx, &ui, "ctrl-a");
+    press(cx, &ui, "alt-g");
+    click(cx, &ui, "insp-tab-picture");
+    // 混合模式（「混合」组在下面，先折起「位置大小」）
+    click(cx, &ui, "tf-title");
+    click(cx, &ui, "blend-4");
+    assert_eq!(
+        selected_compound(cx, &ui).look.blend,
+        ve_core::BlendMode::Multiply
+    );
+    // 描边、阴影两组也在「基础」里
+    click(cx, &ui, "look-stroke-check");
+    assert!(selected_compound(cx, &ui).look.stroke.is_some());
+    assert!(exists(cx, &ui, "look-shadow-check"));
+    // 抠像
+    click(cx, &ui, "seg-key");
+    click(cx, &ui, "look-key-check");
+    assert_eq!(
+        selected_compound(cx, &ui).look.chroma.map(|k| k.color),
+        Some(0x00_FF00)
+    );
+    // 合成时整组带着这些外观（里面的层不带）
+    let frame = ui.view.read_with(cx, |w, _| {
+        let flat = ve_core::compound::flatten(&w.document().project).unwrap();
+        ve_core::compose::resolve_frame(&flat, Time::from_millis(500))
+    });
+    let look = frame.groups.first().and_then(|g| g.shape).map(|s| s.look);
+    assert!(look.is_some_and(|l| l.stroke.is_some() && l.chroma.is_some()));
+    assert!(frame.layers.iter().all(|l| l.look.stroke.is_none()));
+}
+
+#[gpui_kit::test]
 fn a_compound_takes_a_mask_and_round_corners_as_a_whole(cx: &mut TestAppContext) {
     let ui = open(cx);
     magnet_off(cx, &ui);
@@ -465,8 +502,8 @@ fn a_compound_takes_a_mask_and_round_corners_as_a_whole(cx: &mut TestAppContext)
     press(cx, &ui, "ctrl-a");
     press(cx, &ui, "alt-g");
     click(cx, &ui, "insp-tab-picture");
-    // 复合片段的画面分页没有「抠像」
-    assert!(exists(cx, &ui, "seg-mask") && !exists(cx, &ui, "seg-key"));
+    // 复合片段的画面分页也有「抠像」「蒙版」（整组生效）
+    assert!(exists(cx, &ui, "seg-mask") && exists(cx, &ui, "seg-key"));
     // 圆角在位置大小下面，要往下滚才看得到
     cx.update_window(ui.win, |_, window, wcx| {
         window.scroll(
@@ -519,8 +556,6 @@ fn a_compound_can_be_sped_up_as_a_whole(cx: &mut TestAppContext) {
     press(cx, &ui, "alt-g");
     let before = selected_compound(cx, &ui).duration;
     click(cx, &ui, "insp-tab-speed");
-    // 复合片段只有常规变速
-    assert!(!exists(cx, &ui, "speed-seg-curve"));
     click(cx, &ui, "speed-2");
     let c = selected_compound(cx, &ui);
     assert!((c.speed - 2.0).abs() < 1e-4);
@@ -532,6 +567,12 @@ fn a_compound_can_be_sped_up_as_a_whole(cx: &mut TestAppContext) {
     click(cx, &ui, "tb-undo");
     click(cx, &ui, "tb-undo");
     assert_eq!(selected_compound(cx, &ui).duration, before);
+    // 曲线变速：整组按曲线快慢
+    click(cx, &ui, "speed-seg-curve");
+    click(cx, &ui, "curve-hero");
+    assert!(selected_compound(cx, &ui).curve.is_some());
+    click(cx, &ui, "tb-undo");
+    assert!(selected_compound(cx, &ui).curve.is_none());
 }
 
 #[gpui_kit::test]

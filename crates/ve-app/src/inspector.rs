@@ -633,12 +633,20 @@ impl Workspace {
                     .into_any_element()
             }
             (Some(InspectorTab::Picture), ClipContent::Compound { .. }) => {
-                // 复合片段：「基础」是它自己的面板（进入、解除、位置大小、圆角），「蒙版」整组裁
+                // 复合片段：「基础」是它自己的面板（进入、解除、位置大小、混合、圆角）加描边、阴影，
+                // 「抠像」「蒙版」整组生效
                 let seg = match self.inspector.look.seg {
                     crate::inspector_look::PictureSeg::Mask => self
                         .render_mask_seg(cx)
                         .unwrap_or_else(|| div().into_any_element()),
-                    _ => self.render_compound_panel(&c, cx),
+                    crate::inspector_look::PictureSeg::Key => self
+                        .render_key_seg(cx)
+                        .unwrap_or_else(|| div().into_any_element()),
+                    crate::inspector_look::PictureSeg::Basic => v_flex()
+                        .gap_3()
+                        .child(self.render_compound_panel(&c, cx))
+                        .children(self.render_stroke_shadow(cx))
+                        .into_any_element(),
                 };
                 v_flex()
                     .gap_3()
