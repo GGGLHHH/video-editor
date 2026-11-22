@@ -35,7 +35,10 @@ impl Workspace {
 
     /// 播放器面板的标题行：标题 + ≡ 菜单。
     pub(crate) fn render_player_header(&self, cx: &Context<'_, Self>) -> AnyElement {
-        chrome::panel_header(PLAYER_TITLE, cx)
+        let previewing = self.player_title();
+        let title: SharedString = previewing.clone().unwrap_or_else(|| PLAYER_TITLE.into());
+        chrome::panel_header(title, cx)
+            .children(previewing.map(|_| div().id("player-previewing").test_support()))
             .child(div().flex_1())
             .child(
                 div()

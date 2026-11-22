@@ -23,8 +23,26 @@ pub const STILL_CHOICES: [u32; 5] = [3, 5, 8, 10, 15];
 /// 新草稿默认帧率可选的几档。
 pub const RATE_CHOICES: [u32; 5] = [24, 25, 30, 50, 60];
 
+/// 自己存的文字预设（文本面板「保存预设」）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextPreset {
+    /// 名字。
+    pub name: String,
+    /// 整套样式（套用时不动字幕的位置）。
+    pub style: ve_core::SubtitleStyle,
+}
+
+/// 自己存的调节预设（片段右键「保存为调节预设」，在「调节」标签里点一下套用）。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AdjustPreset {
+    /// 第几个（名字按它生成）。
+    pub number: u32,
+    /// 基础调节。
+    pub adjust: ve_core::ColorAdjust,
+}
+
 /// 全局设置。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
     /// 草稿（自动保存的新工程）放哪；`None` 用默认位置。
@@ -35,6 +53,12 @@ pub struct AppSettings {
     pub still_secs: u32,
     /// 新草稿的帧率（导入第一段视频后按视频的来）。
     pub frame_rate: u32,
+    /// 自己存的文字预设。
+    pub text_presets: Vec<TextPreset>,
+    /// 自己存的调节预设。
+    pub adjust_presets: Vec<AdjustPreset>,
+    /// 新手引导看过了（第一次打开时弹一次）。
+    pub seen_guide: bool,
 }
 
 impl Default for AppSettings {
@@ -44,6 +68,9 @@ impl Default for AppSettings {
             cache_dir: None,
             still_secs: 5,
             frame_rate: 30,
+            text_presets: Vec::new(),
+            adjust_presets: Vec::new(),
+            seen_guide: false,
         }
     }
 }
@@ -518,6 +545,12 @@ mod tests {
             cache_dir: None,
             still_secs: 8,
             frame_rate: 25,
+            adjust_presets: Vec::new(),
+            text_presets: vec![TextPreset {
+                name: "我的预设 1".into(),
+                style: ve_core::SubtitleStyle::default(),
+            }],
+            seen_guide: true,
         };
         s.save(&file).unwrap();
         assert_eq!(AppSettings::load(&file), s);

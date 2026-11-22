@@ -207,13 +207,37 @@ impl Document {
             return;
         }
         self.anchor = Some(clip);
+        // 组合（Ctrl+G）里的片段一起选中、一起取消
+        let members = self.group_members(clip);
         if !additive {
-            self.selection = vec![clip];
-        } else if let Some(i) = self.selection.iter().position(|c| *c == clip) {
-            self.selection.remove(i);
+            self.selection = members;
+        } else if self.selection.contains(&clip) {
+            self.selection.retain(|c| !members.contains(c));
         } else {
-            self.selection.push(clip);
+            for m in members {
+                if !self.selection.contains(&m) {
+                    self.selection.push(m);
+                }
+            }
         }
+    }
+
+    /// 和 `clip` 同一个组合的片段（它自己在最前；没成组时只有它自己），锁着的轨道上的不算。
+    fn group_members(&self, clip: ClipId) -> Vec<ClipId> {
+        let tl = &self.project.timeline;
+        let Some(g) = tl.find_clip(clip).and_then(|(_, c)| c.group) else {
+            return vec![clip];
+        };
+        let mut out = vec![clip];
+        out.extend(
+            tl.tracks
+                .iter()
+                .filter(|t| !t.locked)
+                .flat_map(|t| t.clips.iter())
+                .filter(|c| c.group == Some(g) && c.id != clip)
+                .map(|c| c.id),
+        );
+        out
     }
 
     /// Shift 点击：选中起点片段和 `to` 之间的一块——两者所在轨道之间的每条轨上，
@@ -315,6 +339,11 @@ impl Document {
     pub fn mark_saved(&mut self, path: PathBuf) {
         self.path = Some(path);
         self.dirty = false;
+    }
+
+    /// 工程文件换了地方（改名）：只改路径，有没有未保存的修改照旧。
+    pub fn set_path(&mut self, path: PathBuf) {
+        self.path = Some(path);
     }
 
     /// 工程名：文件名（不带扩展名），没保存过的叫「未命名」。

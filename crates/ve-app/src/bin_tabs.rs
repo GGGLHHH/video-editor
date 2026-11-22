@@ -74,6 +74,52 @@ impl Workspace {
         self.after_change(window, cx);
     }
 
+    /// 右键「保存为调节预设」：选中的第一个视频片段的基础调节存进设置。
+    pub(crate) fn save_adjust_preset(
+        &mut self,
+        _: &act::SaveAdjustPreset,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(adjust) = self.selected_picture_clips().first().and_then(|&c| {
+            self.doc
+                .project
+                .timeline
+                .find_clip(c)
+                .map(|(_, clip)| clip.adjust)
+        }) else {
+            return;
+        };
+        let mut settings = self.settings.clone();
+        let number = settings
+            .adjust_presets
+            .iter()
+            .map(|p| p.number)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        settings
+            .adjust_presets
+            .push(crate::settings::AdjustPreset { number, adjust });
+        self.use_settings(settings, None, cx);
+        crate::workspace::notify(
+            Notification::success(format!(
+                "已存成「我的预设 {number}」，在「调节」标签里点一下就能套用"
+            )),
+            window,
+            cx,
+        );
+    }
+
+    /// 删掉第 `i` 个调节预设。
+    fn remove_adjust_preset(&mut self, i: usize, cx: &mut Context<'_, Self>) {
+        let mut settings = self.settings.clone();
+        if i < settings.adjust_presets.len() {
+            settings.adjust_presets.remove(i);
+            self.use_settings(settings, None, cx);
+        }
+    }
+
     /// 选中的视频片段都用着这组调色。
     fn all_selected_use(&self, adjust: &ColorAdjust) -> bool {
         let clips = self.selected_picture_clips();
@@ -275,8 +321,54 @@ impl Workspace {
     }
 
     /// 「调节」标签：一张「自定义调节」卡片。
-    pub(crate) fn render_adjust_bin_tab(cx: &Context<'_, Self>) -> impl IntoElement {
+    pub(crate) fn render_adjust_bin_tab(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
+        let presets = self
+            .settings
+            .adjust_presets
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let filter = Filter {
+                    name: "我的预设",
+                    adjust: p.adjust,
+                };
+                let on = self.all_selected_use(&p.adjust);
+                h_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("adjust-preset-{i}")))
+                            .test_support()
+                            .px_2()
+                            .py_1()
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(if on {
+                                palette::accent()
+                            } else {
+                                cx.theme().border
+                            })
+                            .text_xs()
+                            .cursor_pointer()
+                            .child(format!("我的预设 {}", p.number))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.apply_filter(filter, window, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("adjust-preset-{i}-remove")))
+                            .text_xs()
+                            .text_color(muted)
+                            .cursor_pointer()
+                            .child("×")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_adjust_preset(i, cx);
+                            })),
+                    )
+            });
+        let has_presets = !self.settings.adjust_presets.is_empty();
         v_flex()
             .id("bin-adjust")
             .test_support()
@@ -309,5 +401,11 @@ impl Workspace {
                         this.add_adjustment_at_playhead(window, cx);
                     })),
             )
+            .child(div().text_xs().text_color(muted).child(if has_presets {
+                "我的预设（选中视频片段后点一下套用）"
+            } else {
+                "我的预设：片段右键「保存为调节预设」后出现在这里"
+            }))
+            .child(h_flex().flex_wrap().gap_2().children(presets))
     }
 }

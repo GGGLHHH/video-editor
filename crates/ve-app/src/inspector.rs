@@ -32,10 +32,8 @@ pub struct Inspector {
     pub(crate) adjust: crate::inspector_adjust::AdjustFields,
     /// 用户点选的一级标签（当前片段没有这个标签时显示第一个）。
     pub(crate) tab: InspectorTab,
-    /// 「动画」标签：在看出场（否则入场）。
-    pub(crate) anim_out: bool,
-    /// 「动画」标签：预设时长（秒）。
-    pub(crate) anim_secs: f64,
+    /// 「动画」标签：入场 / 出场 / 组合、时长滑条。
+    pub(crate) motion: crate::inspector_motion::MotionFields,
     /// 折叠起来的属性组（按组编号）。
     pub(crate) collapsed: std::collections::HashSet<&'static str>,
     /// 外观（混合模式、描边、阴影、抠像、蒙版）的滑条和二级分段。
@@ -103,11 +101,18 @@ impl InspectorTab {
         }
     }
 
+    /// 视频轨上的复合片段（剪映：和普通视频一样能调画面、变速、动画、调色）。
+    pub const COMPOUND: &'static [Self] =
+        &[Self::Picture, Self::Speed, Self::Animation, Self::Adjust];
+
     /// 某类片段有哪些标签（和剪映一致）。
     #[must_use]
-    pub const fn for_clip(video: bool, subtitle: bool) -> &'static [Self] {
+    pub const fn for_clip(video: bool, subtitle: bool, sound: bool) -> &'static [Self] {
         if subtitle {
             &[Self::Subtitles, Self::Text, Self::Animation]
+        } else if video && !sound {
+            // 没声音的视频（图片、静音素材、声音已经分离出去）没有「音频」标签（剪映）
+            &[Self::Picture, Self::Speed, Self::Animation, Self::Adjust]
         } else if video {
             &[
                 Self::Picture,
@@ -162,6 +167,7 @@ impl Inspector {
         let (adjust, adjust_subs) = crate::inspector_adjust::AdjustFields::new(window, cx);
         let (look, look_subs) = crate::inspector_look::LookFields::new(window, cx);
         let (speed, speed_subs) = crate::inspector_speed::SpeedFields::new(window, cx);
+        let (motion, motion_subs) = crate::inspector_motion::MotionFields::new(window, cx);
         let (grade, grade_subs) = crate::inspector_grade::GradeFields::new(window, cx);
         let (effect, effect_subs) = crate::inspector_effect::EffectFields::new(window, cx);
         let (audio_fx, audio_fx_subs) = crate::inspector_audio_fx::AudioFxFields::new(window, cx);
@@ -214,6 +220,7 @@ impl Inspector {
         subs.extend(adjust_subs);
         subs.extend(look_subs);
         subs.extend(speed_subs);
+        subs.extend(motion_subs);
         subs.extend(grade_subs);
         subs.extend(effect_subs);
         subs.extend(audio_fx_subs);
@@ -227,8 +234,7 @@ impl Inspector {
                 bound: None,
                 gain_gesture: false,
                 tab: InspectorTab::default(),
-                anim_out: false,
-                anim_secs: 0.5,
+                motion,
                 collapsed: std::collections::HashSet::new(),
                 look,
                 speed,
@@ -289,25 +295,25 @@ impl Workspace {
         cx: &Context<'_, Self>,
     ) -> gpui_kit::AnyElement {
         let muted = cx.theme().muted_foreground;
-        let row = |label: &'static str, value: String| {
-            h_flex()
-                .justify_between()
-                .text_sm()
-                .child(div().text_color(muted).child(label))
-                .child(SharedString::from(value))
-        };
         let body = v_flex()
             .gap_2()
             .child(
                 h_flex()
                     .gap_2()
-                    .child(div().flex_1().child(row(
-                        "音量",
-                        format!(
-                            "{:+.1} dB",
-                            c.gain_db_at((self.playhead - c.start).clamp(Time::ZERO, c.duration))
-                        ),
-                    )))
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .justify_between()
+                            .text_sm()
+                            .child(div().text_color(muted).child("音量"))
+                            .child(self.value_box(
+                                "gain",
+                                &self.inspector.gain,
+                                format!("{:+.1} dB", c.gain_db_at(self.key_offset(c))),
+                                64.0,
+                                cx,
+                            )),
+                    )
                     .child(self.render_group_keys(ve_core::KeyGroup::Volume, cx)),
             )
             .child(Slider::new(&self.inspector.gain))
@@ -437,6 +443,7 @@ impl Workspace {
                     self.fill_transform(&t, window, cx);
                     let offset = self.key_offset(&clip);
                     self.fill_adjust(&clip.adjust_at(offset), window, cx);
+                    self.fill_mask_text(window, cx);
                 }
             }
             ClipContent::Subtitle { text, .. } => {
@@ -451,9 +458,11 @@ impl Workspace {
             ClipContent::Adjustment => self.fill_adjust(&clip.adjust, window, cx),
             ClipContent::Effect(_) => self.refresh_effect_slider(window, cx),
             ClipContent::Compound { .. } => {
-                // 视频轨上的复合片段：整组的位置大小
+                // 视频轨上的复合片段：整组的位置大小、调色
                 if let Some((_, t, _)) = self.bound_visual_clip() {
                     self.fill_transform(&t, window, cx);
+                    let offset = self.key_offset(&clip);
+                    self.fill_adjust(&clip.adjust_at(offset), window, cx);
                 }
             }
         }
@@ -560,17 +569,24 @@ impl Workspace {
         let Some(c) = clip else {
             return self.render_draft_params(cx);
         };
-        if c.compound().is_some() {
-            return inspector_frame(div(), self.render_compound_panel(&c, cx));
-        }
         let video = self.bound_video_clip().is_some();
         let subtitle = matches!(c.content, ClipContent::Subtitle { .. });
-        let available = if c.is_adjustment() {
+        let available = if c.compound().is_some() {
+            if self.bound_visual_clip().is_some() {
+                InspectorTab::COMPOUND
+            } else {
+                &[InspectorTab::Picture][..]
+            }
+        } else if c.is_adjustment() {
             &[InspectorTab::Adjust][..]
         } else if c.effect().is_some() {
             &[InspectorTab::Effect][..]
         } else {
-            InspectorTab::for_clip(video, subtitle)
+            let sound = !c.audio_split
+                && c.asset()
+                    .and_then(|a| self.doc.project.assets.get(&a))
+                    .is_some_and(|a| a.audio.is_some());
+            InspectorTab::for_clip(video, subtitle, sound)
         };
         let current = self.inspector.tab.effective(available);
         let tabs = h_flex().children(available.iter().map(|&tab| {
@@ -616,6 +632,34 @@ impl Workspace {
                     .child(seg)
                     .into_any_element()
             }
+            (Some(InspectorTab::Picture), ClipContent::Compound { .. }) => {
+                // 复合片段：「基础」是它自己的面板（进入、解除、位置大小、混合、圆角）加描边、阴影，
+                // 「抠像」「蒙版」整组生效
+                let seg = match self.inspector.look.seg {
+                    crate::inspector_look::PictureSeg::Mask => self
+                        .render_mask_seg(cx)
+                        .unwrap_or_else(|| div().into_any_element()),
+                    crate::inspector_look::PictureSeg::Key => self
+                        .render_key_seg(cx)
+                        .unwrap_or_else(|| div().into_any_element()),
+                    crate::inspector_look::PictureSeg::Basic => v_flex()
+                        .gap_3()
+                        .child(self.render_compound_panel(&c, cx))
+                        .children(self.render_stroke_shadow(cx))
+                        .into_any_element(),
+                };
+                v_flex()
+                    .gap_3()
+                    .children(
+                        self.bound_visual_clip()
+                            .map(|_| self.render_picture_segments(cx)),
+                    )
+                    .child(seg)
+                    .into_any_element()
+            }
+            (Some(InspectorTab::Animation), ClipContent::Compound { .. }) => {
+                self.render_motion_tab(cx).into_any_element()
+            }
             (Some(InspectorTab::Audio), ClipContent::Media { .. }) => {
                 self.render_audio_props(&c, cx)
             }
@@ -629,9 +673,10 @@ impl Workspace {
                 // 剪映文字也有「位置大小」，能打关键帧
                 .children(self.render_transform_section(cx))
                 .into_any_element(),
-            (Some(InspectorTab::Speed), ClipContent::Media { .. }) => {
-                self.render_speed_tab(&c, cx).into_any_element()
-            }
+            (
+                Some(InspectorTab::Speed),
+                ClipContent::Media { .. } | ClipContent::Compound { .. },
+            ) => self.render_speed_tab(&c, cx).into_any_element(),
             (Some(InspectorTab::Animation), ClipContent::Media { .. }) if video => {
                 self.render_motion_tab(cx).into_any_element()
             }
@@ -698,13 +743,14 @@ mod tests {
 
     #[test]
     fn tabs_depend_on_clip_kind_and_fall_back_to_first() {
-        let video = InspectorTab::for_clip(true, false);
+        let video = InspectorTab::for_clip(true, false, true);
+        assert!(!InspectorTab::for_clip(true, false, false).contains(&InspectorTab::Audio));
         assert_eq!(video[0], InspectorTab::Picture);
         assert_eq!(
-            InspectorTab::for_clip(false, false),
+            InspectorTab::for_clip(false, false, true),
             [InspectorTab::Audio, InspectorTab::Speed]
         );
-        let sub = InspectorTab::for_clip(false, true);
+        let sub = InspectorTab::for_clip(false, true, false);
         assert_eq!(
             sub,
             [

@@ -3,7 +3,6 @@
 //!
 //! 几何都按画布像素算（和合成器同一套 `layer_geometry`），只在进出屏幕时换算一次。
 
-use crate::preview::fit_rect;
 use crate::preview_handles::{
     Edge, Guides, HandleHit, cursor_for, drag_move, drag_rotate, drag_scale, drag_scale_edge, hit,
     rotate_handle,
@@ -86,7 +85,7 @@ struct Overlay {
 impl Workspace {
     fn mapping(&self) -> Option<Mapping> {
         let s = self.doc.project.settings;
-        let video = fit_rect(self.preview.bounds, s.width, s.height);
+        let video = self.video_rect();
         let w = f32::from(video.size.width);
         if s.width == 0 || w <= 0.0 {
             return None;
@@ -130,11 +129,12 @@ impl Workspace {
                 showing.contains(&c.id) && c.start <= self.playhead && self.playhead < c.end()
             });
             if let Some(c) = here {
-                let t = c.transform_at(self.playhead - c.start);
+                // 拖动从不含动画的值改起（动画不会被写进去）；框和点中按看到的样子（含动画）
+                let t = c.keyed_transform_at(self.playhead - c.start);
                 // 整组的裁剪合成时不生效，框也不按裁剪画
                 let shown = Transform {
                     crop: ve_core::Crop::default(),
-                    ..t
+                    ..c.transform_at(self.playhead - c.start)
                 };
                 layers.push((
                     depth(tr.id),
@@ -443,7 +443,7 @@ fn square(c: (f32, f32), side: f32) -> Bounds<Pixels> {
     )
 }
 
-/// 画选中框：按实际角度的边框、角和边中点的小方块、下边中点连到旋转手柄的线和圆点、对齐参考线。
+/// 画选中框：按实际角度的边框、角上的白圆点、边中点的小方块、下边中点连到旋转手柄的线和圆点、对齐参考线。
 fn paint_overlay(o: &Overlay, window: &mut Window) {
     let at = |p: (f32, f32)| point(px(p.0), px(p.1));
     let (vx, vy, vw, vh) = o.video;
@@ -473,9 +473,11 @@ fn paint_overlay(o: &Overlay, window: &mut Window) {
             window.paint_path(path, o.color);
         }
     }
+    // 角：白色圆点（剪映），外面一圈选中色
     for c in o.corners {
-        window.paint_quad(fill(square(c, HANDLE_PX), o.color));
-        window.paint_quad(fill(square(c, HANDLE_PX - 2.0), o.handle_bg));
+        let r = px(HANDLE_PX);
+        window.paint_quad(fill(square(c, HANDLE_PX + 2.0), o.color).corner_radii(r));
+        window.paint_quad(fill(square(c, HANDLE_PX), gpui_kit::white()).corner_radii(r));
     }
     // 边中点：小一号的方块
     for e in o.edges {

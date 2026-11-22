@@ -381,6 +381,8 @@ impl Worker<'_> {
                     color: l.color,
                     look: l.look,
                     grades: &l.grades,
+                    detail: l.detail,
+                    mask_text: l.mask_text.as_deref(),
                 })
             })
             .collect();

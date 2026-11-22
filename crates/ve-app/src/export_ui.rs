@@ -42,6 +42,8 @@ pub struct ExportProgress {
 pub enum Resolution {
     /// 跟工程一样。
     Project,
+    /// 短边 480。
+    P480,
     /// 短边 720。
     P720,
     /// 短边 1080。
@@ -50,6 +52,29 @@ pub enum Resolution {
     P1440,
     /// 短边 2160（4K）。
     P2160,
+    /// 短边 4320（8K）。
+    P4320,
+}
+
+/// 视频放进什么文件（剪映导出的「格式」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Container {
+    /// MP4：最通用。
+    #[default]
+    Mp4,
+    /// MOV：剪辑软件之间交换常用，能放无损的 PCM 声音。
+    Mov,
+}
+
+impl Container {
+    /// 文件扩展名。
+    #[must_use]
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Mp4 => "mp4",
+            Self::Mov => "mov",
+        }
+    }
 }
 
 /// 按目标短边等比缩放，宽高取偶数。
@@ -57,10 +82,12 @@ pub enum Resolution {
 pub fn scaled_size(width: u32, height: u32, res: Resolution) -> (u32, u32) {
     let target: u32 = match res {
         Resolution::Project => return (width, height),
+        Resolution::P480 => 480,
         Resolution::P720 => 720,
         Resolution::P1080 => 1080,
         Resolution::P1440 => 1440,
         Resolution::P2160 => 2160,
+        Resolution::P4320 => 4320,
     };
     let short = u64::from(width.min(height).max(1));
     let scale = |v: u32| {
@@ -108,6 +135,10 @@ pub struct ExportChoices {
     pub only_range: bool,
     /// 封面：导出时取成片的一帧存成图片。
     pub cover: Option<CoverAt>,
+    /// 视频的文件格式。
+    pub container: Container,
+    /// 视频里的声音（编码、码率、采样率）。
+    pub video_audio: ve_export::VideoAudio,
 }
 
 /// 导出预设（常见平台的推荐参数）：一下子选好分辨率、帧率、码率、编码和目标响度。
@@ -227,11 +258,38 @@ impl Default for ExportChoices {
             loudness: None,
             only_range: false,
             cover: None,
+            container: Container::Mp4,
+            video_audio: ve_export::VideoAudio::DEFAULT,
         }
     }
 }
 
 impl ExportChoices {
+    /// 换文件格式：MP4 放不了 PCM（声音换回 AAC 192k），MOV 不放 AV1（换回 H.264）。
+    pub const fn set_container(&mut self, container: Container) {
+        self.container = container;
+        match container {
+            Container::Mp4 => {
+                if matches!(self.video_audio.codec, ve_export::AudioCodec::Pcm) {
+                    self.video_audio.codec = ve_export::AudioCodec::Aac(192);
+                }
+            }
+            Container::Mov => {
+                if matches!(self.codec, Codec::Av1) {
+                    self.codec = Codec::H264;
+                }
+            }
+        }
+    }
+
+    /// 换声音编码：PCM 只能放进 MOV。
+    pub const fn set_audio_codec(&mut self, codec: ve_export::AudioCodec) {
+        self.video_audio.codec = codec;
+        if matches!(codec, ve_export::AudioCodec::Pcm) {
+            self.set_container(Container::Mov);
+        }
+    }
+
     /// 按工程设置换算成导出设置。
     #[must_use]
     pub fn settings(&self, path: PathBuf, project: &ProjectSettings) -> ExportSettings {
@@ -256,6 +314,7 @@ impl ExportChoices {
             output: Output::Video,
             loudness_lufs: self.loudness,
             range: None,
+            video_audio: self.video_audio,
         }
     }
 
@@ -356,7 +415,7 @@ pub(crate) struct ExportTarget {
 }
 
 /// 标题里放不进文件名的字符换成「_」。
-fn file_title(title: &str) -> String {
+pub(crate) fn file_title(title: &str) -> String {
     let safe = title
         .chars()
         .map(|c| {
@@ -479,7 +538,11 @@ impl ExportForm {
         if title.is_empty() {
             return Err("标题不能为空");
         }
-        Ok(free_path(&self.dir, &title, "mp4"))
+        Ok(free_path(
+            &self.dir,
+            &title,
+            self.choices.container.extension(),
+        ))
     }
 
     fn settings(&self, cx: &gpui_kit::App) -> ExportSettings {
@@ -643,10 +706,12 @@ impl ExportForm {
         let c = self.choices;
         let res_items = [
             ("res-project", "原始", Resolution::Project),
+            ("res-480", "480P", Resolution::P480),
             ("res-720", "720P", Resolution::P720),
             ("res-1080", "1080P", Resolution::P1080),
             ("res-1440", "2K", Resolution::P1440),
             ("res-2160", "4K", Resolution::P2160),
+            ("res-4320", "8K", Resolution::P4320),
         ]
         .map(|(id, label, r)| {
             Self::pick(
@@ -665,18 +730,29 @@ impl ExportForm {
             |ch| ch.frame_rate = None,
             cx,
         ))
-        .chain([24, 25, 30, 50, 60].map(|n| {
-            let r = FrameRate::new(n, 1);
-            Self::pick(
-                format!("fps-{n}"),
-                n.to_string(),
-                c.frame_rate == Some(r),
-                move |ch| {
-                    ch.frame_rate = Some(r);
-                },
-                cx,
-            )
-        }))
+        .chain(
+            [
+                ("24", "24", FrameRate::new(24, 1)),
+                ("25", "25", FrameRate::new(25, 1)),
+                ("2997", "29.97", FrameRate::new(30_000, 1001)),
+                ("30", "30", FrameRate::new(30, 1)),
+                ("50", "50", FrameRate::new(50, 1)),
+                ("5994", "59.94", FrameRate::new(60_000, 1001)),
+                ("60", "60", FrameRate::new(60, 1)),
+                ("120", "120", FrameRate::new(120, 1)),
+            ]
+            .map(|(id, label, r)| {
+                Self::pick(
+                    format!("fps-{id}"),
+                    label,
+                    c.frame_rate == Some(r),
+                    move |ch| {
+                        ch.frame_rate = Some(r);
+                    },
+                    cx,
+                )
+            }),
+        )
         .collect();
         let br_items = [
             ("br-low", "更低", Bitrate::Lower),
@@ -689,9 +765,13 @@ impl ExportForm {
         let codec_items = [
             ("codec-h264", "H.264（最通用）", Codec::H264),
             ("codec-hevc", "HEVC（更省空间）", Codec::Hevc),
+            ("codec-av1", "AV1（最省空间）", Codec::Av1),
         ]
+        .into_iter()
+        // MOV 不放 AV1
+        .filter(|(.., k)| !(c.container == Container::Mov && *k == Codec::Av1))
         .map(|(id, label, k)| Self::pick(id, label, c.codec == k, move |ch| ch.codec = k, cx))
-        .into();
+        .collect();
         let enc_items = [
             ("enc-nvenc", "显卡（NVENC）", Encoder::Nvenc),
             ("enc-x264", "CPU", Encoder::X264),
@@ -701,15 +781,85 @@ impl ExportForm {
         (res_items, fps_items, br_items, codec_items, enc_items)
     }
 
-    /// 估计大小：视频（含 192k 声音）加上单独导出的音频。
+    /// 「格式」「声音」「采样率」三行。
+    fn format_rows(&self, cx: &Context<'_, Self>) -> [AnyElement; 3] {
+        let (formats, audio, rates) = self.format_items(cx);
+        [
+            row("格式", formats, cx).into_any_element(),
+            row("声音", audio, cx).into_any_element(),
+            row("采样率", rates, cx).into_any_element(),
+        ]
+    }
+
+    /// 「格式」「声音」「采样率」三行的选项。
+    fn format_items(
+        &self,
+        cx: &Context<'_, Self>,
+    ) -> (Vec<AnyElement>, Vec<AnyElement>, Vec<AnyElement>) {
+        use ve_export::AudioCodec;
+        let c = self.choices;
+        let formats = [
+            ("fmt-mp4", "MP4", Container::Mp4),
+            ("fmt-mov", "MOV", Container::Mov),
+        ]
+        .map(|(id, label, k)| {
+            Self::pick(
+                id,
+                label,
+                c.container == k,
+                move |ch| ch.set_container(k),
+                cx,
+            )
+        })
+        .into();
+        let audio = [
+            ("va-aac192", "AAC 192k", AudioCodec::Aac(192)),
+            ("va-aac256", "AAC 256k", AudioCodec::Aac(256)),
+            ("va-aac320", "AAC 320k", AudioCodec::Aac(320)),
+            ("va-pcm", "PCM 无损", AudioCodec::Pcm),
+        ]
+        .map(|(id, label, k)| {
+            Self::pick(
+                id,
+                label,
+                c.video_audio.codec == k,
+                move |ch| ch.set_audio_codec(k),
+                cx,
+            )
+        })
+        .into();
+        let rates = [
+            ("sr-44100", "44.1 kHz", 44_100),
+            ("sr-48000", "48 kHz", 48_000),
+        ]
+        .map(|(id, label, r)| {
+            Self::pick(
+                id,
+                label,
+                c.video_audio.sample_rate == r,
+                move |ch| ch.video_audio.sample_rate = r,
+                cx,
+            )
+        })
+        .into();
+        (formats, audio, rates)
+    }
+
+    /// 估计大小：视频（含里面的声音）加上单独导出的音频。
     fn size_estimate(&self, preview: &ExportSettings) -> String {
         let d = self.out_duration();
         let c = self.choices;
         let mut parts = Vec::new();
         if c.video {
+            // estimated_bytes 按 192k 的声音算；视频里的声音选了别的码率（或 PCM）就补上差的
+            let sound = match c.video_audio.codec {
+                ve_export::AudioCodec::Aac(k) => k,
+                ve_export::AudioCodec::Pcm => c.video_audio.sample_rate * 16 * 2 / 1000,
+            };
+            let kbps = (preview.video_bitrate_kbps + sound).saturating_sub(192);
             parts.push(format!(
                 "视频 {}（码率 {} kbps）",
-                size_text(estimated_bytes(preview.video_bitrate_kbps, d)),
+                size_text(estimated_bytes(kbps, d)),
                 preview.video_bitrate_kbps
             ));
         }
@@ -891,6 +1041,7 @@ impl Render for ExportForm {
                             ))),
                     )
                     .child(row("帧率", fps_items, cx))
+                    .children(self.format_rows(cx))
                     .child(row("码率", br_items, cx))
                     .children((c.bitrate == Bitrate::Custom).then(|| {
                         h_flex()
@@ -1222,6 +1373,33 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mov_pcm_and_av1_choices_stay_compatible() {
+        let mut c = ExportChoices::default();
+        assert_eq!(
+            (c.container, c.video_audio),
+            (Container::Mp4, ve_export::VideoAudio::default())
+        );
+        // 选 PCM：只能放进 MOV
+        c.set_audio_codec(ve_export::AudioCodec::Pcm);
+        assert_eq!(c.container, Container::Mov);
+        // 换回 MP4：声音回到 AAC
+        c.set_container(Container::Mp4);
+        assert_eq!(c.video_audio.codec, ve_export::AudioCodec::Aac(192));
+        // AV1 不放进 MOV
+        c.codec = Codec::Av1;
+        c.set_container(Container::Mov);
+        assert_eq!(c.codec, Codec::H264);
+        assert_eq!(Container::Mov.extension(), "mov");
+        // 新的分辨率档
+        assert_eq!(scaled_size(1920, 1080, Resolution::P480), (852, 480));
+        assert_eq!(scaled_size(1920, 1080, Resolution::P4320), (7680, 4320));
+        // 声音设置进导出设置
+        let project = ProjectSettings::default();
+        let s = c.settings(PathBuf::from("x.mov"), &project);
+        assert_eq!(s.video_audio, c.video_audio);
+    }
+
     #[test]
     fn titles_become_safe_file_names_that_never_overwrite() {
         assert_eq!(file_title("片头: 第1集?"), "片头_ 第1集_");

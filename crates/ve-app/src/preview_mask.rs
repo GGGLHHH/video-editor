@@ -123,8 +123,8 @@ impl MaskFrame {
                     .collect();
                 vec![ring]
             }
-            // 矩形、爱心、星形：画外接框
-            MaskShape::Rectangle | MaskShape::Heart | MaskShape::Star => {
+            // 矩形、爱心、星形、文字：画外接框
+            MaskShape::Rectangle | MaskShape::Heart | MaskShape::Star | MaskShape::Text => {
                 let (w, h) = (self.hw, self.hh);
                 vec![
                     [(-w, -h), (w, -h), (w, h), (-w, h), (-w, -h)]
@@ -281,7 +281,8 @@ impl Workspace {
         let (clip, _, geom) = self.selected_layer(canvas)?;
         let (_, c) = self.doc.project.timeline.find_clip(clip)?;
         let at = self.key_offset(c);
-        Some((clip, c.look_at(at).mask?, geom, at))
+        let look = crate::inspector_look::view_mask(c.look_at(at), self.inspector.look.mask_index);
+        Some((clip, look.mask?, geom, at))
     }
 
     /// 蒙版模式下按下：按在蒙版上就开始拖蒙版。在蒙版模式里返回 `true`（按在蒙版外面也不选图层、
@@ -335,13 +336,16 @@ impl Workspace {
             d.unit,
             shift,
         );
+        let index = self.inspector.look.mask_index;
         let edited = self.doc.edit(|proj| {
             let (_, c) = proj
                 .timeline
                 .find_clip(d.clip)
                 .ok_or(ve_core::EditError::ClipNotFound(d.clip))?;
-            let mut look = c.look_at(d.at);
-            look.mask = Some(m);
+            let real = c.look_at(d.at);
+            let mut view = crate::inspector_look::view_mask(real, index);
+            view.mask = Some(m);
+            let look = crate::inspector_look::unview_mask(view, real, index);
             apply_look_at(proj, d.clip, d.at, look)
         });
         if edited.is_ok() {

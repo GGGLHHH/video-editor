@@ -424,6 +424,127 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// 预设的样子：一个「字」，文字色写在描边色上（没有描边时垫灰底）。
+    fn preset_swatch(
+        id: String,
+        label: SharedString,
+        color: u32,
+        edge: u32,
+        width: f32,
+        on: bool,
+    ) -> gpui_kit::base::ObservedElement<gpui_kit::Stateful<gpui_kit::Div>> {
+        let ground = if width > 0.0 { edge } else { 0x60_6060 };
+        div()
+            .id(SharedString::from(id))
+            .test_support()
+            .p(px(1.))
+            .rounded(px(4.))
+            .border_2()
+            .border_color(if on {
+                crate::theme::palette::accent()
+            } else {
+                gpui_kit::transparent_black()
+            })
+            .cursor_pointer()
+            .child(
+                div()
+                    .w(px(28.))
+                    .h(px(20.))
+                    .text_xs()
+                    .rounded(px(3.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(gpui_kit::rgb(ground))
+                    .text_color(gpui_kit::rgb(color))
+                    .font_weight(gpui_kit::FontWeight::BOLD)
+                    .child("字"),
+            )
+            .tooltip(move |window, cx| {
+                gpui_kit::component::tooltip::Tooltip::new(label.clone()).build(window, cx)
+            })
+    }
+
+    /// 把现在的样式存成自己的预设（存进全局设置）。
+    fn save_text_preset(&mut self, cx: &mut Context<'_, Self>) {
+        let style = self
+            .bound_own_style()
+            .map_or_else(|| self.doc.project.subtitle_style.clone(), |(_, own)| own);
+        let mut settings = self.settings.clone();
+        let name = format!("我的预设 {}", settings.text_presets.len() + 1);
+        settings
+            .text_presets
+            .push(crate::settings::TextPreset { name, style });
+        self.use_settings(settings, None, cx);
+    }
+
+    /// 删掉自己存的第 `i` 个预设。
+    fn remove_text_preset(&mut self, i: usize, cx: &mut Context<'_, Self>) {
+        let mut settings = self.settings.clone();
+        if i < settings.text_presets.len() {
+            settings.text_presets.remove(i);
+            self.use_settings(settings, None, cx);
+        }
+    }
+
+    /// 「预设」一排：自带的、自己存的（点一下套用整套样式、位置不变；右键删除），最后是「保存预设」。
+    fn render_presets(
+        &self,
+        builtin: Vec<AnyElement>,
+        s: &SubtitleStyle,
+        cx: &Context<'_, Self>,
+    ) -> AnyElement {
+        let mine = self
+            .settings
+            .text_presets
+            .iter()
+            .enumerate()
+            .map(|(i, pr)| {
+                let style = pr.style.clone();
+                let on = SubtitleStyle {
+                    margin_ratio: s.margin_ratio,
+                    ..style.clone()
+                } == *s;
+                Self::preset_swatch(
+                    format!("ts-mine-{i}"),
+                    SharedString::from(pr.name.clone()),
+                    style.color,
+                    style.outline_color,
+                    style.outline,
+                    on,
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let style = style.clone();
+                    this.edit_text_style(
+                        &move |st: &mut SubtitleStyle| {
+                            *st = SubtitleStyle {
+                                margin_ratio: st.margin_ratio,
+                                ..style.clone()
+                            };
+                        },
+                        window,
+                        cx,
+                    );
+                }))
+                .on_mouse_down(
+                    gpui_kit::MouseButton::Right,
+                    cx.listener(move |this, _, _, cx| this.remove_text_preset(i, cx)),
+                )
+                .into_any_element()
+            });
+        let save = chrome::chip("ts-save-preset", "＋ 保存预设", false, cx)
+            .on_click(cx.listener(|this, _, _, cx| this.save_text_preset(cx)))
+            .into_any_element();
+        h_flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .children(builtin)
+            .children(mine)
+            .child(save)
+            .into_any_element()
+    }
+
     /// 「应用到全部字幕」开关：开着时改的是所有字幕共用的样式；关掉后这一条有自己的样式（从共用的复制一份）。
     fn toggle_apply_to_all(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some(clip) = self.inspector.bound else {
@@ -465,12 +586,7 @@ impl Workspace {
                     .test_support()
                     .child(Slider::new(slider)),
             )
-            .child(
-                div()
-                    .w(px(36.))
-                    .text_sm()
-                    .child(SharedString::from(format!("{}", f.get(s)))),
-            )
+            .child(self.value_box(f.id(), slider, format!("{}", f.get(s)), 36.0, cx))
             .into_any_element()
     }
 
@@ -552,17 +668,26 @@ impl Workspace {
             .iter()
             .map(|&(id, label, color, edge, width)| {
                 let on = s.color == color && s.outline_color == edge && close(s.outline, width);
-                Self::style_chip(
+                Self::preset_swatch(
                     format!("ts-preset-{id}"),
-                    label,
+                    label.into(),
+                    color,
+                    edge,
+                    width,
                     on,
-                    move |st| {
-                        st.color = color;
-                        st.outline_color = edge;
-                        st.outline = width;
-                    },
-                    cx,
                 )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.edit_text_style(
+                        move |st: &mut SubtitleStyle| {
+                            st.color = color;
+                            st.outline_color = edge;
+                            st.outline = width;
+                        },
+                        window,
+                        cx,
+                    );
+                }))
+                .into_any_element()
             })
             .collect();
         let fonts: Vec<AnyElement> = FONTS
@@ -636,7 +761,7 @@ impl Workspace {
                     "只改这一条字幕"
                 }),
             ))
-            .child(group("预设", vec![chips(presets)]))
+            .child(group("预设", vec![self.render_presets(presets, &s, cx)]))
             .child(group("字体", vec![chips(fonts), all_fonts]))
             .child(group(
                 "字号",

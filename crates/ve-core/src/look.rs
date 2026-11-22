@@ -201,17 +201,20 @@ pub enum MaskShape {
     Heart,
     /// 五角星。
     Star,
+    /// 文字：字的形状（字写在片段的 [`crate::Clip::mask_text`] 里）。
+    Text,
 }
 
 impl MaskShape {
     /// 全部（剪映里的顺序）。
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Linear,
         Self::Mirror,
         Self::Circle,
         Self::Rectangle,
         Self::Heart,
         Self::Star,
+        Self::Text,
     ];
 
     /// 名字。
@@ -224,6 +227,7 @@ impl MaskShape {
             Self::Rectangle => "矩形",
             Self::Heart => "爱心",
             Self::Star => "星形",
+            Self::Text => "文字",
         }
     }
 
@@ -237,6 +241,7 @@ impl MaskShape {
             Self::Rectangle => 3,
             Self::Heart => 4,
             Self::Star => 5,
+            Self::Text => 6,
         }
     }
 }
@@ -273,6 +278,7 @@ impl Mask {
             MaskShape::Mirror => (1.0, 0.3),
             MaskShape::Circle | MaskShape::Heart | MaskShape::Star => (0.5, 0.5),
             MaskShape::Rectangle => (0.6, 0.5),
+            MaskShape::Text => (0.8, 0.4),
         };
         Self {
             shape,
@@ -285,6 +291,29 @@ impl Mask {
             round: 0.0,
             invert: false,
         }
+    }
+}
+
+/// 文字蒙版的字（剪映「蒙版 › 文字」）：字按蒙版的宽高等比放进去，留下字的形状。
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MaskText {
+    /// 字（可以多行）。
+    pub text: String,
+    /// 字体名（空 = 系统默认的无衬线字体）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub font: String,
+}
+
+impl MaskText {
+    /// 新选文字蒙版时的字。
+    pub const DEFAULT_TEXT: &'static str = "文字";
+    /// 最多几个字。
+    pub const MAX_CHARS: usize = 50;
+
+    /// 有字、不太长。
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        !self.text.trim().is_empty() && self.text.chars().count() <= Self::MAX_CHARS
     }
 }
 
@@ -344,6 +373,22 @@ pub fn rgb_unit(c: u32) -> [f32; 3] {
     [ch(16), ch(8), ch(0)]
 }
 
+/// 一个片段最多几个蒙版。
+pub const MAX_MASKS: usize = 4;
+
+fn no_extra_masks(m: &[Option<Mask>; MAX_MASKS - 1]) -> bool {
+    m.iter().all(Option::is_none)
+}
+
+/// 蒙版的数值都在范围里。
+fn mask_ok(m: &Mask) -> bool {
+    [m.x, m.y, m.rotation].iter().all(|v| v.is_finite())
+        && (0.01..=4.0).contains(&m.width)
+        && (0.01..=4.0).contains(&m.height)
+        && (0.0..=1.0).contains(&m.feather)
+        && (0.0..=1.0).contains(&m.round)
+}
+
 /// 片段的外观：没设的都是默认（不写进工程文件）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -358,9 +403,13 @@ pub struct Look {
     /// 阴影。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shadow: Option<Shadow>,
-    /// 蒙版。
+    /// 蒙版（第一个；关键帧只作用在它上面）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mask: Option<Mask>,
+    /// 另外加的蒙版（剪映「添加蒙版」，最多一共 [`MAX_MASKS`] 个）：和第一个取并集，
+    /// 哪个蒙版留下的地方都显示。前面的格子先用，不留空格。
+    #[serde(skip_serializing_if = "no_extra_masks")]
+    pub extra_masks: [Option<Mask>; MAX_MASKS - 1],
     /// 色度抠图。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chroma: Option<ChromaKey>,
@@ -374,8 +423,48 @@ impl Look {
         stroke: None,
         shadow: None,
         mask: None,
+        extra_masks: [None; MAX_MASKS - 1],
         chroma: None,
     };
+
+    /// 有文字蒙版（第一个或另外的蒙版里有文字形状）。
+    #[must_use]
+    pub fn uses_text(&self) -> bool {
+        self.masks().any(|m| m.shape == MaskShape::Text)
+    }
+
+    /// 全部蒙版（第一个和另外的）。
+    pub fn masks(&self) -> impl Iterator<Item = Mask> + '_ {
+        self.mask
+            .into_iter()
+            .chain(self.extra_masks.iter().flatten().copied())
+    }
+
+    /// 加一个矩形蒙版，返回它是第几个（0 = 第一个）；满了返回 `None`。
+    pub fn add_mask(&mut self) -> Option<usize> {
+        let new = Mask::new(MaskShape::Rectangle);
+        if self.mask.is_none() {
+            self.mask = Some(new);
+            return Some(0);
+        }
+        let free = self.extra_masks.iter().position(Option::is_none)?;
+        self.extra_masks[free] = Some(new);
+        Some(free + 1)
+    }
+
+    /// 删掉第 `i` 个蒙版（0 = 第一个），后面的往前挪。
+    pub fn remove_mask(&mut self, i: usize) {
+        let mut all: Vec<Mask> = self.masks().collect();
+        if i < all.len() {
+            all.remove(i);
+        }
+        let mut rest = all.into_iter();
+        self.mask = rest.next();
+        self.extra_masks = [None; MAX_MASKS - 1];
+        for (slot, m) in self.extra_masks.iter_mut().zip(rest) {
+            *slot = Some(m);
+        }
+    }
 
     /// 什么都没设。
     #[must_use]
@@ -399,13 +488,8 @@ impl Look {
                     && small(s.distance)
                     && s.angle.is_finite()
             })
-            && self.mask.is_none_or(|m| {
-                [m.x, m.y, m.rotation].iter().all(|v| v.is_finite())
-                    && (0.01..=4.0).contains(&m.width)
-                    && (0.01..=4.0).contains(&m.height)
-                    && unit(m.feather)
-                    && unit(m.round)
-            })
+            && self.masks().all(|m| mask_ok(&m))
+            && (self.mask.is_some() || no_extra_masks(&self.extra_masks))
             && self
                 .chroma
                 .is_none_or(|c| c.color <= 0xFF_FFFF && unit(c.intensity) && unit(c.shadow))
@@ -423,6 +507,43 @@ impl Look {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn up_to_four_masks_can_be_added_and_removed() {
+        let mut l = Look::NONE;
+        assert_eq!(l.masks().count(), 0);
+        // 第一个放主蒙版，之后放进另外三格，满了加不了
+        assert_eq!(l.add_mask(), Some(0));
+        assert_eq!(l.add_mask(), Some(1));
+        assert_eq!(l.add_mask(), Some(2));
+        assert_eq!(l.add_mask(), Some(3));
+        assert_eq!(l.add_mask(), None);
+        assert_eq!(l.masks().count(), MAX_MASKS);
+        assert!(l.is_valid());
+        // 删第一个：后面的往前挪
+        if let Some(m) = &mut l.extra_masks[0] {
+            m.x = 0.3;
+        }
+        l.remove_mask(0);
+        assert_eq!(l.masks().count(), 3);
+        assert!(
+            (l.mask.unwrap().x - 0.3).abs() < 1e-6,
+            "原来的第二个成了第一个"
+        );
+        l.remove_mask(1);
+        assert_eq!(l.masks().count(), 2);
+        // 存文件：没有另外的蒙版时不写
+        let json = serde_json::to_string(&Look::NONE).unwrap();
+        assert!(!json.contains("extra_masks"), "{json}");
+        let back: Look = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        assert_eq!(back, l);
+        // 另外的蒙版数值不对也不行
+        l.extra_masks[0] = Some(Mask {
+            width: 0.0,
+            ..Mask::new(MaskShape::Rectangle)
+        });
+        assert!(!l.is_valid());
+    }
 
     #[test]
     fn blend_formulas_match_known_values() {

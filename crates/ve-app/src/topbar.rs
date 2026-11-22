@@ -8,6 +8,7 @@ use crate::theme::palette;
 use crate::workspace::{Popup, Workspace};
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::base::{Selectable as _, TestSupportExt as _};
+use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, h_flex, v_flex};
 use gpui_kit::{
@@ -40,8 +41,8 @@ const fn item(
     }
 }
 
-/// 菜单分组（和剪映一样：文件、编辑）。
-fn menu_groups() -> [(&'static str, Vec<MenuItem>); 2] {
+/// 菜单分组（和剪映一样：文件、编辑、帮助）。
+fn menu_groups() -> [(&'static str, Vec<MenuItem>); 3] {
     [
         (
             "文件",
@@ -51,14 +52,20 @@ fn menu_groups() -> [(&'static str, Vec<MenuItem>); 2] {
                 }),
                 item("menu-open", "打开…", "Ctrl+O", || Box::new(act::Open)),
                 item("menu-save", "保存", "Ctrl+S", || Box::new(act::Save)),
-                item("menu-save-as", "另存为…", "Ctrl+Shift+S", || {
+                item("menu-save-as", "另存为…", "Ctrl+Alt+S", || {
                     Box::new(act::SaveAs)
                 }),
                 item("menu-import", "导入素材…", "Ctrl+I", || {
                     Box::new(act::Import)
                 }),
-                item("menu-srt-in", "导入字幕（SRT）…", "", || {
-                    Box::new(act::ImportSrt)
+                item(
+                    "menu-srt-in",
+                    "导入字幕（SRT / ASS / LRC）…",
+                    "",
+                    || Box::new(act::ImportSrt),
+                ),
+                item("menu-script", "粘贴文稿生成字幕…", "", || {
+                    Box::new(act::ImportScript)
                 }),
                 item("menu-srt-out", "导出字幕（SRT）…", "", || {
                     Box::new(act::ExportSrt)
@@ -81,9 +88,14 @@ fn menu_groups() -> [(&'static str, Vec<MenuItem>); 2] {
                 item("menu-settings", "全局设置…", "", || {
                     Box::new(act::OpenSettings)
                 }),
+                item("menu-home", "回到首页", "", || Box::new(act::ShowHome)),
                 item("menu-export", "导出视频…", "Ctrl+E", || {
                     Box::new(act::Export)
                 }),
+                item("menu-still", "导出静帧…", "", || {
+                    Box::new(act::ExportStill)
+                }),
+                item("menu-quit", "退出", "Ctrl+Q", || Box::new(act::Quit)),
             ],
         ),
         (
@@ -91,25 +103,53 @@ fn menu_groups() -> [(&'static str, Vec<MenuItem>); 2] {
             vec![
                 item("menu-undo", "撤销", "Ctrl+Z", || Box::new(act::Undo)),
                 item("menu-redo", "恢复", "Ctrl+Y", || Box::new(act::Redo)),
+                item("menu-copy", "复制", "Ctrl+C", || Box::new(act::Copy)),
+                item("menu-cut", "剪切", "Ctrl+X", || Box::new(act::Cut)),
+                item("menu-paste", "粘贴", "Ctrl+V", || Box::new(act::Paste)),
+                item("menu-copy-attrs", "复制属性", "Ctrl+Shift+C", || {
+                    Box::new(act::CopyAttributes)
+                }),
+                item("menu-paste-attrs", "粘贴属性", "Ctrl+Shift+V", || {
+                    Box::new(act::PasteAttributes)
+                }),
                 item("menu-delete", "删除", "Delete", || Box::new(act::Delete)),
                 item("menu-select-all", "全选", "Ctrl+A", || {
                     Box::new(act::SelectAll)
                 }),
             ],
         ),
+        (
+            "帮助",
+            vec![
+                item("menu-shortcuts", "快捷键", "", || {
+                    Box::new(act::ShowShortcuts)
+                }),
+                item("menu-about", "关于", "", || Box::new(act::About)),
+            ],
+        ),
     ]
 }
 
 impl Workspace {
+    /// 顶栏放在窗口自己的标题栏里（没有系统标题栏）：右边是最小化 / 最大化 / 关闭，空白处拖动窗口。
     pub(crate) fn render_topbar(&self, cx: &Context<'_, Self>) -> impl IntoElement {
+        gpui_kit::component::TitleBar::new()
+            .h(px(TOPBAR_HEIGHT))
+            .pl(px(0.))
+            .bg(palette::window_bg())
+            .border_color(palette::window_bg())
+            .child(self.render_topbar_items(cx))
+    }
+
+    fn render_topbar_items(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let (dot, status) = self.save_status(muted);
         h_flex()
             .id("toolbar")
             .test_support()
             .relative()
-            .h(px(TOPBAR_HEIGHT))
-            .flex_none()
+            .h_full()
+            .flex_1()
             .px_2()
             .gap_2()
             .bg(palette::window_bg())
@@ -141,12 +181,7 @@ impl Workspace {
                     .bottom_0()
                     .justify_center()
                     .text_sm()
-                    .child(
-                        div()
-                            .id("project-name")
-                            .test_support()
-                            .child(SharedString::from(self.doc.name())),
-                    ),
+                    .child(self.render_project_name(cx)),
             )
             .child(div().flex_1())
             .children(self.render_export_status(cx))
@@ -161,6 +196,28 @@ impl Workspace {
                     .disabled(self.export.is_some())
                     .on_click(cx.listener(|this, _, w, cx| this.export(&act::Export, w, cx))),
             )
+    }
+
+    /// 顶栏正中的草稿名：点一下变成输入框改名（剪映）。
+    fn render_project_name(&self, cx: &Context<'_, Self>) -> AnyElement {
+        if let Some(r) = &self.rename {
+            return div()
+                .id("project-rename")
+                .test_support()
+                .w(px(220.))
+                .child(gpui_kit::component::input::Input::new(&r.input).small())
+                .into_any_element();
+        }
+        div()
+            .id("project-name")
+            .test_support()
+            .px_2()
+            .rounded(px(4.))
+            .cursor_text()
+            .hover(|s| s.bg(cx.theme().muted))
+            .child(SharedString::from(self.doc.name()))
+            .on_click(cx.listener(|this, _, window, cx| this.start_rename(window, cx)))
+            .into_any_element()
     }
 
     /// 顶栏的保存状态：（圆点颜色，文字）。
@@ -201,9 +258,13 @@ impl Workspace {
 
     fn render_menu(&self, cx: &Context<'_, Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
+        // 两栏：左边「文件」，右边「编辑」「帮助」「最近打开」（一栏太长，屏幕矮时放不下）
+        let mut left: Vec<AnyElement> = Vec::new();
         let mut rows: Vec<AnyElement> = Vec::new();
         for (gi, (group, items)) in menu_groups().into_iter().enumerate() {
-            if gi > 0 {
+            if gi == 1 {
+                left = std::mem::take(&mut rows);
+            } else if gi > 1 {
                 rows.push(separator(cx));
             }
             rows.push(group_label(group, muted));
@@ -243,7 +304,7 @@ impl Workspace {
             .absolute()
             .top(px(30.))
             .left_0()
-            .w(px(360.))
+            .w(px(640.))
             .max_h(px(640.))
             .overflow_y_scroll()
             .p_1()
@@ -256,7 +317,13 @@ impl Workspace {
                 this.dismiss_popup(e.position);
                 cx.notify();
             }))
-            .children(rows)
+            .child(
+                h_flex()
+                    .items_start()
+                    .gap_1()
+                    .child(v_flex().flex_1().min_w_0().children(left))
+                    .child(v_flex().flex_1().min_w_0().children(rows)),
+            )
     }
 }
 

@@ -281,6 +281,7 @@ mod tests {
                 stroke: Some(crate::Stroke::default()),
                 shadow: Some(crate::Shadow::default()),
                 mask: Some(crate::Mask::new(crate::MaskShape::Heart)),
+                extra_masks: [Some(crate::Mask::new(crate::MaskShape::Circle)), None, None],
                 chroma: Some(crate::ChromaKey::default()),
             },
         )

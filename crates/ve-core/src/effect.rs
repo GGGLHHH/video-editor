@@ -153,11 +153,27 @@ pub struct Effect {
     /// 插件名（种类是 [`EffectKind::Plugin`] 时）；内置特效为空，不写进文件。
     #[serde(default, skip_serializing_if = "PluginName::is_empty")]
     pub plugin: PluginName,
+    /// 速度 0–1（剪映「速度」）：特效里的时间按 [`Self::time_scale`] 倍走，0.5 是原速。
+    /// 旧工程文件没有这一项，按原速读。
+    #[serde(default = "default_speed")]
+    pub speed: f32,
+}
+
+const fn default_speed() -> f32 {
+    Effect::DEFAULT_SPEED
 }
 
 impl Effect {
     /// 新加的特效默认强度（剪映的特效默认值大多在中间）。
     pub const DEFAULT_AMOUNT: f32 = 0.5;
+    /// 默认速度（原速）。
+    pub const DEFAULT_SPEED: f32 = 0.5;
+
+    /// 特效里的时间走多快：速度 0 → 0.25 倍，0.5 → 原速，1 → 4 倍（中间按指数，拖起来均匀）。
+    #[must_use]
+    pub fn time_scale(&self) -> f32 {
+        4.0_f32.powf(self.speed.clamp(0.0, 1.0).mul_add(2.0, -1.0))
+    }
 
     /// 默认强度的特效。
     #[must_use]
@@ -166,6 +182,7 @@ impl Effect {
             kind,
             amount: Self::DEFAULT_AMOUNT,
             plugin: PluginName::EMPTY,
+            speed: Self::DEFAULT_SPEED,
         }
     }
 
@@ -176,6 +193,7 @@ impl Effect {
             kind: EffectKind::Plugin,
             amount: Self::DEFAULT_AMOUNT,
             plugin: PluginName::new(name)?,
+            speed: Self::DEFAULT_SPEED,
         })
     }
 
@@ -193,6 +211,7 @@ impl Effect {
     #[must_use]
     pub fn is_valid(&self) -> bool {
         (0.0..=1.0).contains(&self.amount)
+            && (0.0..=1.0).contains(&self.speed)
             && (self.kind != EffectKind::Plugin || !self.plugin.is_empty())
     }
 }

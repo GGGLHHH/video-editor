@@ -36,16 +36,20 @@ pub mod transform;
 pub mod transition;
 pub mod trim_tools;
 
-pub use adjust::{AdjustItem, ColorAdjust, ColorMatrix, FILTERS, Filter};
+pub use adjust::{
+    AdjustExtra, AdjustItem, ColorAdjust, ColorMatrix, Detail, FILTERS, Filter, Tone,
+};
 pub use asset::{Asset, AudioInfo, VideoInfo};
-pub use audio_fx::AudioFx;
+pub use audio_fx::{AudioFx, Voice};
 pub use edit::EditError;
 pub use effect::{Effect, EffectKind, EffectPass};
-pub use grade::{Curves, Grade, GradeChain, GradeStep, HslAdjust, HslBand, LutRef, Wheels};
+pub use grade::{
+    Curves, Grade, GradeChain, GradeStep, HslAdjust, HslBand, HslChannel, LutRef, Wheels,
+};
 pub use history::History;
 pub use ids::{AssetId, ClipId, IdGen, TrackId};
 pub use keyframe::{Animation, Easing, Key, KeyGroup, Prop};
-pub use look::{BlendMode, ChromaKey, Look, Mask, MaskShape, Shadow, Stroke};
+pub use look::{BlendMode, ChromaKey, Look, Mask, MaskShape, MaskText, Shadow, Stroke};
 pub use project::{Project, ProjectSettings};
 pub use project_file::{LoadedProject, ProjectFileError, load_project, save_project};
 pub use speed_curve::{CurvePreset, SpeedCurve, SpeedPoint};
@@ -55,5 +59,7 @@ pub use text_motion::{
 };
 pub use time::{FLICKS_PER_SECOND, FrameRate, Time, format_timecode};
 pub use timeline::{Clip, ClipContent, Cover, InvariantError, Timeline, Track, TrackKind};
-pub use transform::{Crop, LayerGeometry, Rect, Transform, layer_geometry, wrap_degrees};
+pub use transform::{
+    Crop, LayerGeometry, Rect, Transform, centered_crop, layer_geometry, wrap_degrees,
+};
 pub use transition::{Transition, TransitionKind};

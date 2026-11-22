@@ -40,8 +40,20 @@ pub(crate) const GROUPS: [(&str, &[Item]); 4] = [
             ("加字幕", &["T"]),
             ("主轨磁吸 / 自动吸附 / 联动", &["P", "N", "`"]),
             ("放大 / 缩小时间线", &["Ctrl+=", "Ctrl+-"]),
+            ("增高 / 降低轨道高度", &["Ctrl+Alt+=", "Ctrl+Alt+-"]),
+            ("换标记颜色", &["Alt+M"]),
+            ("组合 / 取消组合", &["Ctrl+G"]),
+            ("放大 / 缩小预览画面", &["Alt+Shift+=", "Alt+Shift+-"]),
+            ("预览画面适应窗口", &["Alt+Shift+Z"]),
+            ("参考线", &["Ctrl+;"]),
             ("全局预览缩放", &["Shift+Z"]),
             ("全选 / 取消全选", &["Ctrl+A", "Ctrl+Shift+A"]),
+            ("上一个 / 下一个分割点", &["↑", "↓"]),
+            ("向前 / 向后大幅移动（10 帧）", &["Shift+←", "Shift+→"]),
+            ("添加 / 删除关键帧", &["Shift+Alt+K"]),
+            ("唤起变速面板", &["Ctrl+R"]),
+            ("分离 / 还原音频", &["Ctrl+Shift+S"]),
+            ("音量 +0.1 dB / -0.1 dB", &["Ctrl+.", "Ctrl+,"]),
         ],
     ),
     (
@@ -63,8 +75,10 @@ pub(crate) const GROUPS: [(&str, &[Item]); 4] = [
             ("复制 / 剪切 / 粘贴", &["Ctrl+C", "Ctrl+X", "Ctrl+V"]),
             ("复制属性 / 粘贴属性", &["Ctrl+Shift+C", "Ctrl+Shift+V"]),
             ("新建 / 打开 / 导入", &["Ctrl+N", "Ctrl+O", "Ctrl+I"]),
-            ("保存 / 另存为", &["Ctrl+S", "Ctrl+Shift+S"]),
+            ("保存 / 另存为", &["Ctrl+S", "Ctrl+Alt+S"]),
             ("导出", &["Ctrl+E"]),
+            ("切换素材面板", &["Tab"]),
+            ("退出（先保存）", &["Ctrl+Q"]),
         ],
     ),
     (
@@ -113,17 +127,105 @@ impl Workspace {
         let Some(slot) = self.recording_key.take() else {
             return;
         };
-        self.shortcut_note = if key == "escape" {
-            None
-        } else {
-            crate::keymap::assign(cx, &slot, key).map(|_| {
-                format!(
-                    "{} 原来用于另一项操作，已经从那里去掉",
-                    crate::keymap::to_shown(key)
-                )
-            })
-        };
+        self.shortcut_note = None;
+        if key != "escape" {
+            if crate::keymap::taken_by(cx, &slot, key).is_some() {
+                // 别的操作正在用这个键：先问要不要替换（剪映的改键冲突确认）
+                self.shortcut_conflict = Some((slot, key.to_owned()));
+            } else {
+                crate::keymap::assign(cx, &slot, key);
+            }
+        }
         cx.notify();
+    }
+
+    /// 冲突时选「替换」：换上，原来用这个键的操作没有键了。
+    fn replace_conflicting_key(&mut self, cx: &mut Context<'_, Self>) {
+        if let Some((slot, key)) = self.shortcut_conflict.take() {
+            crate::keymap::assign(cx, &slot, &key);
+            self.shortcut_note = Some(format!(
+                "{} 原来用于另一项操作，已经从那里去掉",
+                crate::keymap::to_shown(&key)
+            ));
+        }
+        cx.notify();
+    }
+
+    /// 改键冲突的确认条：「Ctrl+K 已经用于另一项操作」替换 / 取消。
+    fn render_shortcut_conflict(&self, cx: &Context<'_, Self>) -> Option<AnyElement> {
+        let (_, key) = self.shortcut_conflict.as_ref()?;
+        Some(
+            h_flex()
+                .id("sc-conflict")
+                .test_support()
+                .gap_2()
+                .p_2()
+                .rounded(px(4.))
+                .bg(cx.theme().muted)
+                .text_xs()
+                .child(div().flex_1().child(SharedString::from(format!(
+                    "{} 已经用于另一项操作，替换吗？",
+                    crate::keymap::to_shown(key)
+                ))))
+                .child(
+                    Button::new("sc-conflict-replace")
+                        .compact()
+                        .label("替换")
+                        .on_click(cx.listener(|this, _, _, cx| this.replace_conflicting_key(cx))),
+                )
+                .child(
+                    Button::new("sc-conflict-cancel")
+                        .compact()
+                        .ghost()
+                        .label("取消")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.shortcut_conflict = None;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// 快捷键方案：剪映（FCP X 键位，默认）/ Premiere。
+    fn render_shortcut_schemes(cx: &Context<'_, Self>) -> AnyElement {
+        let premiere = crate::keymap::is_premiere(cx);
+        let default = !crate::keymap::customized(cx);
+        let chip = |id: &'static str, label: &'static str, on: bool| {
+            chrome::chip(id, label, on, cx).child(div().children(on.then(|| {
+                div()
+                    .id(SharedString::from(format!("{id}-on")))
+                    .test_support()
+            })))
+        };
+        h_flex()
+            .gap_1()
+            .items_center()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("方案"),
+            )
+            .child(
+                chip("sc-scheme-default", "剪映（FCP X）", default).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        crate::keymap::reset(cx);
+                        this.shortcut_conflict = None;
+                        cx.notify();
+                    },
+                )),
+            )
+            .child(
+                chip("sc-scheme-premiere", "Premiere", premiere).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        crate::keymap::use_premiere(cx);
+                        this.shortcut_conflict = None;
+                        cx.notify();
+                    },
+                )),
+            )
+            .into_any_element()
     }
 
     /// 一览里的一个键：点一下开始改；正在改时显示「请按键…」。
@@ -245,6 +347,8 @@ impl Workspace {
                             })),
                     ),
             )
+            .child(Self::render_shortcut_schemes(cx))
+            .children(self.render_shortcut_conflict(cx))
             .child(
                 h_flex()
                     .items_start()

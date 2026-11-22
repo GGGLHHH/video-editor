@@ -100,6 +100,39 @@ pub struct HslAdjust {
     pub lightness: f32,
 }
 
+/// HSL 的一个通道。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HslChannel {
+    /// 色相。
+    Hue,
+    /// 饱和度。
+    Saturation,
+    /// 亮度。
+    Lightness,
+}
+
+impl HslChannel {
+    /// 读。
+    #[must_use]
+    pub const fn get(self, h: &HslAdjust) -> f32 {
+        match self {
+            Self::Hue => h.hue,
+            Self::Saturation => h.saturation,
+            Self::Lightness => h.lightness,
+        }
+    }
+
+    /// 写（夹到 -1–1）。
+    pub const fn set(self, h: &mut HslAdjust, v: f32) {
+        let v = v.clamp(-1.0, 1.0);
+        match self {
+            Self::Hue => h.hue = v,
+            Self::Saturation => h.saturation = v,
+            Self::Lightness => h.lightness = v,
+        }
+    }
+}
+
 /// 曲线：（输入，输出）点，按输入排好，两头默认 (0,0)、(1,1)。
 pub type CurvePoints = Vec<(f32, f32)>;
 
@@ -531,13 +564,15 @@ pub fn load_lut(path: &Path) -> Option<Arc<Lut>> {
         .clone()
 }
 
-/// 一步调色：先过调色矩阵，再（有的话）过进阶调色。
+/// 一步调色：先过调色矩阵，再（有的话）过明暗曲线、进阶调色。
 #[derive(Clone, Debug, PartialEq)]
 pub struct GradeStep {
     /// 先把素材从这个色彩空间换成 Rec.709（HDR / Log 素材；[`crate::color_space`]）。
     pub input: Option<crate::color_space::InputSpace>,
     /// 基础调整（亮度、对比度…）的矩阵。
     pub matrix: crate::ColorMatrix,
+    /// 高光、阴影、光感（矩阵之后）。
+    pub tone: Option<crate::adjust::Tone>,
     /// 进阶调色。
     pub grade: Option<Arc<Grade>>,
 }
@@ -551,6 +586,7 @@ pub fn apply_chain(chain: &[GradeStep], rgb: [f32; 3]) -> [f32; 3] {
     chain.iter().fold(rgb, |c, step| {
         let c = step.input.map_or(c, |s| s.to_rec709(c));
         let m = step.matrix.apply(c).map(|v| v.clamp(0.0, 1.0));
+        let m = step.tone.map_or(m, |t| t.apply(m));
         step.grade.as_ref().map_or(m, |g| g.apply(m))
     })
 }
@@ -586,6 +622,43 @@ pub fn bake(chain: &[GradeStep]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hsl_can_be_keyframed_per_band_and_channel() {
+        use crate::testing::sample_project;
+        use crate::{Prop, Time};
+        let (mut p, ids) = sample_project();
+        let red = HslBand::Red;
+        let prop = Prop::hsl(red, HslChannel::Saturation);
+        assert_eq!(prop.hsl_target(), Some((red, HslChannel::Saturation)));
+        assert_eq!(Prop::HSL.len(), 24);
+        // 第 0 秒打一帧（饱和度 0），第 2 秒拖到 -0.8：中间插值
+        crate::edit::add_keyframe_props(&mut p, ids.v1, Time::ZERO, &[prop]).unwrap();
+        let down = HslAdjust {
+            saturation: -0.8,
+            ..HslAdjust::default()
+        };
+        crate::edit::apply_hsl_at(&mut p, ids.v1, Time::from_secs(2), red, down).unwrap();
+        let keyed = p.timeline.find_clip(ids.v1).unwrap().1;
+        assert_eq!(keyed.animation.keys(prop).len(), 2);
+        let mid = keyed.grade_at(Time::from_secs(1)).unwrap();
+        assert!(
+            (mid.hsl[red.index()].saturation + 0.4).abs() < 1e-3,
+            "{:?}",
+            mid.hsl[0]
+        );
+        assert!((keyed.value_at(prop, Time::from_secs(2)) + 0.8).abs() < 1e-4);
+        // 没打帧的通道改的是固定值
+        let hue = HslAdjust { hue: 0.5, ..down };
+        crate::edit::apply_hsl_at(&mut p, ids.v1, Time::from_secs(2), red, hue).unwrap();
+        let based = p.timeline.find_clip(ids.v1).unwrap().1;
+        assert!((based.grade.as_ref().unwrap().hsl[0].hue - 0.5).abs() < 1e-6);
+        assert_eq!(based.animation.keys(Prop::hsl(red, HslChannel::Hue)), []);
+        // 合成用的是这一刻的调色
+        let f = crate::compose::resolve_frame(&p, Time::from_secs(1));
+        let g = f.layers[0].grades[0].grade.as_ref().unwrap();
+        assert!((g.hsl[0].saturation + 0.4).abs() < 1e-3);
+    }
 
     fn near(a: [f32; 3], b: [f32; 3], tol: f32) -> bool {
         a.iter().zip(b).all(|(x, y)| (x - y).abs() <= tol)
@@ -697,6 +770,7 @@ mod tests {
         let mut g = Grade::default();
         g.curves.luma = vec![(0.5, 1.0)];
         let chain = vec![GradeStep {
+            tone: None,
             input: None,
             matrix: half.matrix(),
             grade: Some(Arc::new(g)),

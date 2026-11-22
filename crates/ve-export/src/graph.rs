@@ -29,6 +29,40 @@ pub enum Codec {
     H264,
     /// HEVC（H.265）：同样画质文件更小。
     Hevc,
+    /// AV1：比 HEVC 还小，新设备才放得了（硬件编码要 RTX 40 系以上，不行时用软件编码）。
+    Av1,
+}
+
+/// 视频里的声音怎么编（剪映导出的「音频」：格式、码率、采样率）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoAudio {
+    /// 编码。
+    pub codec: AudioCodec,
+    /// 采样率（Hz）。
+    pub sample_rate: u32,
+}
+
+impl VideoAudio {
+    /// 默认：AAC 192 kbps、48 kHz。
+    pub const DEFAULT: Self = Self {
+        codec: AudioCodec::Aac(192),
+        sample_rate: 48_000,
+    };
+}
+
+impl Default for VideoAudio {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// 视频里声音的编码。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioCodec {
+    /// AAC，码率 kbps。
+    Aac(u32),
+    /// PCM（16 位无损，只能放进 MOV）。
+    Pcm,
 }
 
 /// 导出什么（剪映导出对话框的「视频导出」/「音频导出」）。
@@ -83,7 +117,11 @@ impl AudioFormat {
     }
 }
 
-/// 推荐码率（kbps）：按每像素每帧 0.15 比特估，720p30 约 4 Mbps、1080p30 约 9 Mbps；HEVC 再省三成。
+/// SVT-AV1 画面短边小于这个（像素）就不能按码率编码。
+const SVT_AV1_MIN_RC_SIDE: u32 = 72;
+
+/// 推荐码率（kbps）：按每像素每帧 0.15 比特估，720p30 约 4 Mbps、1080p30 约 9 Mbps；HEVC 再省三成，
+/// AV1 约是 H.264 的一半多一点。
 #[must_use]
 pub fn recommended_kbps(width: u32, height: u32, frame_rate: FrameRate, codec: Codec) -> u32 {
     let pixels = f64::from(width) * f64::from(height);
@@ -91,6 +129,8 @@ pub fn recommended_kbps(width: u32, height: u32, frame_rate: FrameRate, codec: C
     let kbps = match codec {
         Codec::H264 => kbps,
         Codec::Hevc => kbps * 0.7,
+        // AV1 比 HEVC 再省两成左右
+        Codec::Av1 => kbps * 0.55,
     };
     #[expect(
         clippy::cast_possible_truncation,
@@ -134,6 +174,8 @@ pub struct ExportSettings {
     pub loudness_lufs: Option<i8>,
     /// 只导出时间轴上的这一段（入出点区域）；`None` 导出全部。
     pub range: Option<(Time, Time)>,
+    /// 视频里的声音（编码、码率、采样率）。MP4 还是 MOV 看 `path` 的扩展名。
+    pub video_audio: VideoAudio,
 }
 
 /// 一次 ffmpeg 调用。
@@ -244,7 +286,8 @@ fn push_audio_inputs<'a>(
         let Some(asset) = clip.asset().and_then(|a| project.assets.get(&a)) else {
             continue;
         };
-        if asset.audio.is_none() {
+        // 音频已分离的视频片段：声音由分离出来的那段出，这里不再导一遍
+        if asset.audio.is_none() || clip.audio_split {
             continue;
         }
         // 转场处声音越过片段边界（和预览同一套算法）
@@ -521,16 +564,46 @@ fn push_output(args: &mut Vec<OsString>, settings: &ExportSettings, duration: Ti
             "hvc1",
         ],
         (Encoder::X264, Codec::Hevc) => &["-c:v", "libx265", "-preset", "medium", "-tag:v", "hvc1"],
+        (Encoder::Nvenc, Codec::Av1) => &["-c:v", "av1_nvenc", "-preset", "p5", "-rc", "vbr"],
+        (Encoder::X264, Codec::Av1) => &["-c:v", "libsvtav1", "-preset", "8"],
     };
     args.extend(codec.iter().map(OsString::from));
+    let a = settings.video_audio;
+    let audio: Vec<String> = match a.codec {
+        AudioCodec::Aac(audio_kbps) => vec![
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            format!("{audio_kbps}k"),
+        ],
+        AudioCodec::Pcm => vec!["-c:a".into(), "pcm_s16le".into()],
+    };
+    args.extend(audio.into_iter().map(OsString::from));
+    args.extend(["-ar".to_owned(), a.sample_rate.to_string()].map(OsString::from));
+    let svt_av1 = matches!(
+        (settings.encoder, settings.codec),
+        (Encoder::X264, Codec::Av1)
+    );
+    // SVT-AV1：画面很小时它会关掉自适应量化，按码率编码又不许关，编码器打不开——这时按画质（CRF）编
+    if svt_av1 && settings.width.min(settings.height) < SVT_AV1_MIN_RC_SIDE {
+        args.extend(["-crf", "35"].map(OsString::from));
+    } else {
+        args.extend(["-b:v".to_owned(), format!("{kbps}k")].map(OsString::from));
+    }
+    // SVT-AV1 按码率编码时不支持峰值码率（只有 CRF 模式才行），给了就打不开编码器
+    if !svt_av1 {
+        args.extend(
+            [
+                "-maxrate".to_owned(),
+                format!("{}k", kbps * 3 / 2),
+                "-bufsize".to_owned(),
+                format!("{}k", kbps * 2),
+            ]
+            .map(OsString::from),
+        );
+    }
     args.extend(
         [
-            "-b:v".to_owned(),
-            format!("{kbps}k"),
-            "-maxrate".to_owned(),
-            format!("{}k", kbps * 3 / 2),
-            "-bufsize".to_owned(),
-            format!("{}k", kbps * 2),
             "-pix_fmt".to_owned(),
             "yuv420p".to_owned(),
             "-colorspace".to_owned(),
@@ -543,10 +616,6 @@ fn push_output(args: &mut Vec<OsString>, settings: &ExportSettings, duration: Ti
             "tv".to_owned(),
             "-r".to_owned(),
             rate_str(settings.frame_rate),
-            "-c:a".to_owned(),
-            "aac".to_owned(),
-            "-b:a".to_owned(),
-            "192k".to_owned(),
             "-movflags".to_owned(),
             "+faststart".to_owned(),
             "-t".to_owned(),
@@ -617,6 +686,7 @@ mod tests {
             output: Output::Video,
             loudness_lufs: None,
             range: None,
+            video_audio: VideoAudio::default(),
         }
     }
 
@@ -702,6 +772,33 @@ mod tests {
     }
 
     #[test]
+    fn av1_and_audio_choices_reach_the_command_line() {
+        let (p, _) = sample_project();
+        let mut s = settings();
+        s.codec = Codec::Av1;
+        let args = args_text(&build_job(&p, &s, false).unwrap());
+        assert!(args.contains("-c:v libsvtav1"), "{args}");
+        s.encoder = Encoder::Nvenc;
+        assert!(args_text(&build_job(&p, &s, false).unwrap()).contains("-c:v av1_nvenc"));
+        // 默认：AAC 192k、48 kHz
+        let plain = args_text(&build_job(&p, &settings(), false).unwrap());
+        assert!(plain.contains("-c:a aac -b:a 192k -ar 48000"), "{plain}");
+        // AAC 320k、44.1 kHz
+        s.video_audio = VideoAudio {
+            codec: AudioCodec::Aac(320),
+            sample_rate: 44_100,
+        };
+        let aac = args_text(&build_job(&p, &s, false).unwrap());
+        assert!(aac.contains("-c:a aac -b:a 320k -ar 44100"), "{aac}");
+        // PCM（放进 MOV）
+        s.video_audio.codec = AudioCodec::Pcm;
+        s.path = PathBuf::from("C:/out/final.mov");
+        let pcm = args_text(&build_job(&p, &s, false).unwrap());
+        assert!(pcm.contains("-c:a pcm_s16le -ar 44100"), "{pcm}");
+        assert!(pcm.ends_with("final.mov"), "{pcm}");
+    }
+
+    #[test]
     fn hevc_uses_hevc_encoders_with_hvc1_tag() {
         let (p, _) = sample_project();
         let mut s = settings();
@@ -760,6 +857,7 @@ mod tests {
             denoise: 0.5,
             eq: [3.0, 0.0, 0.0],
             compress: 0.0,
+            ..ve_core::AudioFx::NONE
         };
         ve_core::edit::set_audio_fx(&mut p, ids.a1, fx).unwrap();
         let g = build_job(&p, &settings(), true).unwrap().filter_graph;
@@ -958,5 +1056,14 @@ mod tests {
                 t.as_secs_f64()
             );
         }
+    }
+
+    #[test]
+    fn separated_audio_is_not_exported_twice() {
+        let (mut p, ids) = sample_project();
+        ve_core::edit::separate_audio(&mut p, &[ids.v1]).unwrap();
+        let v1 = std::sync::Arc::clone(p.timeline.find_clip(ids.v1).unwrap().1);
+        let mut args = Vec::new();
+        assert_eq!(push_audio_inputs(&p, &[v1.as_ref()], 0, &mut args).len(), 0);
     }
 }

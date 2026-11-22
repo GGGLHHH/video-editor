@@ -5,7 +5,7 @@
 use crate::PlayClock;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{Consumer, RingBuffer};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -20,6 +20,8 @@ pub struct OutputCtl {
     flush_gen: AtomicU64,
     ack_gen: AtomicU64,
     capture: Option<Mutex<Vec<f32>>>,
+    /// 暂停时还能放出去的帧数（拖动播放头时的一小段声音）。不推进时钟。
+    scrub: AtomicUsize,
 }
 
 impl OutputCtl {
@@ -31,7 +33,19 @@ impl OutputCtl {
             flush_gen: AtomicU64::new(0),
             ack_gen: AtomicU64::new(0),
             capture: capture.then(|| Mutex::new(Vec::new())),
+            scrub: AtomicUsize::new(0),
         }
+    }
+
+    /// 暂停时再放 `frames` 帧（拖动播放头出声）。
+    pub fn add_scrub(&self, frames: usize) {
+        self.scrub.fetch_add(frames, Ordering::AcqRel);
+    }
+
+    /// 上一段拖动的声音还剩多少帧没放完。
+    #[must_use]
+    pub fn scrub_pending(&self) -> usize {
+        self.scrub.load(Ordering::Acquire)
     }
 
     /// 请求输出端丢掉缓冲里所有旧样本（代号 `generation`）。
@@ -70,10 +84,25 @@ pub fn fill_output(
         ctl.ack_gen.store(wanted_gen, Ordering::Release);
     }
     out.fill(0.0);
-    if channels == 0 || !ctl.clock.is_playing() {
+    let playing = ctl.clock.is_playing();
+    // 暂停时只放拖动播放头留下的那一小段（不推进时钟）
+    let scrub = if playing {
+        0
+    } else {
+        ctl.scrub.load(Ordering::Acquire)
+    };
+    if channels == 0 || (!playing && scrub == 0) {
         return 0;
     }
-    let frames = (out.len() / channels).min(cons.slots() / 2);
+    let mut frames = (out.len() / channels).min(cons.slots() / 2);
+    if !playing {
+        frames = frames.min(scrub);
+        if frames == 0 {
+            // 缓冲里已经没有了（被清掉了）：这段就算放完
+            ctl.scrub.store(0, Ordering::Release);
+            return 0;
+        }
+    }
     let Ok(chunk) = cons.read_chunk(frames * 2) else {
         return 0;
     };
@@ -97,7 +126,11 @@ pub fn fill_output(
     }
     drop(captured);
     chunk.commit_all();
-    ctl.clock.advance(frames as u64);
+    if playing {
+        ctl.clock.advance(frames as u64);
+    } else {
+        ctl.scrub.fetch_sub(frames, Ordering::AcqRel);
+    }
     frames
 }
 

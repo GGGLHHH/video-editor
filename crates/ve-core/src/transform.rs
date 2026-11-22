@@ -18,6 +18,15 @@ pub struct Crop {
     pub bottom: f32,
 }
 
+#[expect(clippy::float_cmp, reason = "和默认值 1.0 精确比较")]
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde 的 skip_serializing_if 要传引用"
+)]
+fn is_one(v: &f32) -> bool {
+    *v == 1.0
+}
+
 /// 片段的画面属性。默认值下的画面和 MVP 一样：等比放进画布、居中。
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -26,8 +35,11 @@ pub struct Transform {
     pub x: f32,
     /// 垂直偏移，单位是画布高度（向下为正）。
     pub y: f32,
-    /// 相对「完整放进画布」时的大小。
+    /// 相对「完整放进画布」时的大小（宽；高再乘 `stretch`）。
     pub scale: f32,
+    /// 高相对宽多缩放的比例（剪映关掉「等比缩放」后横竖分开拉）：1 = 等比。不做关键帧。
+    #[serde(skip_serializing_if = "is_one")]
+    pub stretch: f32,
     /// 裁剪；只切掉边，不改变画面的位置和大小。
     pub crop: Crop,
     /// 不透明度（0–1）。
@@ -61,6 +73,7 @@ impl Transform {
             x: (rx / w) as f32 + self.x,
             y: (ry / h) as f32 + self.y,
             scale: self.scale * child.scale,
+            stretch: self.stretch * child.stretch,
             rotation: rotation + self.rotation,
             opacity: self.opacity * child.opacity,
             mirror: self.mirror != child.mirror,
@@ -90,6 +103,7 @@ impl Transform {
         x: 0.0,
         y: 0.0,
         scale: 1.0,
+        stretch: 1.0,
         crop: Crop {
             left: 0.0,
             top: 0.0,
@@ -103,6 +117,8 @@ impl Transform {
 
     /// `scale` 的取值范围。
     pub const SCALE_RANGE: (f32, f32) = (0.01, 10.0);
+    /// `stretch` 的取值范围。
+    pub const STRETCH_RANGE: (f32, f32) = (0.1, 10.0);
 
     /// 是否满足不变式：都是有限数、缩放在范围内、不透明度 0–1、裁剪不越界。
     #[must_use]
@@ -112,6 +128,7 @@ impl Transform {
             self.x,
             self.y,
             self.scale,
+            self.stretch,
             self.opacity,
             self.rotation,
             c.left,
@@ -121,6 +138,7 @@ impl Transform {
         ];
         all.iter().all(|v| v.is_finite())
             && (Self::SCALE_RANGE.0..=Self::SCALE_RANGE.1).contains(&self.scale)
+            && (Self::STRETCH_RANGE.0..=Self::STRETCH_RANGE.1).contains(&self.stretch)
             && (0.0..=1.0).contains(&self.opacity)
             && [c.left, c.top, c.right, c.bottom].iter().all(|v| *v >= 0.0)
             && c.left + c.right < 1.0
@@ -255,6 +273,35 @@ const fn to_f32(v: f64) -> f32 {
     v as f32
 }
 
+/// 把 `source` 大小的画面从正中裁成 `ratio`（宽:高）比例的裁剪（剪映「裁剪」里的比例）。
+#[must_use]
+pub fn centered_crop(source: (u32, u32), ratio: (u32, u32)) -> Crop {
+    if source.0 == 0 || source.1 == 0 || ratio.0 == 0 || ratio.1 == 0 {
+        return Crop::default();
+    }
+    let have = f64::from(source.0) / f64::from(source.1);
+    let want = f64::from(ratio.0) / f64::from(ratio.1);
+    if (have - want).abs() < 1e-6 {
+        return Crop::default();
+    }
+    if want < have {
+        // 要窄一些：左右去掉
+        let side = to_f32((1.0 - want / have) / 2.0);
+        Crop {
+            left: side,
+            right: side,
+            ..Crop::default()
+        }
+    } else {
+        let side = to_f32((1.0 - have / want) / 2.0);
+        Crop {
+            top: side,
+            bottom: side,
+            ..Crop::default()
+        }
+    }
+}
+
 /// 由画布尺寸、源画面尺寸和画面属性算出图层几何。
 ///
 /// 完整源画面等比放进画布再乘 `scale`，中心放在画布中心偏移 `(x·w, y·h)` 处；
@@ -267,7 +314,7 @@ pub fn layer_geometry(canvas: (u32, u32), source: (u32, u32), t: &Transform) -> 
         return LayerGeometry::default();
     }
     let factor = (canvas_w / src_w).min(canvas_h / src_h) * f64::from(t.scale);
-    let (full_w, full_h) = (src_w * factor, src_h * factor);
+    let (full_w, full_h) = (src_w * factor, src_h * factor * f64::from(t.stretch));
     let left = canvas_w / 2.0 + f64::from(t.x) * canvas_w - full_w / 2.0;
     let top = canvas_h / 2.0 + f64::from(t.y) * canvas_h - full_h / 2.0;
     let crop = t.crop;
@@ -324,6 +371,48 @@ mod tests {
         // 方形素材：左右留黑
         let sq = layer_geometry((1920, 1080), (1080, 1080), &Transform::default());
         assert!(close(sq.full, rect(420.0, 0.0, 1080.0, 1080.0)), "{sq:?}");
+    }
+
+    #[test]
+    fn centered_crop_keeps_the_middle_at_the_wanted_ratio() {
+        // 16:9 素材裁成 1:1：左右各去掉 (1 - 9/16) / 2
+        let sq = centered_crop((1920, 1080), (1, 1));
+        assert!((sq.left - 0.21875).abs() < 1e-6 && (sq.right - 0.21875).abs() < 1e-6);
+        assert_eq!((sq.top, sq.bottom), (0.0, 0.0));
+        // 16:9 裁成更宽的 21:9：上下去掉
+        let wide = centered_crop((1920, 1080), (21, 9));
+        assert!(wide.top > 0.0 && (wide.top - wide.bottom).abs() < 1e-6 && wide.left == 0.0);
+        // 比例一样：不裁
+        assert_eq!(centered_crop((1920, 1080), (16, 9)), Crop::default());
+    }
+
+    #[test]
+    fn stretch_changes_only_the_height() {
+        let squashed = Transform {
+            stretch: 0.5,
+            ..Transform::default()
+        };
+        let g = layer_geometry((1920, 1080), (1920, 1080), &squashed);
+        assert!(close(g.full, rect(0.0, 270.0, 1920.0, 540.0)), "{g:?}");
+        assert!(squashed.is_valid());
+        assert!(
+            !Transform {
+                stretch: 0.0,
+                ..squashed
+            }
+            .is_valid()
+        );
+        // 默认不写进文件，旧文件读出来是 1
+        let json = serde_json::to_string(&Transform::default()).unwrap();
+        assert!(!json.contains("stretch"), "{json}");
+        let old: Transform = serde_json::from_str(r#"{"scale":0.5}"#).unwrap();
+        assert_eq!(old.stretch, 1.0);
+        // 放进整组：高度比例相乘
+        let group = Transform {
+            stretch: 2.0,
+            ..Transform::default()
+        };
+        assert!((group.compose(&squashed, 1920, 1080).stretch - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -512,7 +601,7 @@ mod tests {
             x in -2.0f32..2.0, y in -2.0f32..2.0, scale in 0.01f32..10.0,
             l in 0.0f32..0.49, r in 0.0f32..0.49, t in 0.0f32..0.49, b in 0.0f32..0.49,
         ) {
-            let tf = Transform { x, y, scale, crop: Crop { left: l, top: t, right: r, bottom: b }, opacity: 1.0, rotation: 0.0, mirror: false };
+            let tf = Transform { x, y, scale, stretch: 1.0, crop: Crop { left: l, top: t, right: r, bottom: b }, opacity: 1.0, rotation: 0.0, mirror: false };
             prop_assert!(tf.is_valid());
             let geom = layer_geometry((cw, ch), (sw, sh), &tf);
             let (full, shown) = (geom.full, geom.shown);

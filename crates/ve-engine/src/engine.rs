@@ -105,6 +105,8 @@ pub(crate) struct Control {
     pub(crate) rate: f32,
     /// 预览画面尺寸上限（剪映的「原画质 / 清晰画质」切换会改它）。
     pub(crate) preview_max: ScaleTarget,
+    /// 暂停时拖动播放头：在这里放一小段声音（第几次拖动，免得同一处重复放）。
+    pub(crate) scrub: Option<(Time, u64)>,
 }
 
 pub(crate) struct Queued {
@@ -237,6 +239,7 @@ impl Engine {
                 revision: 0,
                 rate: 1.0,
                 preview_max: config.preview_max,
+                scrub: None,
             }),
             wake: Condvar::new(),
             clock,
@@ -398,6 +401,26 @@ impl Engine {
         drop(c);
     }
 
+    /// 暂停时拖动播放头（剪映「时间轴声音」）：定位到 `t`，并在那里放一小段声音（约 85 毫秒），
+    /// 播放头不动。上一段还没放完时先放完，再放最新的位置（拖得快也不越积越慢）。播放中等于 [`Self::seek`]。
+    pub fn scrub(&self, t: Time) {
+        self.seek(t);
+        let mut c = self.shared.control();
+        if !c.playing {
+            let t = t.clamp(Time::ZERO, c.project.timeline.duration().max(Time::ZERO));
+            let n = c.scrub.map_or(1, |(_, n)| n + 1);
+            c.scrub = Some((t, n));
+            self.shared.wake.notify_all();
+        }
+        drop(c);
+    }
+
+    /// 一共收到过几次「拖动出声」（测试、统计用）。
+    #[must_use]
+    pub fn scrubs(&self) -> u64 {
+        self.shared.control().scrub.map_or(0, |(_, n)| n)
+    }
+
     /// 当前播放位置。
     #[must_use]
     pub fn position(&self) -> Time {
@@ -517,6 +540,11 @@ mod tests {
     }
 
     fn engine() -> Engine {
+        // 先把进程共用的软件显卡和管线建好（第一次要编译着色器，CI 上插桩跑覆盖率时要几秒），
+        // 下面等画面的几秒才只算引擎自己的时间
+        drop(ve_render::Compositor::new(&ve_render::RenderConfig {
+            software: true,
+        }));
         Engine::new(EngineConfig {
             audio: AudioBackend::Capture,
             render: ve_render::RenderConfig { software: true },
@@ -818,6 +846,7 @@ mod tests {
             denoise: 0.3,
             eq: [0.0; 3],
             compress: 1.0,
+            ..ve_core::AudioFx::NONE
         };
         ve_core::edit::set_audio_fx(&mut p, clips[0], fx).unwrap();
         e.set_project(Arc::new(p));
@@ -838,6 +867,53 @@ mod tests {
         #[expect(clippy::cast_precision_loss, reason = "测试里样本数很小")]
         let hz = crossings as f64 / (steady.len() as f64 / 48_000.0);
         assert!((hz - 440.0).abs() < 20.0, "{hz}");
+    }
+
+    #[test]
+    fn scrubbing_plays_a_short_snippet_without_moving_the_playhead() {
+        let e = engine();
+        let (p, _) = project_with(&[Fixture::ToneStereo48k]);
+        e.set_project(Arc::new(p));
+        let at = Time::from_millis(700);
+        e.scrub(at);
+        sleep(Duration::from_millis(400));
+        assert!(!e.is_playing());
+        assert_eq!(e.position(), at, "播放头不动");
+        let heard = e.captured_audio();
+        let frames = heard.len() / 2;
+        // 一小段（约 85 毫秒），不是一直放下去
+        assert!(frames > 2_000 && frames < 8_000, "{frames}");
+        assert!(heard.iter().any(|v| v.abs() > 0.05), "有声音");
+        // 没有新的拖动就不再出声
+        sleep(Duration::from_millis(200));
+        assert_eq!(e.captured_audio().len(), 0);
+    }
+
+    #[test]
+    fn voice_change_lowers_the_pitch_in_the_preview() {
+        // 大叔变声把音高降到 0.75 倍：440 Hz → 330 Hz
+        let e = engine();
+        let (mut p, clips) = project_with(&[Fixture::ToneStereo48k]);
+        let fx = ve_core::AudioFx {
+            voice: ve_core::Voice::Uncle,
+            ..ve_core::AudioFx::NONE
+        };
+        ve_core::edit::set_audio_fx(&mut p, clips[0], fx).unwrap();
+        e.set_project(Arc::new(p));
+        e.seek(Time::from_millis(500));
+        e.play();
+        sleep(Duration::from_millis(500));
+        e.pause();
+        let left: Vec<f32> = e.captured_audio().iter().step_by(2).copied().collect();
+        assert!(left.len() > 48_000 / 4, "{}", left.len());
+        let steady = &left[left.len() / 2..];
+        let crossings = steady
+            .windows(2)
+            .filter(|w| w[0] <= 0.0 && w[1] > 0.0)
+            .count();
+        #[expect(clippy::cast_precision_loss, reason = "测试里样本数很小")]
+        let hz = crossings as f64 / (steady.len() as f64 / 48_000.0);
+        assert!((hz - 330.0).abs() < 20.0, "{hz}");
     }
 
     #[test]

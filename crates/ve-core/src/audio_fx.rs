@@ -25,6 +25,68 @@ pub struct AudioFx {
     /// 压缩强度 0–1（0 = 关）：大声的地方压下来、整体再提一点，听起来更平稳。
     #[serde(default)]
     pub compress: f32,
+    /// 变声（剪映「变声」）：变音高不变长度。
+    #[serde(default, skip_serializing_if = "Voice::is_none")]
+    pub voice: Voice,
+}
+
+/// 变声预设：都不改声音的长度（变音高用 rubberband，画面和声音不会错开）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Voice {
+    /// 原声。
+    #[default]
+    None,
+    /// 大叔：降调。
+    Uncle,
+    /// 女生：升调。
+    Female,
+    /// 花栗鼠：升得很高。
+    Chipmunk,
+    /// 机器人：去掉相位，声音发「电」。
+    Robot,
+}
+
+impl Voice {
+    /// 面板上的顺序。
+    pub const ALL: [Self; 5] = [
+        Self::None,
+        Self::Uncle,
+        Self::Female,
+        Self::Chipmunk,
+        Self::Robot,
+    ];
+
+    /// 原声。
+    #[must_use]
+    pub const fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    /// 名字。
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "无",
+            Self::Uncle => "大叔",
+            Self::Female => "女生",
+            Self::Chipmunk => "花栗鼠",
+            Self::Robot => "机器人",
+        }
+    }
+
+    /// ffmpeg 滤镜（原声时 `None`）。
+    #[must_use]
+    pub const fn filter(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Uncle => Some("rubberband=pitch=0.75"),
+            Self::Female => Some("rubberband=pitch=1.3"),
+            Self::Chipmunk => Some("rubberband=pitch=1.7"),
+            Self::Robot => Some(
+                "afftfilt=real='hypot(re,im)*cos(0)':imag='hypot(re,im)*sin(0)':win_size=512:overlap=0.75",
+            ),
+        }
+    }
 }
 
 impl AudioFx {
@@ -33,6 +95,7 @@ impl AudioFx {
         denoise: 0.0,
         eq: [0.0; 3],
         compress: 0.0,
+        voice: Voice::None,
     };
 
     /// 没有任何处理（工程文件里不写）。
@@ -83,6 +146,9 @@ impl AudioFx {
                 1.0 + 2.0 * c
             ));
         }
+        if let Some(v) = self.voice.filter() {
+            parts.push(v.to_owned());
+        }
         (!parts.is_empty()).then(|| parts.join(","))
     }
 
@@ -114,6 +180,7 @@ mod tests {
             denoise: 0.5,
             eq: [3.0, 0.0, -2.0],
             compress: 1.0,
+            ..AudioFx::NONE
         };
         let spec = fx.filter_spec().unwrap();
         let names: Vec<&str> = spec
@@ -125,6 +192,24 @@ mod tests {
         assert!(spec.contains("ratio=8.00"), "{spec}");
         assert_eq!(fx.latency_samples(48_000), 1200);
         assert_eq!(fx.latency_samples(44_100), 1102);
+    }
+
+    #[test]
+    fn voices_change_pitch_or_timbre_but_not_length() {
+        let mut fx = AudioFx::NONE;
+        fx.voice = Voice::Uncle;
+        assert!(!fx.is_none());
+        assert_eq!(fx.filter_spec().as_deref(), Some("rubberband=pitch=0.75"));
+        fx.voice = Voice::Robot;
+        assert!(fx.filter_spec().unwrap().starts_with("afftfilt="));
+        assert_eq!(fx.latency_samples(48_000), 0);
+        // 和别的处理一起：变声排在最后
+        fx.eq[0] = 3.0;
+        assert!(fx.filter_spec().unwrap().ends_with("overlap=0.75"));
+        // 旧工程文件没有变声这一项
+        let old: AudioFx = serde_json::from_str(r#"{"denoise":0.0}"#).unwrap();
+        assert_eq!(old.voice, Voice::None);
+        assert_eq!(Voice::ALL.len(), 5);
     }
 
     #[test]

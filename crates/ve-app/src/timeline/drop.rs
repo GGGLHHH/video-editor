@@ -421,7 +421,7 @@ mod tests {
     fn at(g: &TimelineGeometry, secs: f64, track: usize) -> (f32, f32) {
         (
             g.time_to_x(Time::from_secs_f64(secs)),
-            g.track_top(track) + g.track_height / 2.0,
+            g.track_top(track) + g.row_height(track) / 2.0,
         )
     }
 

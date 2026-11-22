@@ -26,6 +26,19 @@ pub fn save(doc: &mut Document, path: &Path) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// 不是 `.png` 结尾时换成 `.png`（导出静帧）。
+#[must_use]
+pub fn with_png(path: &Path) -> PathBuf {
+    if path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("png"))
+    {
+        path.to_path_buf()
+    } else {
+        path.with_extension("png")
+    }
+}
+
 /// 没有扩展名时补 `.vep`。
 #[must_use]
 pub fn with_extension(path: &Path) -> PathBuf {

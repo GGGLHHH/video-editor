@@ -199,6 +199,52 @@ impl Workspace {
                     || Box::new(act::Reverse),
                     self.reverse_target().is_some() && !self.is_reversing(),
                 ),
+                item(
+                    "cm-group",
+                    if self.selection_is_one_group() {
+                        "取消组合"
+                    } else {
+                        "组合"
+                    },
+                    "Ctrl+G",
+                    || Box::new(act::GroupClips),
+                    self.doc.selection().len() >= 2 || self.selection_is_one_group(),
+                ),
+                item(
+                    "cm-export-selection",
+                    "导出所选片段",
+                    "",
+                    || Box::new(act::ExportSelection),
+                    !self.doc.selection().is_empty(),
+                ),
+                item(
+                    "cm-save-preset",
+                    "保存为调节预设",
+                    "",
+                    || Box::new(act::SaveAdjustPreset),
+                    !self.selected_picture_clips().is_empty(),
+                ),
+                item(
+                    "cm-reveal",
+                    "打开文件所在位置",
+                    "",
+                    || Box::new(act::RevealInFolder),
+                    self.selected_media_path().is_some(),
+                ),
+                {
+                    let (all_split, clips) = self.audio_split_targets();
+                    item(
+                        "cm-separate-audio",
+                        if all_split {
+                            "还原音频"
+                        } else {
+                            "分离音频"
+                        },
+                        "Ctrl+Shift+S",
+                        || Box::new(act::SeparateAudio),
+                        !clips.is_empty(),
+                    )
+                },
             ],
             vec![
                 item(

@@ -6,9 +6,10 @@ use crate::theme::palette;
 use crate::workspace::Workspace;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
-use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
     ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
@@ -180,6 +181,46 @@ pub(crate) struct LookFields {
     pub(crate) seg: PictureSeg,
     /// 取色器开着：下一次在播放器上点击取那里的颜色当抠图颜色。
     pub(crate) picking: bool,
+    /// 「蒙版」里正在改第几个蒙版（0 = 第一个）。
+    pub(crate) mask_index: usize,
+    /// 文字蒙版的字（回车或失焦时写回）。
+    pub(crate) mask_text: Entity<InputState>,
+}
+
+/// 正在改第 `i` 个蒙版时面板看到的外观：`mask` 换成那一个（其余不变）；没有那一个时就是原样。
+pub(crate) fn view_mask(look: Look, i: usize) -> Look {
+    i.checked_sub(1)
+        .and_then(|k| look.extra_masks.get(k).copied().flatten())
+        .map_or(look, |m| Look {
+            mask: Some(m),
+            ..look
+        })
+}
+
+/// 面板改完的外观 `view` 放回去：`mask` 写回第 `i` 个蒙版，第一个蒙版用 `real`（这一刻的值，
+/// 免得把动画到一半的值当成改了、多打关键帧）；选了「无」就是删掉这个蒙版。
+pub(crate) fn unview_mask(view: Look, real: Look, i: usize) -> Look {
+    let editing_extra = i
+        .checked_sub(1)
+        .is_some_and(|k| real.extra_masks.get(k).copied().flatten().is_some());
+    let mut out = Look {
+        mask: real.mask,
+        extra_masks: real.extra_masks,
+        ..view
+    };
+    if editing_extra {
+        match view.mask {
+            Some(m) => out.extra_masks[i - 1] = Some(m),
+            None => out.remove_mask(i),
+        }
+    } else {
+        match view.mask {
+            Some(m) => out.mask = Some(m),
+            // 第一个选了「无」：后面的往前挪
+            None => out.remove_mask(0),
+        }
+    }
+    out
 }
 
 /// 描边 / 阴影可选的颜色（剪映的色板第一行）。
@@ -190,10 +231,20 @@ const SWATCHES: [u32; 8] = [
 impl LookFields {
     /// 创建滑条并订阅。
     pub(crate) fn new(
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<'_, Workspace>,
     ) -> (Self, Vec<Subscription>) {
         let mut subs = Vec::new();
+        let mask_text = cx.new(|cx| InputState::new(window, cx).placeholder("输入文字"));
+        subs.push(cx.subscribe_in(
+            &mask_text,
+            window,
+            |this: &mut Workspace, _, e: &InputEvent, window, cx| {
+                if matches!(e, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                    this.commit_mask_text(window, cx);
+                }
+            },
+        ));
         let sliders = LookField::ALL
             .iter()
             .map(|&f| {
@@ -221,6 +272,8 @@ impl LookFields {
                 gesture: false,
                 seg: PictureSeg::default(),
                 picking: false,
+                mask_index: 0,
+                mask_text,
             },
             subs,
         )
@@ -234,13 +287,78 @@ impl LookFields {
 impl Workspace {
     /// 选中的视频轨媒体片段、它在播放头这一刻的外观（有关键帧的项按时间求值）、播放头相对片段起点的时间。
     fn bound_look_at(&self) -> Option<(ClipId, Look, Time)> {
-        let (clip, ..) = self.bound_video_clip()?;
+        self.bound_look_real()
+            .map(|(clip, look, at)| (clip, view_mask(look, self.inspector.look.mask_index), at))
+    }
+
+    /// 选中的视频轨媒体片段，或视频轨上的复合片段（整组的蒙版、圆角）。
+    pub(crate) fn bound_look_clip(&self) -> Option<ClipId> {
+        self.bound_video_clip().map(|(c, ..)| c).or_else(|| {
+            let (c, ..) = self.bound_visual_clip()?;
+            let (_, clip) = self.doc.project.timeline.find_clip(c)?;
+            clip.compound().map(|_| c)
+        })
+    }
+
+    /// 选中片段这一刻真正的外观（不换蒙版）。
+    fn bound_look_real(&self) -> Option<(ClipId, Look, Time)> {
+        let clip = self.bound_look_clip()?;
         let (_, c) = self.doc.project.timeline.find_clip(clip)?;
         let offset = self.key_offset(c);
         Some((clip, c.look_at(offset), offset))
     }
 
+    /// 正在改的是第几个蒙版（那一个已经没了时当第一个）。
+    fn mask_index_now(&self, real: &Look) -> usize {
+        let i = self.inspector.look.mask_index;
+        if i > 0 && real.extra_masks.get(i - 1).copied().flatten().is_some() {
+            i
+        } else {
+            0
+        }
+    }
+
     /// 选中的视频轨媒体片段和它在播放头这一刻的外观。
+    /// 把选中片段的文字蒙版的字填进输入框（没有时空着）。
+    pub(crate) fn fill_mask_text(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let text = self
+            .bound_look_clip()
+            .and_then(|id| self.doc.project.timeline.find_clip(id))
+            .and_then(|(_, c)| c.mask_text.as_ref().map(|t| t.text.clone()))
+            .unwrap_or_default();
+        self.inspector
+            .look
+            .mask_text
+            .update(cx, |s, cx| s.set_value(text, window, cx));
+    }
+
+    /// 输入框里的字写回片段（一步撤销）；空的不收，输入框换回原来的字。
+    fn commit_mask_text(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(clip) = self.bound_look_clip() else {
+            return;
+        };
+        let text = self.inspector.look.mask_text.read(cx).value().to_string();
+        let current = self
+            .doc
+            .project
+            .timeline
+            .find_clip(clip)
+            .and_then(|(_, c)| c.mask_text.as_ref().map(|t| t.text.clone()));
+        if current.is_none() || current.as_deref() == Some(text.as_str()) {
+            return;
+        }
+        let ok = ve_core::MaskText {
+            text: text.clone(),
+            font: String::new(),
+        }
+        .is_valid();
+        if ok {
+            self.apply(window, cx, |p| ve_core::edit::set_mask_text(p, clip, &text));
+        } else {
+            self.fill_mask_text(window, cx);
+        }
+    }
+
     fn bound_look(&self) -> Option<(ClipId, Look)> {
         self.bound_look_at().map(|(clip, look, _)| (clip, look))
     }
@@ -252,11 +370,77 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some((clip, mut look, at)) = self.bound_look_at() else {
+        let Some((clip, real, at)) = self.bound_look_real() else {
             return;
         };
-        f(&mut look);
+        let i = self.mask_index_now(&real);
+        let mut view = view_mask(real, i);
+        f(&mut view);
+        let look = unview_mask(view, real, i);
         self.apply(window, cx, |p| apply_look_at(p, clip, at, look));
+    }
+
+    /// 「添加蒙版」：加一个矩形蒙版并切过去改它。
+    fn add_mask(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some((clip, mut look, at)) = self.bound_look_real() else {
+            return;
+        };
+        let Some(i) = look.add_mask() else {
+            return;
+        };
+        self.inspector.look.mask_index = i;
+        self.apply(window, cx, |p| apply_look_at(p, clip, at, look));
+    }
+
+    /// 删掉正在改的那个蒙版，回到第一个。
+    fn remove_current_mask(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some((clip, mut look, at)) = self.bound_look_real() else {
+            return;
+        };
+        let i = self.mask_index_now(&look);
+        look.remove_mask(i);
+        self.inspector.look.mask_index = 0;
+        self.apply(window, cx, |p| apply_look_at(p, clip, at, look));
+    }
+
+    /// 蒙版一排：「蒙版 1 / 2 …」切换正在改哪个，「⊕ 添加蒙版」「删除蒙版」。
+    fn render_mask_tabs(&self, cx: &Context<'_, Self>) -> Option<AnyElement> {
+        let (_, real, _) = self.bound_look_real()?;
+        real.mask?;
+        let current = self.mask_index_now(&real);
+        let count = real.masks().count();
+        let tabs = (0..count).map(|i| {
+            crate::chrome::chip(
+                SharedString::from(format!("mask-tab-{i}")),
+                SharedString::from(format!("蒙版 {}", i + 1)),
+                i == current,
+                cx,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.inspector.look.mask_index = i;
+                cx.notify();
+            }))
+            .into_any_element()
+        });
+        let add = (count < ve_core::look::MAX_MASKS).then(|| {
+            crate::chrome::chip("mask-add", "⊕ 添加蒙版", false, cx)
+                .on_click(cx.listener(|this, _, window, cx| this.add_mask(window, cx)))
+                .into_any_element()
+        });
+        let remove = (count > 1).then(|| {
+            crate::chrome::chip("mask-remove", "删除蒙版", false, cx)
+                .on_click(cx.listener(|this, _, window, cx| this.remove_current_mask(window, cx)))
+                .into_any_element()
+        });
+        Some(
+            h_flex()
+                .flex_wrap()
+                .gap_1()
+                .children(tabs)
+                .children(add)
+                .children(remove)
+                .into_any_element(),
+        )
     }
 
     /// 一组的「↻ 重置」：这一组的关键帧一起清掉，再改成默认值（一步撤销）。
@@ -267,10 +451,19 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some((clip, mut look, at)) = self.bound_look_at() else {
+        let Some((clip, real, at)) = self.bound_look_real() else {
             return;
         };
-        f(&mut look);
+        let i = self.mask_index_now(&real);
+        let mut view = view_mask(real, i);
+        f(&mut view);
+        let look = unview_mask(view, real, i);
+        // 另外的蒙版没有关键帧：重置它时别清掉第一个蒙版的
+        let props = if i > 0 && props == Prop::MASK.as_slice() {
+            &[][..]
+        } else {
+            props
+        };
         self.apply(window, cx, |p| reset_look_at(p, clip, at, look, props));
     }
 
@@ -281,16 +474,19 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some((clip, mut look, at)) = self.bound_look_at() else {
+        let Some((clip, real, at)) = self.bound_look_real() else {
             return;
         };
+        let i = self.mask_index_now(&real);
         match e {
             SliderEvent::Change(v) => {
                 if !self.inspector.look.gesture {
                     self.doc.begin_gesture();
                     self.inspector.look.gesture = true;
                 }
-                field.set(&mut look, field.ui_to_value(v.start()));
+                let mut view = view_mask(real, i);
+                field.set(&mut view, field.ui_to_value(v.start()));
+                let look = unview_mask(view, real, i);
                 let _ = self.doc.edit(|p| apply_look_at(p, clip, at, look));
                 self.after_change(window, cx);
             }
@@ -411,13 +607,12 @@ impl Workspace {
                         .test_support()
                         .child(Slider::new(s)),
                 )
-                .child(
-                    div()
-                        .w(px(36.))
-                        .text_sm()
-                        .child(SharedString::from(format!("{v}"))),
+                .child(self.value_box(f.id(), s, format!("{v}"), 36.0, cx))
+                // 关键帧只作用在第一个蒙版：改另外的蒙版时不显示 ‹ ◇ ›
+                .children(
+                    (self.inspector.look.mask_index == 0 || !Prop::MASK.contains(&f.prop()))
+                        .then(|| self.render_group_keys(KeyGroup::Look(f.prop()), cx)),
                 )
-                .child(self.render_group_keys(KeyGroup::Look(f.prop()), cx))
                 .into_any_element(),
         )
     }
@@ -464,9 +659,10 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// 二级分段「基础 / 抠像 / 蒙版」（剪映），点了就切换。
+    /// 二级分段「基础 / 抠像 / 蒙版」（剪映），点了就切换。视频轨上的复合片段也有（整组生效）。
     pub(crate) fn render_picture_segments(&self, cx: &Context<'_, Self>) -> AnyElement {
         let current = self.inspector.look.seg;
+        let keyable = self.bound_look_clip().is_some();
         h_flex()
             .p(px(2.))
             .gap(px(2.))
@@ -478,6 +674,8 @@ impl Workspace {
                     ("seg-key", "抠像", PictureSeg::Key),
                     ("seg-mask", "蒙版", PictureSeg::Mask),
                 ]
+                .into_iter()
+                .filter(|&(_, _, seg)| keyable || seg != PictureSeg::Key)
                 .map(|(id, label, seg)| {
                     let on = seg == current;
                     div()
@@ -734,12 +932,22 @@ impl Workspace {
         ))
     }
 
-    /// 「蒙版」分段：形状一排（无 + 6 种），选了形状后下面是反转和各项数值。
-    pub(crate) fn render_mask_seg(&self, cx: &Context<'_, Self>) -> Option<AnyElement> {
-        let (_, look) = self.bound_look()?;
-        let current = look.mask.map(|m| m.shape);
+    /// 形状一排：无 + 各种形状（复合片段整组的蒙版不支持文字形状）。
+    fn render_mask_shapes(
+        &self,
+        clip: ClipId,
+        current: Option<MaskShape>,
+        cx: &Context<'_, Self>,
+    ) -> AnyElement {
+        let compound = self
+            .doc
+            .project
+            .timeline
+            .find_clip(clip)
+            .is_some_and(|(_, c)| c.compound().is_some());
         let shapes = std::iter::once((None, "无"))
             .chain(MaskShape::ALL.map(|s| (Some(s), s.label())))
+            .filter(|(shape, _)| !(compound && *shape == Some(MaskShape::Text)))
             .map(|(shape, label)| {
                 let id = SharedString::from(format!(
                     "mask-{}",
@@ -748,16 +956,59 @@ impl Workspace {
                 crate::chrome::chip(id, label, current == shape, cx)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.edit_look(|l| l.mask = shape.map(Mask::new), window, cx);
+                        this.fill_mask_text(window, cx);
                     }))
                     .into_any_element()
             });
-        let mut rows = vec![
-            h_flex()
-                .flex_wrap()
-                .gap_1()
-                .children(shapes)
-                .into_any_element(),
-        ];
+        h_flex()
+            .flex_wrap()
+            .gap_1()
+            .children(shapes)
+            .into_any_element()
+    }
+
+    /// 文字蒙版的字：一行输入框（回车或失焦写回）。
+    fn render_mask_text_row(&self, cx: &Context<'_, Self>) -> AnyElement {
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(
+                div()
+                    .w(px(52.))
+                    .flex_none()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("文字"),
+            )
+            .child(
+                div()
+                    .id("mask-text-input")
+                    .test_support()
+                    .flex_1()
+                    .child(Input::new(&self.inspector.look.mask_text).small()),
+            )
+            .into_any_element()
+    }
+
+    /// 「蒙版」分段：形状一排（无 + 7 种，复合片段没有文字），选了形状后下面是反转和各项数值。
+    pub(crate) fn render_mask_seg(&self, cx: &Context<'_, Self>) -> Option<AnyElement> {
+        let (clip, look) = self.bound_look()?;
+        let mut rows: Vec<AnyElement> = self.render_mask_tabs(cx).into_iter().collect();
+        rows.push(self.render_mask_shapes(clip, look.mask.map(|m| m.shape), cx));
+        // 还没有蒙版：「添加蒙版」也能加一个
+        if look.mask.is_none() {
+            rows.push(
+                h_flex()
+                    .child(
+                        crate::chrome::chip("mask-add", "⊕ 添加蒙版", false, cx)
+                            .on_click(cx.listener(|this, _, window, cx| this.add_mask(window, cx))),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if look.mask.is_some_and(|m| m.shape == MaskShape::Text) {
+            rows.push(self.render_mask_text_row(cx));
+        }
         if let Some(m) = look.mask {
             rows.push(
                 h_flex()

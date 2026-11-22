@@ -28,8 +28,12 @@ pub struct LayerSource {
     /// 整条调色链（片段自己的，再接上压在它上面的调节片段）；只在用到进阶调色（HSL、曲线、
     /// 色轮、LUT）时才有，没有时按 [`Self::color`] 的矩阵调色。
     pub grades: crate::GradeChain,
+    /// 锐化、颗粒、暗角（片段自己的「调整」）。
+    pub detail: crate::adjust::Detail,
     /// 帧融合：慢放时把 `source_time` 前后两帧按时间混合（[`crate::Clip::blends_frames`]）。
     pub frame_blend: bool,
+    /// 文字蒙版的字（外观里有文字形状的蒙版时才有）。
+    pub mask_text: Option<std::sync::Arc<crate::MaskText>>,
 }
 
 /// 时间点 `t` 上要合成的东西：各层画面和底色的调色。
@@ -48,9 +52,9 @@ pub struct Composition {
     pub groups: Vec<GroupPass>,
 }
 
-/// 一段整组半透明的图层（复合片段里面那几层）：先照常把第 `start..end` 层（和压在里面的前
-/// `effects_end` 道特效）画上去，再和画这组之前的画面按 `opacity` 混合——对普通叠加的图层，
-/// 这正好等于「整组合成好再按不透明度叠上去」，重叠处不会透出下面那层。
+/// 一个复合片段里面那几层（隔离组）：先在透明的画布上把第 `start..end` 层（和压在里面的前
+/// `effects_end` 道特效）画好——里面的特效、混合模式只作用在组里——再按整组的抠图、蒙版、圆角、
+/// 描边、阴影、不透明度、混合模式叠到画这组之前的画面上。整组半透明时重叠处不会透出下面那层。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GroupPass {
     /// 第一层。
@@ -61,6 +65,18 @@ pub struct GroupPass {
     pub effects_end: usize,
     /// 整组的不透明度。
     pub opacity: f32,
+    /// 复合片段的蒙版、圆角（有的话）：组外面的部分露出下面（[`GroupShape`]）。
+    pub shape: Option<GroupShape>,
+}
+
+/// 复合片段整组的外观：它是一个画布大小的图层，按 `transform`（已经和外面几层复合片段叠好）
+/// 放在画布上，`look` 里的抠图、蒙版、圆角、描边、阴影、混合模式对整组生效（文字蒙版除外）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GroupShape {
+    /// 整组在画布上的位置大小（不透明度另算）。
+    pub transform: Transform,
+    /// 外观。
+    pub look: crate::Look,
 }
 
 impl GroupPass {
@@ -97,9 +113,9 @@ pub fn resolve_frame(project: &Project, t: Time) -> Composition {
     let mut background = crate::ColorMatrix::IDENTITY;
     let mut background_grades: crate::GradeChain = Vec::new();
     let mut effects = Vec::new();
-    // 每层、每道特效外面套着哪些复合片段（从外到里，带这一刻的不透明度）
-    let mut layer_chains: Vec<Vec<(ClipId, f32)>> = Vec::new();
-    let mut effect_chains: Vec<Vec<(ClipId, f32)>> = Vec::new();
+    // 每层、每道特效外面套着哪些复合片段（从外到里，带这一刻的不透明度和形状）
+    let mut layer_chains: Vec<Vec<Outer>> = Vec::new();
+    let mut effect_chains: Vec<Vec<Outer>> = Vec::new();
     // 每层外面各层复合片段自己的调色（从里到外），和调节片段（压在哪几层上、在哪些复合片段里面）：
     // 最后按「里面的调节片段 → 复合片段自己 → 外面的调节片段」的顺序接到每层后面
     let mut layer_parent_grades: Vec<Vec<ParentGrade>> = Vec::new();
@@ -115,7 +131,7 @@ pub fn resolve_frame(project: &Project, t: Time) -> Composition {
                 if let Some(clip) = clip {
                     under_parents(layer, clip, t, canvas);
                 }
-                layer_chains.push(clip.map(|c| parents_of(c, t)).unwrap_or_default());
+                layer_chains.push(clip.map(|c| parents_of(c, t, canvas)).unwrap_or_default());
                 layer_parent_grades.push(clip.map(|c| parent_grades(c, t)).unwrap_or_default());
             }
             out.extend(pair);
@@ -130,45 +146,40 @@ pub fn resolve_frame(project: &Project, t: Time) -> Composition {
         }
         if let Some(effect) = clip.effect_at(t - clip.start) {
             #[expect(clippy::cast_possible_truncation, reason = "片段内的秒数")]
-            let seconds = (t - clip.start).as_secs_f64() as f32;
+            let seconds = (t - clip.start).as_secs_f64() as f32 * effect.time_scale();
             effects.push(crate::EffectPass {
                 after: out.len(),
                 effect,
                 seconds,
             });
-            effect_chains.push(parents_of(clip, t));
+            effect_chains.push(parents_of(clip, t, canvas));
             continue;
         }
         if clip.is_adjustment() {
-            let m = clip.adjust_at(t - clip.start).matrix();
-            if !m.is_identity() || clip.grade.is_some() {
-                let step = crate::GradeStep {
-                    input: None,
-                    matrix: m,
-                    grade: clip.grade.clone(),
-                };
-                background = background.then(&m);
-                background_grades.push(step.clone());
-                adjustments.push(Adjustment {
-                    below: out.len(),
-                    inside: parents_of(clip, t).into_iter().map(|(id, _)| id).collect(),
-                    matrix: m,
-                    step,
-                });
+            if let Some(a) = adjustment_of(clip, t, canvas, out.len()) {
+                // 复合片段里面的调节片段只调里面（隔离），不碰黑底
+                if a.inside.is_empty() {
+                    background = background.then(&a.matrix);
+                    background_grades.push(a.step.clone());
+                }
+                adjustments.push(a);
             }
             continue;
         }
         if let Some(mut layer) = layer_of(tr.id, clip, i, t - clip.start, None) {
             under_parents(&mut layer, clip, t, canvas);
             out.push(layer);
-            layer_chains.push(parents_of(clip, t));
+            layer_chains.push(parents_of(clip, t, canvas));
             layer_parent_grades.push(parent_grades(clip, t));
         }
     }
-    grade_in_order(&mut out, &layer_parent_grades, &adjustments);
+    grade_in_order(&mut out, &layer_chains, &layer_parent_grades, &adjustments);
     // 整条链都没用进阶调色：只留矩阵（着色器走快的那条路）
-    let plain =
-        |chain: &crate::GradeChain| chain.iter().all(|s| s.grade.is_none() && s.input.is_none());
+    let plain = |chain: &crate::GradeChain| {
+        chain
+            .iter()
+            .all(|s| s.grade.is_none() && s.input.is_none() && s.tone.is_none())
+    };
     for l in &mut out {
         if plain(&l.grades) {
             l.grades.clear();
@@ -177,7 +188,11 @@ pub fn resolve_frame(project: &Project, t: Time) -> Composition {
     if plain(&background_grades) {
         background_grades.clear();
     }
-    let groups = groups_of(&layer_chains, &effects, &effect_chains);
+    let blended: Vec<bool> = out
+        .iter()
+        .map(|l| l.look.blend != crate::BlendMode::Normal)
+        .collect();
+    let groups = groups_of(&layer_chains, &blended, &effects, &effect_chains);
     Composition {
         layers: out,
         background,
@@ -191,6 +206,7 @@ pub fn resolve_frame(project: &Project, t: Time) -> Composition {
 /// 调色在它之前做（里面的调节片段 → 复合片段自己 → 外面的调节片段）。
 fn grade_in_order(
     layers: &mut [LayerSource],
+    chains: &[Vec<Outer>],
     parents: &[Vec<ParentGrade>],
     adjustments: &[Adjustment],
 ) {
@@ -200,7 +216,16 @@ fn grade_in_order(
     };
     for (i, (l, own)) in layers.iter_mut().zip(parents).enumerate() {
         let mut pending = own.iter().peekable();
-        for a in adjustments.iter().filter(|a| a.below > i) {
+        // 调节片段在哪个复合片段里，就只调同在里面的层
+        let reaches = |a: &&Adjustment| {
+            a.below > i
+                && a.inside.last().is_none_or(|inner| {
+                    chains
+                        .get(i)
+                        .is_some_and(|c| c.iter().any(|o| o.id == *inner))
+                })
+        };
+        for a in adjustments.iter().filter(reaches) {
             while let Some(p) = pending.next_if(|p| !a.inside.contains(&p.clip)) {
                 push(l, &p.matrix, &p.step);
             }
@@ -227,21 +252,48 @@ struct Adjustment {
     step: crate::GradeStep,
 }
 
+/// 调节片段在 `t` 这一刻（压在前 `below` 层上）；不调色时 `None`。
+fn adjustment_of(clip: &Clip, t: Time, canvas: (u32, u32), below: usize) -> Option<Adjustment> {
+    let a = clip.adjust_at(t - clip.start);
+    let m = a.matrix();
+    let grade = clip.grade_at(t - clip.start);
+    if m.is_identity() && grade.is_none() && a.tone().is_none() {
+        return None;
+    }
+    Some(Adjustment {
+        below,
+        inside: parents_of(clip, t, canvas)
+            .into_iter()
+            .map(|o| o.id)
+            .collect(),
+        matrix: m,
+        step: crate::GradeStep {
+            input: None,
+            matrix: m,
+            tone: a.tone(),
+            grade,
+        },
+    })
+}
+
 /// 片段外面各层复合片段这一刻自己的调色（从里到外，没调色的跳过）。
 fn parent_grades(clip: &Clip, t: Time) -> Vec<ParentGrade> {
     let mut out = Vec::new();
     let mut next = clip.parent.as_deref();
     while let Some(p) = next {
         let at = (t - p.start).clamp(Time::ZERO, p.duration);
-        let m = p.adjust_at(at).matrix();
-        if !m.is_identity() || p.grade.is_some() {
+        let a = p.adjust_at(at);
+        let m = a.matrix();
+        let grade = p.grade_at(at);
+        if !m.is_identity() || grade.is_some() || a.tone().is_some() {
             out.push(ParentGrade {
                 clip: p.id,
                 matrix: m,
                 step: crate::GradeStep {
                     input: None,
                     matrix: m,
-                    grade: p.grade.clone(),
+                    tone: a.tone(),
+                    grade,
                 },
             });
         }
@@ -250,41 +302,78 @@ fn parent_grades(clip: &Clip, t: Time) -> Vec<ParentGrade> {
     out
 }
 
-/// 片段外面套着的复合片段（从外到里），带这一刻的不透明度。
-fn parents_of(clip: &Clip, t: Time) -> Vec<(ClipId, f32)> {
+/// 外面一层复合片段在这一刻：编号、不透明度、整组的形状（有蒙版或圆角时）。
+#[derive(Debug, Clone, Copy)]
+struct Outer {
+    id: ClipId,
+    opacity: f32,
+    shape: Option<GroupShape>,
+}
+
+/// 复合片段的这些外观要整组画（隔离组）：蒙版、圆角、描边、阴影、混合模式、抠图。
+fn needs_group(look: &crate::Look) -> bool {
+    look.mask.is_some()
+        || look.radius > 0.0
+        || look.stroke.is_some()
+        || look.shadow.is_some()
+        || look.chroma.is_some()
+        || look.blend != crate::BlendMode::Normal
+}
+
+/// 片段外面套着的复合片段（从外到里）。形状的位置是外面几层叠起来的（画布 `w`×`h`）。
+fn parents_of(clip: &Clip, t: Time, (w, h): (u32, u32)) -> Vec<Outer> {
     let mut chain = Vec::new();
     let mut next = clip.parent.as_deref();
     while let Some(p) = next {
         let at = (t - p.start).clamp(Time::ZERO, p.duration);
-        chain.push((p.id, p.transform_at(at).opacity));
+        chain.push((p.id, p.transform_at(at), p.look_at(at)));
         next = p.parent.as_deref();
     }
     chain.reverse();
+    let mut placed: Option<Transform> = None;
     chain
+        .into_iter()
+        .map(|(id, mut own, look)| {
+            let opacity = own.opacity;
+            own.opacity = 1.0;
+            let transform = placed.map_or(own, |outer| outer.compose(&own, w, h));
+            placed = Some(transform);
+            let shaped = needs_group(&look);
+            Outer {
+                id,
+                opacity,
+                shape: shaped.then_some(GroupShape { transform, look }),
+            }
+        })
+        .collect()
 }
 
-/// 半透明复合片段的分组：每一层嵌套里，套着同一个复合片段的连续几层是一组（摊开时里面的
-/// 轨道挨着放，同一个复合片段的层一定连着）。完全不透明的不用分组。
+/// 复合片段的分组：每一层嵌套里，套着同一个复合片段的连续几层是一组（摊开时里面的轨道挨着放，
+/// 同一个复合片段的层一定连着）。完全不透明、没有整组外观、里面也没有特效和混合模式图层的不用
+/// 分组（照常画结果一样）。
 fn groups_of(
-    layers: &[Vec<(ClipId, f32)>],
+    layers: &[Vec<Outer>],
+    blended: &[bool],
     effects: &[crate::EffectPass],
-    effect_chains: &[Vec<(ClipId, f32)>],
+    effect_chains: &[Vec<Outer>],
 ) -> Vec<GroupPass> {
     let depth = layers.iter().map(Vec::len).max().unwrap_or(0);
     let mut groups = Vec::new();
     for d in 0..depth {
         let mut i = 0;
         while i < layers.len() {
-            let Some(&(id, opacity)) = layers[i].get(d) else {
+            let Some(&Outer { id, opacity, shape }) = layers[i].get(d) else {
                 i += 1;
                 continue;
             };
             let end = (i + 1..layers.len())
-                .find(|&j| layers[j].get(d).map(|x| x.0) != Some(id))
+                .find(|&j| layers[j].get(d).map(|x| x.id) != Some(id))
                 .unwrap_or(layers.len());
-            if opacity < 1.0 - 1e-6 {
+            let inside = |k: usize| effect_chains[k].get(d).map(|x| x.id) == Some(id);
+            let has_effect = (0..effects.len()).any(inside);
+            let has_blend = blended[i..end].iter().any(|&b| b);
+            if opacity < 1.0 - 1e-6 || shape.is_some() || has_effect || has_blend {
                 // 组里的特效：压在组里最后一层上、又在这个复合片段里面的那几道
-                let inside = |k: usize| effect_chains[k].get(d).map(|x| x.0) == Some(id);
                 let effects_end = effects
                     .iter()
                     .enumerate()
@@ -295,6 +384,7 @@ fn groups_of(
                     end,
                     effects_end,
                     opacity,
+                    shape,
                 });
             }
             i = end;
@@ -341,16 +431,30 @@ fn layer_of(
         max_scale: clip
             .animation
             .max_value(crate::Prop::Scale)
-            .map_or(clip.transform.scale, |m| m.max(clip.transform.scale)),
+            .map_or(clip.transform.scale, |m| m.max(clip.transform.scale))
+            * clip.motion.max_scale()
+            * clip.transform.stretch.max(1.0),
         color: clip.adjust_at(offset).matrix(),
         lane: u8::from(index % 2 == 1),
         look: clip.look_at(offset),
         grades: vec![crate::GradeStep {
             input: clip.input_space,
             matrix: clip.adjust_at(offset).matrix(),
-            grade: clip.grade.clone(),
+            tone: clip.adjust_at(offset).tone(),
+            grade: clip.grade_at(offset),
         }],
+        detail: {
+            let a = clip.adjust_at(offset);
+            // 颗粒每 1/24 秒换一次图案
+            #[expect(clippy::cast_possible_truncation, reason = "0–96 的整数")]
+            let seed = ((clip.source_at(offset).as_secs_f64() * 24.0).floor() % 97.0) as f32;
+            crate::adjust::Detail { seed, ..a.detail() }
+        },
         frame_blend: clip.blends_frames(),
+        mask_text: {
+            let look = clip.look_at(offset);
+            look.uses_text().then(|| clip.mask_text.clone()).flatten()
+        },
     })
 }
 
@@ -591,6 +695,23 @@ mod tests {
         assert_eq!(before[1].source_time, Time::from_secs(5), "v2 的素材起点");
         assert_eq!(resolve_layers(&p, Time::from_secs(6)).len(), 1, "转场之后");
         assert!(p.timeline.check_invariants(&p.assets).is_ok());
+    }
+
+    #[test]
+    fn tone_items_make_a_chain_and_detail_reaches_the_layer() {
+        use crate::edit::set_adjust;
+        let (mut p, ids) = sample_project();
+        let a = crate::ColorAdjust {
+            shadows: 0.5,
+            vignette: 0.3,
+            ..crate::ColorAdjust::NONE
+        };
+        set_adjust(&mut p, ids.v1, a).unwrap();
+        let f = resolve_frame(&p, Time::from_secs(1));
+        let l = &f.layers[0];
+        assert_eq!(l.grades.len(), 1, "高光阴影光感走查找表");
+        assert!(l.grades[0].tone.is_some());
+        assert!((l.detail.vignette - 0.3).abs() < 1e-6);
     }
 
     #[test]
@@ -852,6 +973,7 @@ mod tests {
             end: 3,
             effects_end: 0,
             opacity: 0.5,
+            shape: None,
         };
         // 第 0 层没画：组往前挪一层
         assert_eq!(
@@ -864,5 +986,24 @@ mod tests {
         );
         // 组里一层都没画：丢掉
         assert_eq!(GroupPass::remap(&[g], &[true, false, false, true]), []);
+    }
+
+    #[test]
+    fn effect_speed_runs_the_effects_clock_faster_or_slower() {
+        let (mut p, _) = sample_project();
+        let mut fast = crate::Effect::new(crate::EffectKind::Grain);
+        fast.speed = 1.0;
+        let fx = crate::edit::add_effect(&mut p, Time::ZERO, Time::from_secs(4), fast).unwrap();
+        let secs = |proj: &Project| resolve_frame(proj, Time::from_secs(1)).effects[0].seconds;
+        // 速度拉满：4 倍
+        assert!((secs(&p) - 4.0).abs() < 1e-4, "{}", secs(&p));
+        // 默认（中间）：原速
+        let mut normal = fast;
+        normal.speed = crate::Effect::DEFAULT_SPEED;
+        crate::edit::set_effect(&mut p, fx, normal).unwrap();
+        assert!((secs(&p) - 1.0).abs() < 1e-4);
+        // 旧工程文件没有速度这一项：按原速读
+        let old: crate::Effect = serde_json::from_str(r#"{"kind":"Grain","amount":0.5}"#).unwrap();
+        assert!((old.speed - crate::Effect::DEFAULT_SPEED).abs() < 1e-6);
     }
 }

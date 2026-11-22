@@ -169,6 +169,16 @@ impl Workspace {
             )
             .child(
                 tool(
+                    "tb-crop",
+                    Lucide::Crop,
+                    "裁剪：按比例从正中裁（裁剪的数值在「画面」里接着改）",
+                    || Box::new(act::OpenCrop),
+                    cx,
+                )
+                .disabled(!video_selected),
+            )
+            .child(
+                tool(
                     "tb-mirror",
                     Lucide::FlipHorizontal2,
                     "镜像：选中的视频片段左右翻转",
@@ -215,6 +225,14 @@ impl Workspace {
                 "联动（~）：主轨片段挪动时，压在上面的字幕跟着走",
                 self.doc.project.settings.linkage,
                 || Box::new(act::ToggleLinkage),
+                cx,
+            ))
+            .child(toggle(
+                "tb-scrub-audio",
+                Lucide::AudioLines,
+                "时间轴声音：暂停时拖动播放头，放出那一处的声音",
+                self.scrub_audio(),
+                || Box::new(act::ToggleScrubAudio),
                 cx,
             ))
             .child(toggle(

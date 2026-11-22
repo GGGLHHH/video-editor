@@ -27,16 +27,19 @@ pub(crate) enum LayoutMode {
     Audio,
     /// 竖屏创作：播放器在右边占满高度；左边上面素材和属性、下面时间轴。
     Portrait,
+    /// 竖屏创作（左）：播放器在左边占满高度；右边上面素材和属性、下面时间轴。
+    PortraitLeft,
 }
 
 impl LayoutMode {
     /// 菜单里的选项：（编号，名字，模式）。
-    pub(crate) const ALL: [(&'static str, &'static str, Self); 5] = [
+    pub(crate) const ALL: [(&'static str, &'static str, Self); 6] = [
         ("layout-default", "默认布局", Self::Default),
         ("layout-media", "媒体素材优先", Self::MediaFirst),
         ("layout-inspector", "属性调节优先", Self::InspectorFirst),
         ("layout-audio", "音频创作", Self::Audio),
         ("layout-portrait", "竖屏创作", Self::Portrait),
+        ("layout-portrait-left", "竖屏创作（左）", Self::PortraitLeft),
     ];
 }
 
@@ -48,6 +51,23 @@ impl Workspace {
         if mode == LayoutMode::Audio {
             self.bin_tab = crate::media_bin::BinTab::Audio;
         }
+    }
+
+    /// 「重置当前布局」：各个分隔条回到默认位置（分隔条按编号记拖过的位置，换一代编号就重新排）。
+    pub(crate) const fn reset_layout(&mut self) {
+        self.layout_generation += 1;
+        self.popup = None;
+    }
+
+    /// 重置过几次布局（测试用）。
+    #[must_use]
+    pub const fn layout_generation(&self) -> u32 {
+        self.layout_generation
+    }
+
+    /// 分隔条的编号：带上重置的代数。
+    fn split_id(&self, name: &str) -> gpui_kit::SharedString {
+        format!("{name}-{}", self.layout_generation).into()
     }
 
     /// 时间轴卡片（各种布局共用）。
@@ -75,7 +95,7 @@ impl Workspace {
     /// 按布局模式排四块面板。初始比例按剪映；之后可以拖分隔条。
     #[expect(
         clippy::too_many_lines,
-        reason = "五种布局并排写，一眼能对照各自的排法"
+        reason = "几种布局并排写，一眼能对照各自的排法"
     )]
     pub(crate) fn render_panels(&self, window: &Window, cx: &Context<'_, Self>) -> AnyElement {
         let viewport = window.viewport_size();
@@ -88,7 +108,7 @@ impl Workspace {
                 } else {
                     0.42
                 };
-                let top = h_resizable("main-split")
+                let top = h_resizable(self.split_id("main-split"))
                     .child(
                         resizable_panel()
                             .size(px((vw * 0.30).max(240.)))
@@ -106,7 +126,7 @@ impl Workspace {
                 } else {
                     "vertical-split"
                 };
-                v_resizable(id)
+                v_resizable(self.split_id(id))
                     .child(resizable_panel().child(top))
                     .child(
                         resizable_panel()
@@ -117,21 +137,21 @@ impl Workspace {
             }
             LayoutMode::MediaFirst => {
                 // 素材在左边一整列（约 26% 宽）；右边上面播放器 + 属性，下面时间轴
-                let upper = h_resizable("media-upper")
+                let upper = h_resizable(self.split_id("media-upper"))
                     .child(resizable_panel().child(chrome::card(self.render_preview(cx))))
                     .child(
                         resizable_panel()
                             .size(px((vw * 0.22).max(280.)))
                             .child(chrome::card(self.render_inspector(cx))),
                     );
-                let right = v_resizable("media-right")
+                let right = v_resizable(self.split_id("media-right"))
                     .child(resizable_panel().child(upper))
                     .child(
                         resizable_panel()
                             .size(px((vh * 0.42).max(220.)))
                             .child(self.timeline_card(cx)),
                     );
-                h_resizable("media-split")
+                h_resizable(self.split_id("media-split"))
                     .child(
                         resizable_panel()
                             .size(px((vw * 0.26).max(240.)))
@@ -142,21 +162,21 @@ impl Workspace {
             }
             LayoutMode::InspectorFirst => {
                 // 属性在右边一整列（约 24% 宽）；左边上面素材 + 播放器，下面时间轴
-                let upper = h_resizable("inspector-upper")
+                let upper = h_resizable(self.split_id("inspector-upper"))
                     .child(
                         resizable_panel()
                             .size(px((vw * 0.30).max(240.)))
                             .child(chrome::card(self.render_media_bin(cx))),
                     )
                     .child(resizable_panel().child(chrome::card(self.render_preview(cx))));
-                let left = v_resizable("inspector-left")
+                let left = v_resizable(self.split_id("inspector-left"))
                     .child(resizable_panel().child(upper))
                     .child(
                         resizable_panel()
                             .size(px((vh * 0.42).max(220.)))
                             .child(self.timeline_card(cx)),
                     );
-                h_resizable("inspector-split")
+                h_resizable(self.split_id("inspector-split"))
                     .child(resizable_panel().child(left))
                     .child(
                         resizable_panel()
@@ -167,27 +187,52 @@ impl Workspace {
             }
             LayoutMode::Portrait => {
                 // 播放器在右边一整列（约 30% 宽）；左边上面素材 + 属性，下面时间轴
-                let upper = h_resizable("portrait-upper")
+                let upper = h_resizable(self.split_id("portrait-upper"))
                     .child(resizable_panel().child(chrome::card(self.render_media_bin(cx))))
                     .child(
                         resizable_panel()
                             .size(px((vw * 0.25).max(280.)))
                             .child(chrome::card(self.render_inspector(cx))),
                     );
-                let left = v_resizable("portrait-left")
+                let left = v_resizable(self.split_id("portrait-left"))
                     .child(resizable_panel().child(upper))
                     .child(
                         resizable_panel()
                             .size(px((vh * 0.45).max(220.)))
                             .child(self.timeline_card(cx)),
                     );
-                h_resizable("portrait-split")
+                h_resizable(self.split_id("portrait-split"))
                     .child(resizable_panel().child(left))
                     .child(
                         resizable_panel()
                             .size(px((vw * 0.30).max(320.)))
                             .child(chrome::card(self.render_preview(cx))),
                     )
+                    .into_any_element()
+            }
+            LayoutMode::PortraitLeft => {
+                // 播放器在左边一整列；右边上面素材 + 属性，下面时间轴
+                let upper = h_resizable(self.split_id("portrait-left-upper"))
+                    .child(resizable_panel().child(chrome::card(self.render_media_bin(cx))))
+                    .child(
+                        resizable_panel()
+                            .size(px((vw * 0.25).max(280.)))
+                            .child(chrome::card(self.render_inspector(cx))),
+                    );
+                let right = v_resizable(self.split_id("portrait-left-right"))
+                    .child(resizable_panel().child(upper))
+                    .child(
+                        resizable_panel()
+                            .size(px((vh * 0.45).max(220.)))
+                            .child(self.timeline_card(cx)),
+                    );
+                h_resizable(self.split_id("portrait-left-split"))
+                    .child(
+                        resizable_panel()
+                            .size(px((vw * 0.30).max(320.)))
+                            .child(chrome::card(self.render_preview(cx))),
+                    )
+                    .child(resizable_panel().child(right))
                     .into_any_element()
             }
         }
@@ -254,7 +299,25 @@ impl Workspace {
                                 cx.notify();
                             },
                         ))
-                        .children(items),
+                        .children(items)
+                        .child(div().h(px(1.)).my_1().bg(cx.theme().border))
+                        .child(
+                            h_flex()
+                                .id("layout-reset")
+                                .test_support()
+                                .h(px(26.))
+                                .px_2()
+                                .pl(px(28.))
+                                .rounded(px(4.))
+                                .text_sm()
+                                .cursor_pointer()
+                                .hover(|s| s.bg(palette::menu_hover()))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.reset_layout();
+                                    cx.notify();
+                                }))
+                                .child("重置当前布局"),
+                        ),
                 )
                 .with_priority(1)
             }))

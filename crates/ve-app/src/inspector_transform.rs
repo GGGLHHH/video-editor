@@ -12,7 +12,7 @@ use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, Styled as _, Subscription, Window, div, px,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
 use ve_core::edit::{apply_transform_at, reset_transform};
 use ve_core::{ClipId, Crop, KeyGroup, Time, TrackKind, Transform, wrap_degrees};
@@ -37,6 +37,14 @@ pub struct TransformFields {
     /// 缩放滑块（1%–400%，剪映的「缩放」那一条）；超出范围的值靠输入框打。
     scale_slider: Entity<SliderState>,
     scale_gesture: bool,
+    /// 关掉「等比缩放」后的「缩放 Y」滑块（高 = 缩放 × 横竖比例）。
+    scale_y: Entity<SliderState>,
+    /// 「等比缩放」开着（剪映默认开）；片段横竖比例不是 1 时显示成关着。
+    pub(crate) uniform: bool,
+    /// 旋转拨盘在窗口里的位置（上一帧布局的结果）。
+    pub(crate) dial: gpui_kit::Bounds<gpui_kit::Pixels>,
+    /// 正在拖旋转拨盘：按下时的角度。
+    pub(crate) dialing: Option<f32>,
     /// 正在数值框上左右拖动改值（剪映）。
     scrub: Option<Scrub>,
     /// 上次填进输入框的文字：没被改过的字段提交时沿用片段的精确值，
@@ -142,6 +150,9 @@ fn parse_deg(s: &str) -> Option<f32> {
         .filter(|v| v.is_finite())
 }
 
+/// 旋转拨盘的大小（像素）。
+const DIAL_PX: f32 = 22.0;
+
 /// 由各字段文字算出新的画面属性：解析不了的字段保持原值，越界的夹到范围内；
 /// 左右或上下裁剪加起来到 100% 以上时整次修改无效，返回 `None`。
 #[must_use]
@@ -152,6 +163,7 @@ pub fn transform_from_text(current: &Transform, fields: &[String; 8]) -> Option<
         x: get(0, current.x).clamp(OFFSET_RANGE.0, OFFSET_RANGE.1),
         y: get(1, current.y).clamp(OFFSET_RANGE.0, OFFSET_RANGE.1),
         scale: get(2, current.scale).clamp(Transform::SCALE_RANGE.0, Transform::SCALE_RANGE.1),
+        stretch: current.stretch,
         crop: Crop {
             left: crop(3, current.crop.left),
             top: crop(4, current.crop.top),
@@ -192,6 +204,13 @@ impl TransformFields {
                 .step(1.0)
                 .default_value(100.0)
         });
+        let scale_y = cx.new(|_| {
+            SliderState::new()
+                .min(SCALE_SLIDER.0)
+                .max(SCALE_SLIDER.1)
+                .step(1.0)
+                .default_value(100.0)
+        });
         let mut subs: Vec<Subscription> = [&x, &y, &scale, &rotation]
             .into_iter()
             .chain(&crop)
@@ -217,6 +236,13 @@ impl TransformFields {
             window,
             |this: &mut Workspace, _, e: &SliderEvent, window, cx| {
                 this.on_scale_slider(e, window, cx);
+            },
+        ));
+        subs.push(cx.subscribe_in(
+            &scale_y,
+            window,
+            |this: &mut Workspace, _, e: &SliderEvent, window, cx| {
+                this.on_scale_y_slider(e, window, cx);
             },
         ));
         // 数值框两边的「−」「+」（和方向键 ↑ ↓）：按一格改值并立即生效
@@ -245,6 +271,10 @@ impl TransformFields {
                 opacity,
                 opacity_gesture: false,
                 scale_slider,
+                scale_y,
+                uniform: true,
+                dial: gpui_kit::Bounds::default(),
+                dialing: None,
                 scale_gesture: false,
                 scrub: None,
                 shown: Default::default(),
@@ -294,7 +324,7 @@ impl Workspace {
                 c.subtitle_text()?;
             }
             let offset = self.key_offset(c);
-            Some((clip, c.transform_at(offset), offset))
+            Some((clip, c.keyed_transform_at(offset), offset))
         })
     }
 
@@ -314,7 +344,7 @@ impl Workspace {
             return None;
         }
         let offset = self.key_offset(c);
-        Some((clip, c.transform_at(offset), offset))
+        Some((clip, c.keyed_transform_at(offset), offset))
     }
 
     /// 播放头动了：绑定的片段有动画时，面板里的数字跟着换成这一刻的值。
@@ -373,6 +403,221 @@ impl Workspace {
         let scale = (t.scale * 100.0).clamp(SCALE_SLIDER.0, SCALE_SLIDER.1);
         f.scale_slider
             .update(cx, |s, cx| s.set_value(scale, window, cx));
+        let tall = (t.scale * t.stretch * 100.0).clamp(SCALE_SLIDER.0, SCALE_SLIDER.1);
+        f.scale_y.update(cx, |s, cx| s.set_value(tall, window, cx));
+    }
+
+    /// 「缩放 Y」滑块：高 = 缩放 × 横竖比例；拖动中实时改，松手合成一步撤销。
+    fn on_scale_y_slider(
+        &mut self,
+        e: &SliderEvent,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((clip, current, at)) = self.bound_visual_clip() else {
+            return;
+        };
+        match e {
+            SliderEvent::Change(v) => {
+                if !self.inspector.transform.scale_gesture {
+                    self.doc.begin_gesture();
+                    self.inspector.transform.scale_gesture = true;
+                }
+                let (lo, hi) = Transform::STRETCH_RANGE;
+                let t = Transform {
+                    stretch: (v.start() / 100.0 / current.scale.max(1e-3)).clamp(lo, hi),
+                    ..current
+                };
+                let _ = self.doc.edit(|p| apply_transform_at(p, clip, at, t));
+                self.after_change(window, cx);
+            }
+            SliderEvent::Release(_) => {
+                if self.inspector.transform.scale_gesture {
+                    self.doc.end_gesture();
+                    self.inspector.transform.scale_gesture = false;
+                }
+            }
+        }
+    }
+
+    /// 旋转拨盘（剪映）：圆里一根指针指着现在的角度，按住绕圈拖就转（一步撤销）。
+    fn render_rotation_dial(rotation: f32, cx: &Context<'_, Self>) -> gpui_kit::AnyElement {
+        let this = cx.entity();
+        div()
+            .id("tf-rotate-dial")
+            .test_support()
+            .size(px(DIAL_PX))
+            .flex_none()
+            .cursor_pointer()
+            .child(
+                gpui_kit::canvas(
+                    move |bounds, _, cx| {
+                        // 只在位置变了时写回（每帧都写会让工作区每帧都算「改过」）
+                        if this.read(cx).inspector.transform.dial != bounds {
+                            this.update(cx, |w, _| w.inspector.transform.dial = bounds);
+                        }
+                    },
+                    move |bounds, (), window, _| {
+                        let c = bounds.center();
+                        let r = f32::from(bounds.size.width) / 2.0;
+                        window.paint_quad(
+                            gpui_kit::outline(
+                                bounds,
+                                crate::theme::palette::tick(),
+                                gpui_kit::BorderStyle::Solid,
+                            )
+                            .corner_radii(px(r)),
+                        );
+                        // 指针：0° 朝上，顺时针为正
+                        let a = rotation.to_radians();
+                        let tip = gpui_kit::point(
+                            c.x + px(a.sin() * (r - 3.0)),
+                            c.y - px(a.cos() * (r - 3.0)),
+                        );
+                        let mut needle = gpui_kit::PathBuilder::stroke(px(1.5));
+                        needle.move_to(c);
+                        needle.line_to(tip);
+                        if let Ok(path) = needle.build() {
+                            window.paint_path(path, crate::theme::palette::accent());
+                        }
+                    },
+                )
+                .size_full(),
+            )
+            .on_mouse_down(
+                gpui_kit::MouseButton::Left,
+                cx.listener(|this, e: &gpui_kit::MouseDownEvent, window, cx| {
+                    this.inspector.transform.dialing =
+                        this.bound_visual_clip().map(|(_, t, _)| t.rotation);
+                    this.dial_to(e.position, window, cx);
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(|this, e: &gpui_kit::MouseMoveEvent, window, cx| {
+                    if this.inspector.transform.dialing.is_some() {
+                        this.dial_to(e.position, window, cx);
+                    }
+                }),
+            )
+            .on_mouse_up(
+                gpui_kit::MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.end_dial(cx)),
+            )
+            .on_mouse_up_out(
+                gpui_kit::MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.end_dial(cx)),
+            )
+            .into_any_element()
+    }
+
+    /// 拨盘拖到 `p`：角度 = 指针相对拨盘中心的方向（0° 朝上、顺时针），取整到 1°。
+    fn dial_to(
+        &mut self,
+        p: gpui_kit::Point<gpui_kit::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((clip, current, at)) = self.bound_visual_clip() else {
+            return;
+        };
+        let c = self.inspector.transform.dial.center();
+        let (dx, dy) = (f32::from(p.x - c.x), f32::from(p.y - c.y));
+        if dx.hypot(dy) < 1.0 {
+            return;
+        }
+        let deg = wrap_degrees(dx.atan2(-dy).to_degrees().round());
+        if !self.inspector.transform.scale_gesture {
+            self.doc.begin_gesture();
+            self.inspector.transform.scale_gesture = true;
+        }
+        let t = Transform {
+            rotation: deg,
+            ..current
+        };
+        let _ = self.doc.edit(|p| apply_transform_at(p, clip, at, t));
+        self.after_change(window, cx);
+    }
+
+    fn end_dial(&mut self, cx: &mut Context<'_, Self>) {
+        if self.inspector.transform.dialing.take().is_some() {
+            if self.inspector.transform.scale_gesture {
+                self.doc.end_gesture();
+                self.inspector.transform.scale_gesture = false;
+            }
+            cx.notify();
+        }
+    }
+
+    /// 「等比缩放」开关：关掉后出现「缩放 Y」；打开时横竖比例回到 1。
+    fn toggle_uniform(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some((clip, current, at)) = self.bound_visual_clip() else {
+            return;
+        };
+        if self.uniform_shown(&current) {
+            self.inspector.transform.uniform = false;
+            cx.notify();
+        } else {
+            self.inspector.transform.uniform = true;
+            let t = Transform {
+                stretch: 1.0,
+                ..current
+            };
+            self.apply(window, cx, |p| apply_transform_at(p, clip, at, t));
+        }
+    }
+
+    /// 「等比缩放」显示成开着：开关开着、片段也是等比的。
+    fn uniform_shown(&self, t: &Transform) -> bool {
+        self.inspector.transform.uniform && (t.stretch - 1.0).abs() < 1e-4
+    }
+
+    /// 「等比缩放」开关，关着时下面再一行「缩放 Y」。
+    fn render_uniform_rows(
+        &self,
+        t: &Transform,
+        cx: &Context<'_, Self>,
+    ) -> Vec<gpui_kit::AnyElement> {
+        let muted = cx.theme().muted_foreground;
+        let uniform = self.uniform_shown(t);
+        let toggle = h_flex()
+            .justify_end()
+            .child(
+                crate::chrome::chip("tf-uniform", "等比缩放", uniform, cx)
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_uniform(window, cx))),
+            )
+            .into_any_element();
+        let mut rows = vec![toggle];
+        if !uniform {
+            let s = &self.inspector.transform.scale_y;
+            rows.push(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .w(px(64.))
+                            .text_xs()
+                            .text_color(muted)
+                            .child("缩放 Y %"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .id("tf-scale-y")
+                            .test_support()
+                            .child(Slider::new(s)),
+                    )
+                    .child(self.value_box(
+                        "tf-scale-y",
+                        s,
+                        format!("{:.0}%", t.scale * t.stretch * 100.0),
+                        48.0,
+                        cx,
+                    ))
+                    .into_any_element(),
+            );
+        }
+        rows
     }
 
     /// 数值框的「−」「+」：改这一格、立即提交（一步撤销）。
@@ -689,10 +934,10 @@ impl Workspace {
 
     /// 「混合」组：不透明度（混合模式见画面合成）。
     fn render_blend_group(&self, t: &Transform, cx: &Context<'_, Self>) -> gpui_kit::AnyElement {
-        let opacity = self.opacity_row(t.opacity);
+        let opacity = self.opacity_row(t.opacity, cx);
         let blended = self
-            .bound_video_clip()
-            .and_then(|(clip, ..)| self.doc.project.timeline.find_clip(clip))
+            .bound_look_clip()
+            .and_then(|clip| self.doc.project.timeline.find_clip(clip))
             .is_some_and(|(_, c)| c.look.blend != ve_core::BlendMode::Normal);
         let body = v_flex()
             .gap_2()
@@ -782,6 +1027,12 @@ impl Workspace {
                     .into_any_element(),
                 KeyGroup::Scale,
             ))
+            .children(
+                (!subtitle)
+                    .then(|| self.render_uniform_rows(&t, cx))
+                    .into_iter()
+                    .flatten(),
+            )
             .child(line(
                 "位置 %",
                 h_flex()
@@ -798,7 +1049,13 @@ impl Workspace {
             .children((!subtitle).then(|| {
                 line(
                     "旋转 °",
-                    number("tf-rotation", StepField::Rotation).into_any_element(),
+                    h_flex()
+                        .flex_1()
+                        .gap_2()
+                        .items_center()
+                        .child(Self::render_rotation_dial(t.rotation, cx))
+                        .child(number("tf-rotation", StepField::Rotation))
+                        .into_any_element(),
                     KeyGroup::Rotation,
                 )
             }))
@@ -837,7 +1094,7 @@ impl Workspace {
     }
 
     /// 不透明度：滑块 + 百分比。
-    fn opacity_row(&self, opacity: f32) -> gpui_kit::AnyElement {
+    fn opacity_row(&self, opacity: f32, cx: &Context<'_, Self>) -> gpui_kit::AnyElement {
         h_flex()
             .flex_1()
             .gap_2()
@@ -848,12 +1105,13 @@ impl Workspace {
                     .test_support()
                     .child(Slider::new(&self.inspector.transform.opacity)),
             )
-            .child(
-                div()
-                    .w(px(48.))
-                    .text_sm()
-                    .child(SharedString::from(format!("{}%", pct(opacity)))),
-            )
+            .child(self.value_box(
+                "tf-opacity",
+                &self.inspector.transform.opacity,
+                format!("{}%", pct(opacity)),
+                48.0,
+                cx,
+            ))
             .into_any_element()
     }
 }

@@ -3,7 +3,7 @@
 //! 每个属性单独一串关键帧（时间相对片段起点）；没有关键帧的属性用片段原来的固定值。
 //! 求值是两端值按缓动曲线的凸组合，结果再整理成合法的画面属性（见 [`Animation::apply`]）。
 
-use crate::{AdjustItem, ColorAdjust, Time, Transform};
+use crate::{AdjustExtra, AdjustItem, ColorAdjust, Time, Transform};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -118,6 +118,68 @@ pub enum Prop {
     MaskRound,
     /// 画面特效强度。
     EffectAmount,
+    /// HSL 红色的色相。
+    HslRedHue,
+    /// HSL 红色的饱和度。
+    HslRedSat,
+    /// HSL 红色的亮度。
+    HslRedLight,
+    /// HSL 橙色的色相。
+    HslOrangeHue,
+    /// HSL 橙色的饱和度。
+    HslOrangeSat,
+    /// HSL 橙色的亮度。
+    HslOrangeLight,
+    /// HSL 黄色的色相。
+    HslYellowHue,
+    /// HSL 黄色的饱和度。
+    HslYellowSat,
+    /// HSL 黄色的亮度。
+    HslYellowLight,
+    /// HSL 绿色的色相。
+    HslGreenHue,
+    /// HSL 绿色的饱和度。
+    HslGreenSat,
+    /// HSL 绿色的亮度。
+    HslGreenLight,
+    /// HSL 青色的色相。
+    HslCyanHue,
+    /// HSL 青色的饱和度。
+    HslCyanSat,
+    /// HSL 青色的亮度。
+    HslCyanLight,
+    /// HSL 蓝色的色相。
+    HslBlueHue,
+    /// HSL 蓝色的饱和度。
+    HslBlueSat,
+    /// HSL 蓝色的亮度。
+    HslBlueLight,
+    /// HSL 紫色的色相。
+    HslPurpleHue,
+    /// HSL 紫色的饱和度。
+    HslPurpleSat,
+    /// HSL 紫色的亮度。
+    HslPurpleLight,
+    /// HSL 品红色的色相。
+    HslMagentaHue,
+    /// HSL 品红色的饱和度。
+    HslMagentaSat,
+    /// HSL 品红色的亮度。
+    HslMagentaLight,
+    /// 高光（调色「基础」，-1–1）。
+    Highlights,
+    /// 阴影（调色）。
+    Shadows,
+    /// 光感（调色）。
+    Light,
+    /// 锐化（调色，0–1）。
+    Sharpen,
+    /// 颗粒（调色，0–1）。
+    Grain,
+    /// 暗角（调色，-1–1）。
+    Vignette,
+    /// 横竖比例（高相对宽多缩放的比例，画面属性）。
+    Stretch,
 }
 
 /// 属性面板里一行一个关键帧按钮（剪映电脑版按属性打帧）：位置（X、Y 一起）、缩放、旋转、
@@ -142,6 +204,12 @@ pub enum KeyGroup {
     Look(Prop),
     /// 画面特效的强度。
     Effect,
+    /// HSL 的一项（「调整 › HSL」某个颜色的色相 / 饱和度 / 亮度，[`Prop::HSL`] 里的一个）。
+    Hsl(Prop),
+    /// 「基础调节」整组（组标题上的 ‹ ◇ ›）：亮度到暗角 11 项一起。
+    AdjustAll,
+    /// 调色「基础」里另外六项的一项（高光、阴影、光感、锐化、颗粒、暗角）。
+    Extra(AdjustExtra),
 }
 
 impl KeyGroup {
@@ -159,7 +227,8 @@ impl KeyGroup {
     pub const fn props(self) -> &'static [Prop] {
         match self {
             Self::Position => &[Prop::X, Prop::Y],
-            Self::Scale => &[Prop::Scale],
+            // 「缩放 Y」（横竖比例）和缩放共用一个 ◇
+            Self::Scale => &[Prop::Scale, Prop::Stretch],
             Self::Rotation => &[Prop::Rotation],
             Self::Opacity => &[Prop::Opacity],
             Self::Crop => &[
@@ -176,7 +245,46 @@ impl KeyGroup {
             Self::Volume => &[Prop::Volume],
             Self::Effect => &[Prop::EffectAmount],
             Self::Look(p) => look_slice(p),
+            Self::Hsl(p) => hsl_slice(p),
+            Self::AdjustAll => &Prop::ADJUST_ALL,
+            Self::Extra(AdjustExtra::Highlights) => &[Prop::Highlights],
+            Self::Extra(AdjustExtra::Shadows) => &[Prop::Shadows],
+            Self::Extra(AdjustExtra::Light) => &[Prop::Light],
+            Self::Extra(AdjustExtra::Sharpen) => &[Prop::Sharpen],
+            Self::Extra(AdjustExtra::Grain) => &[Prop::Grain],
+            Self::Extra(AdjustExtra::Vignette) => &[Prop::Vignette],
         }
+    }
+}
+
+/// 一个 HSL 属性自己组成的一组。
+const fn hsl_slice(p: Prop) -> &'static [Prop] {
+    match p {
+        Prop::HslRedHue => &[Prop::HslRedHue],
+        Prop::HslRedSat => &[Prop::HslRedSat],
+        Prop::HslRedLight => &[Prop::HslRedLight],
+        Prop::HslOrangeHue => &[Prop::HslOrangeHue],
+        Prop::HslOrangeSat => &[Prop::HslOrangeSat],
+        Prop::HslOrangeLight => &[Prop::HslOrangeLight],
+        Prop::HslYellowHue => &[Prop::HslYellowHue],
+        Prop::HslYellowSat => &[Prop::HslYellowSat],
+        Prop::HslYellowLight => &[Prop::HslYellowLight],
+        Prop::HslGreenHue => &[Prop::HslGreenHue],
+        Prop::HslGreenSat => &[Prop::HslGreenSat],
+        Prop::HslGreenLight => &[Prop::HslGreenLight],
+        Prop::HslCyanHue => &[Prop::HslCyanHue],
+        Prop::HslCyanSat => &[Prop::HslCyanSat],
+        Prop::HslCyanLight => &[Prop::HslCyanLight],
+        Prop::HslBlueHue => &[Prop::HslBlueHue],
+        Prop::HslBlueSat => &[Prop::HslBlueSat],
+        Prop::HslBlueLight => &[Prop::HslBlueLight],
+        Prop::HslPurpleHue => &[Prop::HslPurpleHue],
+        Prop::HslPurpleSat => &[Prop::HslPurpleSat],
+        Prop::HslPurpleLight => &[Prop::HslPurpleLight],
+        Prop::HslMagentaHue => &[Prop::HslMagentaHue],
+        Prop::HslMagentaSat => &[Prop::HslMagentaSat],
+        Prop::HslMagentaLight => &[Prop::HslMagentaLight],
+        _ => &[],
     }
 }
 
@@ -204,10 +312,11 @@ const fn look_slice(p: Prop) -> &'static [Prop] {
 
 impl Prop {
     /// 画面属性的全部字段。
-    pub const TRANSFORM: [Self; 9] = [
+    pub const TRANSFORM: [Self; 10] = [
         Self::X,
         Self::Y,
         Self::Scale,
+        Self::Stretch,
         Self::Rotation,
         Self::Opacity,
         Self::CropLeft,
@@ -224,6 +333,45 @@ impl Prop {
         Self::Temperature,
         Self::Tint,
     ];
+
+    /// 调色「基础」里另外六项。
+    pub const ADJUST_EXTRA: [Self; 6] = [
+        Self::Highlights,
+        Self::Shadows,
+        Self::Light,
+        Self::Sharpen,
+        Self::Grain,
+        Self::Vignette,
+    ];
+
+    /// 调色「基础」全部 11 项（组标题 ◇ 管的）。
+    pub const ADJUST_ALL: [Self; 11] = [
+        Self::Brightness,
+        Self::Contrast,
+        Self::Saturation,
+        Self::Temperature,
+        Self::Tint,
+        Self::Highlights,
+        Self::Shadows,
+        Self::Light,
+        Self::Sharpen,
+        Self::Grain,
+        Self::Vignette,
+    ];
+
+    /// 对应的另外六项调色（不是时 `None`）。
+    #[must_use]
+    pub const fn adjust_extra(self) -> Option<AdjustExtra> {
+        match self {
+            Self::Highlights => Some(AdjustExtra::Highlights),
+            Self::Shadows => Some(AdjustExtra::Shadows),
+            Self::Light => Some(AdjustExtra::Light),
+            Self::Sharpen => Some(AdjustExtra::Sharpen),
+            Self::Grain => Some(AdjustExtra::Grain),
+            Self::Vignette => Some(AdjustExtra::Vignette),
+            _ => None,
+        }
+    }
 
     /// 对应的调色项（不是调色属性时 `None`）。
     #[must_use]
@@ -246,6 +394,7 @@ impl Prop {
             Self::X
                 | Self::Y
                 | Self::Scale
+                | Self::Stretch
                 | Self::Rotation
                 | Self::Opacity
                 | Self::CropLeft
@@ -262,6 +411,7 @@ impl Prop {
             Self::X => t.x,
             Self::Y => t.y,
             Self::Scale => t.scale,
+            Self::Stretch => t.stretch,
             Self::Rotation => t.rotation,
             Self::Opacity => t.opacity,
             Self::CropLeft => t.crop.left,
@@ -278,6 +428,7 @@ impl Prop {
             Self::X => t.x = value,
             Self::Y => t.y = value,
             Self::Scale => t.scale = value,
+            Self::Stretch => t.stretch = value,
             Self::Rotation => t.rotation = value,
             Self::Opacity => t.opacity = value,
             Self::CropLeft => t.crop.left = value,
@@ -398,6 +549,57 @@ impl Prop {
         }
     }
 
+    /// HSL 的 24 项（8 个颜色 × 色相、饱和度、亮度）。
+    pub const HSL: [Self; 24] = [
+        Self::HslRedHue,
+        Self::HslRedSat,
+        Self::HslRedLight,
+        Self::HslOrangeHue,
+        Self::HslOrangeSat,
+        Self::HslOrangeLight,
+        Self::HslYellowHue,
+        Self::HslYellowSat,
+        Self::HslYellowLight,
+        Self::HslGreenHue,
+        Self::HslGreenSat,
+        Self::HslGreenLight,
+        Self::HslCyanHue,
+        Self::HslCyanSat,
+        Self::HslCyanLight,
+        Self::HslBlueHue,
+        Self::HslBlueSat,
+        Self::HslBlueLight,
+        Self::HslPurpleHue,
+        Self::HslPurpleSat,
+        Self::HslPurpleLight,
+        Self::HslMagentaHue,
+        Self::HslMagentaSat,
+        Self::HslMagentaLight,
+    ];
+
+    /// 某个颜色的色相 / 饱和度 / 亮度。
+    #[must_use]
+    pub const fn hsl(band: crate::HslBand, channel: crate::HslChannel) -> Self {
+        let c = match channel {
+            crate::HslChannel::Hue => 0,
+            crate::HslChannel::Saturation => 1,
+            crate::HslChannel::Lightness => 2,
+        };
+        Self::HSL[band.index() * 3 + c]
+    }
+
+    /// 是 HSL 的哪一项（不是时 `None`）。
+    #[must_use]
+    pub fn hsl_target(self) -> Option<(crate::HslBand, crate::HslChannel)> {
+        let i = Self::HSL.iter().position(|p| *p == self)?;
+        let channel = [
+            crate::HslChannel::Hue,
+            crate::HslChannel::Saturation,
+            crate::HslChannel::Lightness,
+        ][i % 3];
+        Some((crate::HslBand::ALL[i / 3], channel))
+    }
+
     /// 是外观属性。
     #[must_use]
     pub fn is_look(self) -> bool {
@@ -416,6 +618,18 @@ impl Prop {
                 | Self::MaskRotation
                 | Self::ShadowAngle => true,
                 Self::Scale => (Transform::SCALE_RANGE.0..=Transform::SCALE_RANGE.1).contains(&v),
+                Self::Stretch => {
+                    (Transform::STRETCH_RANGE.0..=Transform::STRETCH_RANGE.1).contains(&v)
+                }
+                Self::Highlights
+                | Self::Shadows
+                | Self::Light
+                | Self::Sharpen
+                | Self::Grain
+                | Self::Vignette => self.adjust_extra().is_some_and(|x| {
+                    let (lo, hi) = x.range();
+                    (lo..=hi).contains(&v)
+                }),
                 Self::Opacity
                 | Self::Radius
                 | Self::ShadowOpacity
@@ -431,7 +645,31 @@ impl Prop {
                 | Self::Contrast
                 | Self::Saturation
                 | Self::Temperature
-                | Self::Tint => (-1.0..=1.0).contains(&v),
+                | Self::Tint
+                | Self::HslRedHue
+                | Self::HslRedSat
+                | Self::HslRedLight
+                | Self::HslOrangeHue
+                | Self::HslOrangeSat
+                | Self::HslOrangeLight
+                | Self::HslYellowHue
+                | Self::HslYellowSat
+                | Self::HslYellowLight
+                | Self::HslGreenHue
+                | Self::HslGreenSat
+                | Self::HslGreenLight
+                | Self::HslCyanHue
+                | Self::HslCyanSat
+                | Self::HslCyanLight
+                | Self::HslBlueHue
+                | Self::HslBlueSat
+                | Self::HslBlueLight
+                | Self::HslPurpleHue
+                | Self::HslPurpleSat
+                | Self::HslPurpleLight
+                | Self::HslMagentaHue
+                | Self::HslMagentaSat
+                | Self::HslMagentaLight => (-1.0..=1.0).contains(&v),
                 Self::Volume => (VOLUME_RANGE_DB.0..=VOLUME_RANGE_DB.1).contains(&v),
                 Self::StrokeWidth | Self::ShadowBlur | Self::ShadowDistance => {
                     (0.0..=0.1).contains(&v)
@@ -483,6 +721,23 @@ impl Animation {
         all
     }
 
+    /// 把 `from` 处所有属性的关键帧挪到 `to`（缓动跟着走；`to` 处原来有的被盖掉）。返回是否挪了。
+    pub fn move_keys(&mut self, from: Time, to: Time) -> bool {
+        let mut moved = false;
+        for keys in self.tracks.values_mut() {
+            let Some(i) = keys.iter().position(|k| k.at == from) else {
+                continue;
+            };
+            let mut k = keys.remove(i);
+            k.at = to;
+            keys.retain(|other| other.at != to);
+            let j = keys.partition_point(|other| other.at < to);
+            keys.insert(j, k);
+            moved = true;
+        }
+        moved
+    }
+
     /// 换掉某个属性的全部关键帧（`keys` 为空时这个属性不再有动画）。`keys` 要按时间排好。
     pub fn set_keys(&mut self, prop: Prop, keys: Vec<Key>) {
         if keys.is_empty() {
@@ -517,6 +772,11 @@ impl Animation {
         for prop in Prop::ADJUST {
             if let (Some(item), Some(v)) = (prop.adjust_item(), self.value_at(prop, at)) {
                 item.set(&mut a, v);
+            }
+        }
+        for prop in Prop::ADJUST_EXTRA {
+            if let (Some(x), Some(v)) = (prop.adjust_extra(), self.value_at(prop, at)) {
+                x.set(&mut a, v);
             }
         }
         a
@@ -587,6 +847,15 @@ impl Animation {
         }
         self.tracks.retain(|_, keys| !keys.is_empty());
         removed
+    }
+
+    /// 所有关键帧的时间按 `f` 换算（`f` 单调递增；曲线变速的复合片段摊开时用）。
+    pub fn map_times(&mut self, f: impl Fn(Time) -> Time) {
+        for keys in self.tracks.values_mut() {
+            for k in keys.iter_mut() {
+                k.at = f(k.at);
+            }
+        }
     }
 
     /// 所有关键帧的时间乘 `factor`（变速时动画跟着内容伸缩）。
@@ -936,7 +1205,7 @@ mod tests {
             p.set(&mut t, v);
             assert!((p.get(&t) - v).abs() < 1e-6, "{p:?}");
         }
-        assert!((t.crop.bottom - 0.09).abs() < 1e-6 && (t.rotation - 0.04).abs() < 1e-6);
+        assert!((t.crop.bottom - 0.10).abs() < 1e-6 && (t.rotation - 0.05).abs() < 1e-6);
     }
 
     #[test]

@@ -59,7 +59,7 @@ impl Workspace {
     }
 
     /// ◆：播放头不在关键帧上时打一个，在关键帧上时删掉它。
-    fn toggle_keyframe(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+    pub(crate) fn toggle_keyframe(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some(k) = self.key_state().filter(|k| k.on_clip) else {
             return;
         };
@@ -240,6 +240,18 @@ impl Workspace {
             KeyGroup::Volume => "volume",
             KeyGroup::Effect => "effect",
             KeyGroup::Look(p) => look_key_name(p),
+            KeyGroup::AdjustAll => "adjust-all",
+            KeyGroup::Extra(ve_core::AdjustExtra::Highlights) => "highlights",
+            KeyGroup::Extra(ve_core::AdjustExtra::Shadows) => "shadows",
+            KeyGroup::Extra(ve_core::AdjustExtra::Light) => "light",
+            KeyGroup::Extra(ve_core::AdjustExtra::Sharpen) => "sharpen",
+            KeyGroup::Extra(ve_core::AdjustExtra::Grain) => "grain",
+            KeyGroup::Extra(ve_core::AdjustExtra::Vignette) => "vignette",
+            KeyGroup::Hsl(p) => match p.hsl_target().map(|(_, ch)| ch) {
+                Some(ve_core::HslChannel::Hue) => "hsl-hue",
+                Some(ve_core::HslChannel::Saturation) => "hsl-sat",
+                _ => "hsl-light",
+            },
         };
         let id = |suffix: &str| -> gpui_kit::SharedString {
             if suffix.is_empty() {

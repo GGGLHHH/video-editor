@@ -215,6 +215,71 @@ impl Workspace {
         });
     }
 
+    /// 选中的片段是不是正好是一个组合（都在同一组里）。
+    pub(crate) fn selection_is_one_group(&self) -> bool {
+        let tl = &self.doc.project.timeline;
+        let groups: Vec<Option<u32>> = self
+            .doc
+            .selection()
+            .iter()
+            .map(|&id| tl.find_clip(id).and_then(|(_, c)| c.group))
+            .collect();
+        groups.first().copied().flatten().is_some() && groups.windows(2).all(|w| w[0] == w[1])
+    }
+
+    /// Ctrl+G：把选中的片段组合起来；已经是一个组合时取消组合（一步撤销）。
+    pub(crate) fn group_clips(
+        &mut self,
+        _: &act::GroupClips,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let clips = self.doc.selection().to_vec();
+        if self.selection_is_one_group() {
+            self.apply(window, cx, |p| ve_core::edit::ungroup_clips(p, &clips));
+        } else if clips.len() >= 2 {
+            self.apply(window, cx, |p| {
+                ve_core::edit::group_clips(p, &clips).map(|_| ())
+            });
+        } else {
+            crate::workspace::notify(Notification::warning("先选中两段以上再组合"), window, cx);
+        }
+    }
+
+    /// Alt+M：播放头处的标记换下一个颜色（一步撤销）。
+    pub(crate) fn marker_color(
+        &mut self,
+        _: &act::MarkerColor,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let at = self
+            .doc
+            .project
+            .settings
+            .frame_rate
+            .snap(self.engine.position());
+        if self
+            .doc
+            .project
+            .timeline
+            .markers
+            .binary_search(&at)
+            .is_err()
+        {
+            crate::workspace::notify(
+                Notification::warning("播放头处没有标记（按 M 加一个）"),
+                window,
+                cx,
+            );
+            return;
+        }
+        self.apply(window, cx, |p| {
+            p.timeline.cycle_marker_color(at);
+            Ok(())
+        });
+    }
+
     pub(crate) fn next_marker(
         &mut self,
         _: &act::NextMarker,

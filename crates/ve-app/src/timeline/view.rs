@@ -17,8 +17,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use ve_core::{AssetId, ClipContent, ClipId, Project, Time, TrackKind};
 
+/// 标尺上离标记这么近（像素）按下就是拖标记。
+const MARKER_HIT_PX: f32 = 6.0;
+
 /// 按下后鼠标挪开这么远（像素）才算拖起来，开始贴边自动滚。
 const DRAG_START_PX: f32 = 4.0;
+
+/// 「时间轴声音」开关（剪映）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrubSound {
+    /// 开（默认）：暂停时拖动播放头放一小段声音。
+    #[default]
+    On,
+    /// 关。
+    Off,
+}
 
 /// 时间轴视图状态。
 #[derive(Debug, Default)]
@@ -50,6 +63,12 @@ pub struct TimelineUi {
     /// 按下的位置（时间轴本地坐标）：按下后鼠标还没真的挪开（几像素以内）时不贴边自动滚，
     /// 免得在边缘单击一下片段就被挪走；挪开过一次就清掉。
     pub pressed_at: Option<(f32, f32)>,
+    /// 正在拖的关键帧小菱形：（片段，它现在在片段里的时间）。
+    pub key_drag: Option<(ClipId, Time)>,
+    /// 正在标尺上拖的标记（现在的位置）。
+    pub marker_drag: Option<Time>,
+    /// 正在拖的音频淡入（`true`）/ 淡出（`false`）拖点。
+    pub fade_drag: Option<(ClipId, bool)>,
     /// 播放时跟着播放头翻页（用户自己滚走时不拉回）。
     pub follow: super::geometry::PlayFollow,
     /// 正在拖横向滚动条：（按下时的横坐标，按下时的横向滚动）。
@@ -60,6 +79,8 @@ pub struct TimelineUi {
     pub tool_menu: bool,
     /// 预览轴开着（S）。
     pub preview_axis: bool,
+    /// 「时间轴声音」：暂停时拖动播放头放不放一小段声音。
+    pub scrub_sound: ScrubSound,
     /// 鼠标悬停处的时刻（在轨道区域里时）。
     pub hover_time: Option<Time>,
     /// 预览轴正在预览：真正的播放头位置（鼠标离开时回到这里）。
@@ -197,6 +218,8 @@ impl Workspace {
     ) {
         self.focus.focus(window, cx);
         self.end_preview_axis();
+        // 单独预览素材时点时间轴：回到时间轴
+        self.end_asset_preview(cx);
         let (x, y) = self.local(e.position);
         let geo = self.timeline.geometry;
         if y >= geo.ruler_height
@@ -207,6 +230,29 @@ impl Workspace {
                 cx,
             )
         {
+            return;
+        }
+        if self.start_marker_drag(&geo, x, y, cx) {
+            return;
+        }
+        // 音频片段上沿两头的淡入 / 淡出拖点
+        if let Some(handle) = geo.fade_handle_at(x, y, &self.doc.project.timeline) {
+            self.doc.begin_gesture();
+            self.timeline.fade_drag = Some(handle);
+            cx.notify();
+            return;
+        }
+        // 选中片段中部的关键帧小菱形：跳到那一帧，按住拖就挪它
+        if let Some((clip, t)) =
+            geo.keyframe_at(x, y, &self.doc.project.timeline, self.doc.selection())
+            && let Some((_, c)) = self.doc.project.timeline.find_clip(clip)
+        {
+            let at = c.start + t;
+            self.doc.begin_gesture();
+            self.timeline.key_drag = Some((clip, t));
+            self.engine.pause();
+            self.seek(at, cx);
+            cx.notify();
             return;
         }
         let toggle = e.modifiers.control || e.modifiers.platform;
@@ -263,7 +309,7 @@ impl Workspace {
         {
             let out = d.update(&mut self.doc, &geo, x, y, self.playhead, true);
             if let Some(t) = out.seek {
-                self.seek(t, cx);
+                self.scrub_to(t, cx);
             }
         }
         self.after_change(window, cx);
@@ -314,6 +360,51 @@ impl Workspace {
             cx.notify();
             return;
         }
+        if let Some((clip, fade_in)) = self.timeline.fade_drag {
+            if pressed {
+                self.drag_fade(clip, fade_in, x, window, cx);
+            } else {
+                self.timeline_mouse_up(window, cx);
+            }
+            return;
+        }
+        if let Some(from) = self.timeline.marker_drag {
+            if pressed {
+                let to = self
+                    .doc
+                    .project
+                    .settings
+                    .frame_rate
+                    .snap(self.timeline.geometry.x_to_time(x))
+                    .max(Time::ZERO);
+                if to != from
+                    && self
+                        .doc
+                        .edit(|p| {
+                            if p.timeline.move_marker(from, to) {
+                                Ok(())
+                            } else {
+                                Err(ve_core::EditError::InvalidValue)
+                            }
+                        })
+                        .is_ok()
+                {
+                    self.timeline.marker_drag = Some(to);
+                    self.after_change(window, cx);
+                }
+            } else {
+                self.timeline_mouse_up(window, cx);
+            }
+            return;
+        }
+        if let Some((clip, from)) = self.timeline.key_drag {
+            if pressed {
+                self.drag_keyframe(clip, from, x, window, cx);
+            } else {
+                self.timeline_mouse_up(window, cx);
+            }
+            return;
+        }
         if self.timeline.marquee.is_some() || self.timeline.drag.is_some() {
             if !pressed {
                 // 在窗口外松开时收不到 mouse up：移动时发现左键已松开，就当作松开处理
@@ -346,6 +437,72 @@ impl Workspace {
         self.drag_to(x, y, window, cx);
     }
 
+    /// 拖淡入 / 淡出拖点到横坐标 `x`：对齐到帧，淡入淡出加起来不超过片段长度。
+    fn drag_fade(
+        &mut self,
+        clip: ClipId,
+        fade_in: bool,
+        x: f32,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((_, c)) = self.doc.project.timeline.find_clip(clip) else {
+            return;
+        };
+        let rate = self.doc.project.settings.frame_rate;
+        let t = rate.snap(self.timeline.geometry.x_to_time(x));
+        let (fin, fout) = if fade_in {
+            (
+                (t - c.start).clamp(Time::ZERO, c.duration - c.fade_out),
+                c.fade_out,
+            )
+        } else {
+            (
+                c.fade_in,
+                (c.end() - t).clamp(Time::ZERO, c.duration - c.fade_in),
+            )
+        };
+        if (fin, fout) != (c.fade_in, c.fade_out)
+            && self
+                .doc
+                .edit(|p| ve_core::edit::set_fades(p, clip, fin, fout))
+                .is_ok()
+        {
+            self.after_change(window, cx);
+        }
+    }
+
+    /// 拖关键帧小菱形到横坐标 `x`：对齐到帧，夹在片段里（最多到最后一帧），这一刻所有属性的
+    /// 关键帧一起挪过去，播放头跟着。
+    fn drag_keyframe(
+        &mut self,
+        clip: ClipId,
+        from: Time,
+        x: f32,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((_, c)) = self.doc.project.timeline.find_clip(clip) else {
+            return;
+        };
+        let rate = self.doc.project.settings.frame_rate;
+        let (start, last) = (
+            c.start,
+            (c.duration - rate.frame_duration()).max(Time::ZERO),
+        );
+        let to = (rate.snap(self.timeline.geometry.x_to_time(x)) - start).clamp(Time::ZERO, last);
+        if to != from
+            && self
+                .doc
+                .edit(|p| ve_core::edit::move_keyframes(p, clip, from, to))
+                .is_ok()
+        {
+            self.timeline.key_drag = Some((clip, to));
+            self.seek(start + to, cx);
+            self.after_change(window, cx);
+        }
+    }
+
     /// 框选 / 拖动跟到时间轴本地坐标 `(x, y)`（鼠标移动、贴边自动滚以后都走这里）。
     fn drag_to(&mut self, x: f32, y: f32, window: &mut Window, cx: &mut Context<'_, Self>) {
         let geo = self.timeline.geometry;
@@ -369,7 +526,7 @@ impl Workspace {
         self.timeline.snap_line = out.snap;
         self.timeline.insert_line = out.insert;
         if let Some(t) = out.seek {
-            self.seek(t, cx);
+            self.scrub_to(t, cx);
         }
         if self.doc.revision() != revision {
             self.after_change(window, cx);
@@ -430,10 +587,58 @@ impl Workspace {
         }
     }
 
+    /// 标尺上按在标记上（左右 [`MARKER_HIT_PX`] 像素内）：开始拖它（剪映），返回是不是。
+    fn start_marker_drag(
+        &mut self,
+        geo: &TimelineGeometry,
+        x: f32,
+        y: f32,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        if y >= geo.ruler_height {
+            return false;
+        }
+        let Some(m) = self
+            .doc
+            .project
+            .timeline
+            .markers
+            .iter()
+            .copied()
+            .find(|m| (geo.time_to_x(*m) - x).abs() <= MARKER_HIT_PX)
+        else {
+            return false;
+        };
+        self.doc.begin_gesture();
+        self.timeline.marker_drag = Some(m);
+        cx.notify();
+        true
+    }
+
     fn timeline_mouse_up(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.timeline.thumb_drag = None;
-        self.timeline.pressed_at = None;
-        self.timeline.marquee = None;
+        let pressed = self.timeline.pressed_at.take();
+        if self.timeline.key_drag.take().is_some()
+            || self.timeline.fade_drag.take().is_some()
+            || self.timeline.marker_drag.take().is_some()
+        {
+            self.doc.end_gesture();
+            self.after_change(window, cx);
+            return;
+        }
+        // 点轨道空白处（框选没拖开）：播放头跳过去（剪映）
+        if self.timeline.marquee.take().is_some()
+            && let Some((px0, py0)) = pressed
+        {
+            let (x, y) = self.timeline.pointer;
+            if (x - px0).hypot(y - py0) < DRAG_START_PX {
+                let rate = self.doc.project.settings.frame_rate;
+                let t = rate
+                    .snap(self.timeline.geometry.x_to_time(px0))
+                    .max(Time::ZERO);
+                self.seek(t, cx);
+            }
+        }
         let insert = self.timeline.insert_line.take();
         if let Some(drag) = self.timeline.drag.take()
             && let Some(clip) = drag.clip()
@@ -479,6 +684,12 @@ impl Workspace {
         if let Some(m) = self.timeline.marquee.take() {
             self.doc.set_selection(m.before);
             return (true, false);
+        }
+        if self.timeline.key_drag.take().is_some()
+            || self.timeline.fade_drag.take().is_some()
+            || self.timeline.marker_drag.take().is_some()
+        {
+            return (true, true);
         }
         let dragging = self
             .timeline
@@ -740,12 +951,19 @@ fn playhead_color(snapped: bool) -> Hsla {
     }
 }
 
-fn ruler_label(t: Time, step: Time) -> String {
+fn ruler_label(t: Time, step: Time, rate: ve_core::FrameRate) -> String {
     let ms = t.as_millis().max(0);
     let (m, s) = (ms / 60_000, ms / 1000 % 60);
-    // 剪映式：分:秒都补两位（00:01），细刻度再带十分之一秒
-    if step < Time::from_secs(1) {
-        format!("{m:02}:{s:02}.{}", ms / 100 % 10)
+    // 剪映式：分:秒都补两位（00:01）；放大到一秒里有几个刻度时，不在整秒上的刻度写这一秒里的第几帧（15f）
+    if step < Time::from_secs(1) && ms % 1000 != 0 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss,
+            reason = "一秒里的帧号很小"
+        )]
+        let frame = ((ms % 1000) as f64 / 1000.0 * rate.as_f64() + 1e-6).floor() as u64;
+        format!("{frame}f")
     } else {
         format!("{m:02}:{s:02}")
     }
@@ -768,10 +986,40 @@ fn paint_empty_hint(snap: &Snapshot, ox: f32, oy: f32, window: &mut Window, cx: 
         cx,
         "素材拖拽到这里，开始你的大作吧~",
         ox + geo.header_width + 16.0,
-        oy + geo.track_top(i) + geo.track_height / 2.0 - 8.0,
+        oy + geo.track_top(i) + geo.row_height(i) / 2.0 - 8.0,
         12.0,
         palette::tick(),
     );
+}
+
+/// 轨道底色和轨道头（类型图标 + 名字）。
+fn paint_track_rows(snap: &Snapshot, ox: f32, oy: f32, w: f32, window: &mut Window, cx: &mut App) {
+    let geo = snap.geo;
+    let names = super::tracks::track_names(&snap.project.timeline);
+    for (i, label) in names.iter().enumerate() {
+        let y = oy + geo.track_top(i);
+        window.paint_quad(fill(
+            rect(ox, y, w, geo.row_height(i) - 1.0),
+            palette::track_bg(i % 2 == 0),
+        ));
+        window.paint_quad(fill(
+            rect(ox, y, geo.header_width, geo.row_height(i) - 1.0),
+            palette::ruler_bg(),
+        ));
+        let ty = y + geo.row_height(i) / 2.0 - 8.0;
+        // 主轨左边是「封面」按钮，就不画类型图标了（剪映的主轨也是封面在最左）
+        let main = ve_core::magnet::main_track(&snap.project.timeline);
+        let track = snap.project.timeline.tracks.get(i);
+        let label_x = match track {
+            Some(t) if Some(t.id) != main => {
+                let icon = super::tracks::track_icon(t.kind);
+                paint_text(window, cx, icon, ox + 8.0, ty, 12.0, palette::tick());
+                22.0
+            }
+            _ => 10.0,
+        };
+        paint_text(window, cx, label, ox + label_x, ty, 12.0, palette::text());
+    }
 }
 
 fn paint(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
@@ -780,21 +1028,7 @@ fn paint(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut 
     let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
     window.paint_quad(fill(bounds, palette::timeline_bg()));
 
-    // 轨道底色和轨道头
-    let names = super::tracks::track_names(&snap.project.timeline);
-    for (i, label) in names.iter().enumerate() {
-        let y = oy + geo.track_top(i);
-        window.paint_quad(fill(
-            rect(ox, y, w, geo.track_height - 1.0),
-            palette::track_bg(i % 2 == 0),
-        ));
-        window.paint_quad(fill(
-            rect(ox, y, geo.header_width, geo.track_height - 1.0),
-            palette::ruler_bg(),
-        ));
-        let ty = y + geo.track_height / 2.0 - 8.0;
-        paint_text(window, cx, label, ox + 10.0, ty, 12.0, palette::text());
-    }
+    paint_track_rows(snap, ox, oy, w, window, cx);
 
     paint_empty_hint(snap, ox, oy, window, cx);
 
@@ -810,7 +1044,7 @@ fn paint(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut 
                 if x1 < area.origin.x.into() || x0 > ox + w {
                     continue;
                 }
-                let r = rect(x0, y, x1 - x0, geo.track_height - 5.0);
+                let r = rect(x0, y, x1 - x0, geo.row_height(i) - 5.0);
                 paint_clip(snap, clip, track.kind, r, ox, window, cx);
                 // 整条轨不起作用（隐藏的画面 / 字幕轨、静音的音频轨）或锁着：片段压暗
                 let silent = track.kind == TrackKind::Audio && track.muted;
@@ -865,7 +1099,7 @@ fn paint(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut 
                 paint_text(
                     window,
                     cx,
-                    &ruler_label(t, step),
+                    &ruler_label(t, step, snap.project.settings.frame_rate),
                     x + 3.0,
                     oy + 3.0,
                     10.0,
@@ -890,7 +1124,7 @@ fn paint(snap: &Snapshot, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut 
 fn paint_transitions(snap: &Snapshot, ox: f32, oy: f32, window: &mut Window) {
     let geo = snap.geo;
     for (i, track) in snap.project.timeline.tracks.iter().enumerate() {
-        let y = oy + geo.track_top(i) + geo.track_height / 2.0 - 7.0;
+        let y = oy + geo.track_top(i) + geo.row_height(i) / 2.0 - 7.0;
         // 滚到标尺下面去的轨道不画（这里画在标尺之后，否则会压在标尺上）
         if y < oy + geo.ruler_height {
             continue;
@@ -941,15 +1175,18 @@ fn paint_range(snap: &Snapshot, ox: f32, oy: f32, w: f32, window: &mut Window) {
 /// 标记：标尺顶上的青色小旗（剪映）。
 fn paint_markers(snap: &Snapshot, ox: f32, oy: f32, w: f32, window: &mut Window) {
     let geo = snap.geo;
-    for &m in &snap.project.timeline.markers {
+    let tl = &snap.project.timeline;
+    for &m in &tl.markers {
         let x = ox + geo.time_to_x(m);
         if x >= ox + geo.header_width && x <= ox + w {
-            window.paint_quad(
-                fill(rect(x - 4.0, oy + 1.0, 8.0, 7.0), palette::accent()).corner_radii(px(2.0)),
+            let color = gpui_kit::rgb(
+                ve_core::timeline::MARKER_COLORS[usize::from(tl.marker_color(m))
+                    .min(ve_core::timeline::MARKER_COLORS.len() - 1)],
             );
+            window.paint_quad(fill(rect(x - 4.0, oy + 1.0, 8.0, 7.0), color).corner_radii(px(2.0)));
             window.paint_quad(fill(
                 rect(x - 0.5, oy + 1.0, 1.0, geo.ruler_height - 1.0),
-                palette::accent(),
+                color,
             ));
         }
     }
@@ -958,7 +1195,63 @@ fn paint_markers(snap: &Snapshot, ox: f32, oy: f32, w: f32, window: &mut Window)
 /// 选中片段的描边粗细（像素）。
 const SELECTION_BORDER: f32 = 2.0;
 
-/// 片段底部画出关键帧位置（小菱形）。
+/// 片段上的标记：选中的画关键帧小菱形，音频片段画淡入淡出。
+fn paint_marks(
+    clip: &ve_core::Clip,
+    kind: TrackKind,
+    selected: bool,
+    ox: f32,
+    geo: &TimelineGeometry,
+    r: Bounds<Pixels>,
+    window: &mut Window,
+) {
+    if selected {
+        paint_keyframes(clip, ox, geo, r, window);
+    }
+    if kind == TrackKind::Audio {
+        paint_fades(clip, ox, geo, r, window);
+    }
+}
+
+/// 音频片段的淡入淡出：淡化的那段压一个斜着的阴影，上沿两头画拖点。
+fn paint_fades(
+    clip: &ve_core::Clip,
+    ox: f32,
+    geo: &TimelineGeometry,
+    r: Bounds<Pixels>,
+    window: &mut Window,
+) {
+    let (x0, y0) = (f32::from(r.origin.x), f32::from(r.origin.y));
+    let (x1, y1) = (x0 + f32::from(r.size.width), y0 + f32::from(r.size.height));
+    let (fin, fout) = geo.fade_handles(clip);
+    let (fin, fout) = (ox + fin, ox + fout);
+    let top = y0 + super::geometry::FADE_HANDLE_Y;
+    // 淡入：左下角到拖点一条斜线以上压暗；淡出对称
+    let shade = |a: (f32, f32), b: (f32, f32), c: (f32, f32)| {
+        let mut p = gpui_kit::PathBuilder::fill();
+        p.move_to(point(px(a.0), px(a.1)));
+        p.line_to(point(px(b.0), px(b.1)));
+        p.line_to(point(px(c.0), px(c.1)));
+        p.close();
+        p.build()
+    };
+    if clip.fade_in > Time::ZERO
+        && let Ok(p) = shade((x0, y1), (x0, y0), (fin, y0))
+    {
+        window.paint_path(p, palette::fade_shade());
+    }
+    if clip.fade_out > Time::ZERO
+        && let Ok(p) = shade((x1, y1), (x1, y0), (fout, y0))
+    {
+        window.paint_path(p, palette::fade_shade());
+    }
+    for x in [fin, fout] {
+        let dot = Bounds::new(point(px(x - 3.5), px(top - 3.5)), size(px(7.0), px(7.0)));
+        window.paint_quad(fill(dot, palette::text()).corner_radii(px(3.5)));
+    }
+}
+
+/// 选中的片段中部画出关键帧位置（小菱形，剪映）：点一下跳过去，按住能拖。
 fn paint_keyframes(
     clip: &ve_core::Clip,
     ox: f32,
@@ -967,11 +1260,12 @@ fn paint_keyframes(
     window: &mut Window,
 ) {
     const HALF: f32 = 4.5;
-    let y = f32::from(r.origin.y + r.size.height) - HALF - 3.0;
-    // 片段两端的关键帧也整个画在片段里面，不被边缘切掉一半
+    let y = f32::from(r.origin.y) + f32::from(r.size.height) / 2.0;
+    // 片段两端的关键帧也整个画在片段里面，不被边缘切掉一半（和点击判定用同一个距离）
+    let inset = super::geometry::KEY_INSET;
     let (left, right) = (
-        f32::from(r.origin.x) + HALF + 2.0,
-        f32::from(r.origin.x + r.size.width) - HALF - 2.0,
+        f32::from(r.origin.x) + inset,
+        f32::from(r.origin.x + r.size.width) - inset,
     );
     for t in clip.animation.times() {
         let x = (ox + geo.time_to_x(clip.start + t)).clamp(left, right.max(left));
@@ -1000,7 +1294,7 @@ fn paint_ghosts(snap: &Snapshot, ox: f32, oy: f32, window: &mut Window) {
             x0,
             oy + geo.track_top(i) + 2.0,
             x1 - x0,
-            geo.track_height - 5.0,
+            geo.row_height(i) - 5.0,
         );
         window.paint_quad(fill(r, palette::ghost()).corner_radii(px(3.0)));
         window.paint_quad(outline(r, palette::hover(), BorderStyle::Dashed).corner_radii(px(3.0)));
@@ -1011,12 +1305,12 @@ fn paint_ghosts(snap: &Snapshot, ox: f32, oy: f32, window: &mut Window) {
 /// 要套滤镜 / 转场的片段（描边）。
 fn paint_drop(snap: &Snapshot, ox: f32, oy: f32, w: f32, window: &mut Window) {
     let geo = snap.geo;
-    let ghost = |window: &mut Window, top: f32, start: Time, duration: Time| {
+    let ghost = |window: &mut Window, top: f32, h: f32, start: Time, duration: Time| {
         let (x0, x1) = (
             ox + geo.time_to_x(start),
             ox + geo.time_to_x(start + duration),
         );
-        let r = rect(x0, oy + top + 2.0, x1 - x0, geo.track_height - 5.0);
+        let r = rect(x0, oy + top + 2.0, x1 - x0, h - 5.0);
         window.paint_quad(fill(r, palette::drop_preview()).corner_radii(px(3.0)));
         window
             .paint_quad(outline(r, palette::selection(), BorderStyle::Solid).corner_radii(px(3.0)));
@@ -1026,7 +1320,13 @@ fn paint_drop(snap: &Snapshot, ox: f32, oy: f32, w: f32, window: &mut Window) {
             track,
             start,
             duration,
-        }) => ghost(window, geo.track_top(track), start, duration),
+        }) => ghost(
+            window,
+            geo.track_top(track),
+            geo.row_height(track),
+            start,
+            duration,
+        ),
         Some(DropTarget::NewTrack {
             slot,
             start,
@@ -1034,13 +1334,19 @@ fn paint_drop(snap: &Snapshot, ox: f32, oy: f32, w: f32, window: &mut Window) {
         }) => {
             let y = geo.track_top(slot);
             window.paint_quad(fill(rect(ox, oy + y - 1.0, w, 2.0), palette::selection()));
-            ghost(window, y - geo.track_height / 2.0, start, duration);
+            ghost(
+                window,
+                y - geo.track_height / 2.0,
+                geo.track_height,
+                start,
+                duration,
+            );
         }
         Some(DropTarget::Main { track, at }) => {
             let x = ox + geo.time_to_x(at);
             let y = oy + geo.track_top(track);
             window.paint_quad(fill(
-                rect(x - 2.0, y, 4.0, geo.track_height),
+                rect(x - 2.0, y, 4.0, geo.row_height(track)),
                 palette::selection(),
             ));
         }
@@ -1052,7 +1358,7 @@ fn paint_drop(snap: &Snapshot, ox: f32, oy: f32, w: f32, window: &mut Window) {
                         x0,
                         oy + geo.track_top(i) + 2.0,
                         x1 - x0,
-                        geo.track_height - 5.0,
+                        geo.row_height(i) - 5.0,
                     );
                     window.paint_quad(
                         outline(r, palette::selection(), BorderStyle::Solid).corner_radii(px(3.0)),
@@ -1134,9 +1440,24 @@ fn paint_clip(
                 if !m.thumbnails.is_empty() && kind != TrackKind::Audio =>
             {
                 paint_thumbnails(&geo, clip, *source_in, asset.duration, m, r, ox, window);
+                // 带声音的视频：底部一窄条波形（剪映）；音频分离出去了就不画
+                if !m.peaks.is_empty() && !clip.audio_split {
+                    let band = waveform_band(kind, f32::from(r.origin.y), f32::from(r.size.height));
+                    window.paint_quad(fill(
+                        rect(
+                            f32::from(r.origin.x),
+                            band.0,
+                            f32::from(r.size.width),
+                            band.1,
+                        ),
+                        palette::waveform_strip(),
+                    ));
+                    paint_waveform(&geo, clip, *source_in, m, r, band, ox, window);
+                }
             }
             (ClipContent::Media { source_in, .. }, Some(_), Some(m)) if !m.peaks.is_empty() => {
-                paint_waveform(&geo, clip, *source_in, m, r, ox, window);
+                let band = waveform_band(kind, f32::from(r.origin.y), f32::from(r.size.height));
+                paint_waveform(&geo, clip, *source_in, m, r, band, ox, window);
             }
             _ => {}
         }
@@ -1188,7 +1509,7 @@ fn paint_clip(
             11.0,
             palette::text(),
         );
-        paint_keyframes(clip, ox, &geo, r, window);
+        paint_marks(clip, kind, selected, ox, &geo, r, window);
     });
     if !selected && snap.hover == Some(clip.id) {
         window.paint_quad(outline(r, palette::hover(), BorderStyle::Solid).corner_radii(px(3.0)));
@@ -1251,19 +1572,35 @@ fn paint_thumbnails(
 }
 
 /// 波形：每 2 像素一列。
+/// 视频片段底部那条波形多高（像素）。
+const VIDEO_WAVE_HEIGHT: f32 = 12.0;
+
+/// 片段（顶 `y0`、高 `h`）里画波形的那一条：（顶，高）。音频片段铺满标题下面，视频片段只在
+/// 底部画一窄条（上面是缩略图）。
+fn waveform_band(kind: TrackKind, y0: f32, h: f32) -> (f32, f32) {
+    if kind == TrackKind::Audio {
+        (y0 + 16.0, (h - 18.0).max(1.0))
+    } else {
+        let band = VIDEO_WAVE_HEIGHT.min(h);
+        (y0 + h - band, band)
+    }
+}
+
+#[expect(clippy::too_many_arguments, reason = "绘制参数，拆成结构体反而难读")]
 fn paint_waveform(
     geo: &TimelineGeometry,
     clip: &ve_core::Clip,
     source_in: Time,
     m: &MediaThumbs,
     r: Bounds<Pixels>,
+    (band_top, band_h): (f32, f32),
     ox: f32,
     window: &mut Window,
 ) {
-    let (x0, y0) = (f32::from(r.origin.x), f32::from(r.origin.y));
-    let (cw, ch) = (f32::from(r.size.width), f32::from(r.size.height));
-    let mid = y0 + 14.0 + (ch - 14.0) / 2.0;
-    let half = (ch - 18.0) / 2.0;
+    let x0 = f32::from(r.origin.x);
+    let cw = f32::from(r.size.width);
+    let mid = band_top + band_h / 2.0;
+    let half = band_h / 2.0;
     let (left, right) = mask_span(window);
     for k in visible_cells(x0, cw, 2.0, left, right) {
         #[expect(clippy::cast_precision_loss, reason = "列数很少")]
@@ -1291,6 +1628,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn video_clips_get_a_thin_waveform_strip_at_the_bottom() {
+        // 56 像素高的片段：音频片段的波形铺满标题下面，视频片段只在底部画一窄条
+        let (top, h) = waveform_band(TrackKind::Audio, 100.0, 56.0);
+        assert!(
+            (top - 116.0).abs() < 1e-3 && (h - 38.0).abs() < 1e-3,
+            "{top} {h}"
+        );
+        let (top, h) = waveform_band(TrackKind::Video, 100.0, 56.0);
+        assert!((h - VIDEO_WAVE_HEIGHT).abs() < 1e-3 && (top + h - 156.0).abs() < 1e-3);
+    }
+
+    #[test]
     fn only_visible_cells_are_iterated() {
         // 1 小时的片段放大到 2000 px/s：720 万像素宽，只画屏幕上那 1000 像素
         let cells = visible_cells(-3_000_000.0, 7_200_000.0, 2.0, 0.0, 1000.0);
@@ -1305,14 +1654,33 @@ mod tests {
 
     #[test]
     fn ruler_labels_pad_minutes_like_jianying() {
-        assert_eq!(ruler_label(Time::from_secs(1), Time::from_secs(1)), "00:01");
+        let rate = ve_core::FrameRate::new(30, 1);
         assert_eq!(
-            ruler_label(Time::from_secs(75), Time::from_secs(5)),
-            "01:15"
+            ruler_label(Time::from_secs(1), Time::from_secs(1), rate),
+            "00:01"
         );
         assert_eq!(
-            ruler_label(Time::from_secs_f64(2.5), Time::from_secs_f64(0.5)),
-            "00:02.5"
+            ruler_label(Time::from_secs(75), Time::from_secs(5), rate),
+            "01:15"
+        );
+        // 剪映：半秒处写这一秒里的第几帧
+        assert_eq!(
+            ruler_label(Time::from_secs_f64(2.5), Time::from_secs_f64(0.5), rate),
+            "15f"
+        );
+        assert_eq!(
+            ruler_label(Time::from_secs(3), Time::from_secs_f64(0.5), rate),
+            "00:03",
+            "整秒还是写时间"
+        );
+        assert_eq!(
+            ruler_label(
+                Time::from_secs_f64(0.5),
+                Time::from_secs_f64(0.5),
+                ve_core::FrameRate::new(25, 1)
+            ),
+            "12f",
+            "落在第 12 帧里"
         );
     }
 

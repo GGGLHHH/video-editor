@@ -1,4 +1,4 @@
-//! SRT 字幕文件：解析、生成、导入工程、从工程导出。
+//! SRT 字幕文件：解析、生成、导入工程、从工程导出；也能读 LRC 歌词、ASS 字幕的对白。
 
 use crate::edit::{EditError, add_caption};
 use crate::{ClipId, Project, Time, TrackKind};
@@ -104,6 +104,190 @@ fn write_timestamp(out: &mut String, t: Time) {
     );
 }
 
+/// ASS 的时间 `H:MM:SS.cc`。
+fn ass_time(s: &str) -> Option<Time> {
+    let mut parts = s.trim().split(':');
+    let h: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let (sec, cs) = parts.next()?.split_once('.')?;
+    let sec: i64 = sec.parse().ok()?;
+    let ms: i64 = format!("{cs:0<3}")[..3].parse().ok()?;
+    (parts.next().is_none() && (0..60).contains(&m) && (0..60).contains(&sec))
+        .then(|| Time::from_millis(((h * 60 + m) * 60 + sec) * 1000 + ms))
+}
+
+/// ASS 文字：去掉 `{\...}` 样式标签，`\N` / `\n` 换行，`\h` 空格。
+fn ass_text(raw: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0usize;
+    for c in raw.chars() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("\\N", "\n")
+        .replace("\\n", "\n")
+        .replace("\\h", " ")
+        .trim()
+        .to_owned()
+}
+
+/// 解析 ASS / SSA 字幕：按 `[Events]` 的 `Format` 找开始、结束、文字三列，读 `Dialogue` 行
+/// （`Comment` 行跳过）；样式、位置、特效都不要，只留文字。
+///
+/// # Errors
+/// 一条能用的对白都没有。
+pub fn parse_ass(src: &str) -> Result<Vec<Cue>, SrtError> {
+    let src = src.strip_prefix('\u{feff}').unwrap_or(src);
+    // 没写 Format 时按标准的十列
+    let mut columns: Vec<String> = "Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text"
+        .split(',')
+        .map(str::to_owned)
+        .collect();
+    let mut cues = Vec::new();
+    for line in src.lines() {
+        let line = line.trim();
+        if let Some(f) = line.strip_prefix("Format:") {
+            columns = f.split(',').map(|c| c.trim().to_owned()).collect();
+            continue;
+        }
+        let Some(body) = line.strip_prefix("Dialogue:") else {
+            continue;
+        };
+        let col = |name: &str| columns.iter().position(|c| c.eq_ignore_ascii_case(name));
+        let (Some(start_col), Some(end_col), Some(text_col)) =
+            (col("Start"), col("End"), col("Text"))
+        else {
+            continue;
+        };
+        // 文字是最后一列，里面可以有逗号
+        let fields: Vec<&str> = body.splitn(columns.len(), ',').collect();
+        let (Some(a), Some(b), Some(t)) = (
+            fields.get(start_col).and_then(|v| ass_time(v)),
+            fields.get(end_col).and_then(|v| ass_time(v)),
+            fields.get(text_col),
+        ) else {
+            continue;
+        };
+        let text = ass_text(t);
+        if b > a && !text.is_empty() {
+            cues.push(Cue {
+                start: a,
+                end: b,
+                text,
+            });
+        }
+    }
+    cues.sort_by_key(|c| c.start);
+    if cues.is_empty() {
+        return Err(SrtError {
+            line: 1,
+            message: "没有能用的对白（Dialogue）",
+        });
+    }
+    Ok(cues)
+}
+
+/// 贴的文稿里一个字念多久。
+const SCRIPT_PER_CHAR: Time = Time::from_millis(220);
+/// 一句最短、最长放多久。
+const SCRIPT_RANGE: (Time, Time) = (Time::from_secs(1), Time::from_secs(6));
+
+/// 贴一段文稿按句拆成字幕（剪映「文稿匹配」的手动版）：按句号、问号、感叹号、分号、省略号和换行断句，
+/// 句末标点不要；从 `start` 起一句接一句，每句按字数估长度（每字 0.22 秒，夹在 1–6 秒）。
+#[must_use]
+pub fn script_cues(text: &str, start: Time) -> Vec<Cue> {
+    const ENDS: [char; 10] = ['。', '！', '？', '；', '!', '?', ';', '…', '\n', '\r'];
+    let mut at = start;
+    text.split(ENDS)
+        .map(|s| {
+            s.trim()
+                .trim_end_matches(['，', ',', '、', '：', ':'])
+                .trim()
+        })
+        .filter(|s| !s.is_empty())
+        .map(|sentence| {
+            let chars = i64::try_from(sentence.chars().count()).unwrap_or(i64::MAX);
+            let len =
+                Time(SCRIPT_PER_CHAR.0.saturating_mul(chars)).clamp(SCRIPT_RANGE.0, SCRIPT_RANGE.1);
+            let cue = Cue {
+                start: at,
+                end: at + len,
+                text: sentence.to_owned(),
+            };
+            at += len;
+            cue
+        })
+        .collect()
+}
+
+/// 一条歌词最后没有下一句时放多久。
+const LRC_LAST: Time = Time::from_secs(3);
+
+/// `[mm:ss.xx]` 里的时间（百分秒或毫秒都行）；`[ti:…]` 这类标签返回 `None`。
+fn lrc_time(tag: &str) -> Option<Time> {
+    let (m, rest) = tag.split_once(':')?;
+    let m: i64 = m.trim().parse().ok()?;
+    let (sec, frac) = rest.split_once('.').unwrap_or((rest, "0"));
+    let sec: i64 = sec.trim().parse().ok()?;
+    let frac = frac.trim();
+    if frac.is_empty() || !frac.chars().all(|c| c.is_ascii_digit()) || !(0..60).contains(&sec) {
+        return None;
+    }
+    // 两位是百分秒、三位是毫秒
+    let ms: i64 = format!("{frac:0<3}")[..3].parse().ok()?;
+    Some(Time::from_millis((m * 60 + sec) * 1000 + ms))
+}
+
+/// 解析 LRC 歌词：每句从它的时间开始、到下一句开始结束（最后一句放 3 秒）；
+/// 一行几个时间就出现几次；空歌词只当分隔（上一句到这里结束）。
+///
+/// # Errors
+/// 一句带时间的歌词都没有。
+pub fn parse_lrc(src: &str) -> Result<Vec<Cue>, SrtError> {
+    let src = src.strip_prefix('\u{feff}').unwrap_or(src);
+    let mut stamps: Vec<(Time, String)> = Vec::new();
+    for line in src.lines() {
+        let mut rest = line.trim();
+        let mut times = Vec::new();
+        while let Some(body) = rest.strip_prefix('[') {
+            let Some((tag, after)) = body.split_once(']') else {
+                break;
+            };
+            match lrc_time(tag) {
+                Some(t) => times.push(t),
+                None if times.is_empty() => {}
+                None => break,
+            }
+            rest = after;
+        }
+        let text = rest.trim().to_owned();
+        stamps.extend(times.into_iter().map(|t| (t, text.clone())));
+    }
+    stamps.sort_by_key(|(t, _)| *t);
+    let cues: Vec<Cue> = stamps
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, text))| !text.is_empty())
+        .map(|(i, (start, text))| Cue {
+            start: *start,
+            end: stamps.get(i + 1).map_or(*start + LRC_LAST, |(t, _)| *t),
+            text: text.clone(),
+        })
+        .filter(|c| c.end > c.start)
+        .collect();
+    if cues.is_empty() {
+        return Err(SrtError {
+            line: 1,
+            message: "没有带时间的歌词",
+        });
+    }
+    Ok(cues)
+}
+
 /// 生成 SRT 文本（`\n` 换行，每条后空一行）。
 #[must_use]
 pub fn write_srt(cues: &[Cue]) -> String {
@@ -188,6 +372,88 @@ pub fn export_srt(project: &Project) -> Vec<Cue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pasted_script_splits_into_back_to_back_sentences() {
+        let cues = script_cues(
+            "你好世界。今天天气不错！\n\n  第三句话没有标点\n短",
+            Time::from_secs(10),
+        );
+        let texts: Vec<&str> = cues.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["你好世界", "今天天气不错", "第三句话没有标点", "短"]
+        );
+        assert_eq!(cues[0].start, Time::from_secs(10));
+        // 一句接一句，长度按字数（每字 0.22 秒，最短 1 秒）
+        for w in cues.windows(2) {
+            assert_eq!(w[0].end, w[1].start);
+        }
+        assert_eq!(
+            cues[0].end - cues[0].start,
+            Time::from_millis(1000),
+            "4 个字不到 1 秒按 1 秒"
+        );
+        assert_eq!(
+            cues[2].end - cues[2].start,
+            Time::from_millis(1760),
+            "8 个字"
+        );
+        assert_eq!(script_cues(" \n。！", Time::ZERO), []);
+    }
+
+    #[test]
+    fn ass_dialogue_lines_become_cues_without_style_tags() {
+        let src = "[Script Info]\nTitle: x\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.00,0:00:02.50,Default,,0,0,0,,{\\b1}你好，{\\i1}世界{\\i0}\nComment: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,注释不要\nDialogue: 0,0:00:05.20,0:00:06.00,Default,,0,0,0,,第一行\\N第二行, 带逗号\n";
+        let cues = parse_ass(src).unwrap();
+        assert_eq!(
+            cues,
+            [
+                Cue {
+                    start: Time::from_secs(1),
+                    end: Time::from_millis(2500),
+                    text: "你好，世界".into()
+                },
+                Cue {
+                    start: Time::from_millis(5200),
+                    end: Time::from_secs(6),
+                    text: "第一行\n第二行, 带逗号".into()
+                },
+            ]
+        );
+        assert!(parse_ass("[Events]\n").is_err());
+    }
+
+    #[test]
+    fn lrc_lines_become_cues_that_end_where_the_next_starts() {
+        let src = "\u{feff}[ti:歌名]\n[ar:歌手]\n[00:01.00]第一句\n[00:03.50]第二句\n\n[00:05.250]最后一句\n[01:00.00]\n";
+        let cues = parse_lrc(src).unwrap();
+        assert_eq!(
+            cues,
+            [
+                Cue {
+                    start: Time::from_secs(1),
+                    end: Time::from_millis(3500),
+                    text: "第一句".into()
+                },
+                Cue {
+                    start: Time::from_millis(3500),
+                    end: Time::from_millis(5250),
+                    text: "第二句".into()
+                },
+                Cue {
+                    start: Time::from_millis(5250),
+                    end: Time::from_secs(60),
+                    text: "最后一句".into()
+                },
+            ]
+        );
+        // 一行几个时间：同一句出现几次；最后一句没有下一句时放 3 秒
+        let repeat = parse_lrc("[00:10.00][00:02.00]副歌").unwrap();
+        assert_eq!(repeat[0].start, Time::from_secs(2));
+        assert_eq!(repeat[1].end, Time::from_secs(13));
+        assert!(parse_lrc("没有时间").is_err());
+    }
     use crate::testing::sample_project;
     use proptest::prelude::*;
 
